@@ -1,0 +1,8 @@
+node_modules/
+.dev/
+out/
+coverage/
+*.log
+.DS_Store
+# Real database rows and pages of client sites (users, drafts, private posts, tokens): never published.
+tests/fixtures/
