@@ -336,19 +336,34 @@ const image: BlockConverter = (block, ctx) => {
     printed || saved === undefined || (saved[key] ?? "") !== ""
       ? (named?.[key] ?? spec[key])
       : undefined;
+  const width = size("width");
   return assemble(env, {
     tag: "img",
     forceTag: "img",
     attributes: {
       src: spec.src,
       alt: spec.alt,
-      width: size("width"),
+      width,
       height: size("height"),
-      sizes: spec.sizes,
+      sizes: spec.sizes ?? naturalSizes(width, block.attrs.imageType === "dynamic"),
       loading: spec.loading,
     },
   }).nodes;
 };
+
+/**
+ * The `sizes` that give a rebuilt `srcset` the natural width the live tag has. The plugin prints a
+ * static image as a plain `src` of the size it names, so its natural width is that file's width,
+ * wherever it sits; a `srcset` with the build's default `sizes` (`50vw`) has the width of that slot
+ * instead, and an image whose stylesheet leaves its width to the content (a grid column holding an
+ * `120%` wide image, a flex item with no width) lays out narrower than on the live page. A dynamic
+ * image is printed with a `srcset` and `auto, (max-width: Wpx) 100vw, Wpx`, which is what WordPress
+ * itself prints for it.
+ */
+function naturalSizes(width: AttrValue | undefined, dynamic: boolean): string | undefined {
+  if (typeof width !== "number" || !(width > 0)) return undefined;
+  return dynamic ? `auto, (max-width: ${width}px) 100vw, ${width}px` : `${width}px`;
+}
 
 // ── Video ────────────────────────────────────────────────────────────────────────────────────────
 

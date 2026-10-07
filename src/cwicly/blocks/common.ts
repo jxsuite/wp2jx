@@ -605,6 +605,21 @@ function deviceStyle(deviceHide: Record<string, true> | undefined): JxStyle {
 }
 
 /**
+ * The text of a `<p>` that is one binding: the value of a field that may hold paragraphs of its own
+ * (a rich-text field saves `<p>…</p>`). Printed inside a `<p>` the browser closes the box at the
+ * first inner paragraph and the closing tag at the end then opens an empty paragraph of its own
+ * (the page gets a stray box with its margin, and a flex parent a gap); the plugin's markup has the
+ * paragraphs and no stray one, so the value gives up its last `</p>` to the box that holds it.
+ * A value that is not paragraphs is printed as it is. (Measured on the live pages of the second pilot,
+ * whose plugin is 1.6.0 though its data format says 1.4.7: the page has the paragraphs and no stray one.)
+ */
+export function paragraphValue(html: string): string {
+  const m = /^\$\{([\s\S]*)\}$/.exec(html);
+  if (!m || m[1]!.includes("${")) return html;
+  return `\${((h) => /^\\s*<p[\\s>]/i.test(h) ? h.replace(/<\\/p>\\s*$/i, '') : h)(${m[1]})}`;
+}
+
+/**
  * The element a block becomes, from what the converter says is inside it. See the module comment for
  * how the five sources are combined.
  */
@@ -652,7 +667,15 @@ export function assemble(env: BlockEnv, spec: RootSpec = {}): Built {
   const nested = spec.content?.children ?? spec.children;
   let content: Pick<JxElement, "textContent" | "children" | "innerHTML"> = {
     ...(spec.content?.textContent === undefined ? {} : { textContent: spec.content.textContent }),
-    ...(spec.content?.innerHTML === undefined ? {} : { innerHTML: spec.content.innerHTML }),
+    ...(spec.content?.innerHTML === undefined
+      ? {}
+      : {
+          // A component's own properties are its client template's to read: that one is left as it is.
+          innerHTML:
+            tag === "p" && ctx.props === undefined
+              ? paragraphValue(spec.content.innerHTML)
+              : spec.content.innerHTML,
+        }),
     ...(nested === undefined || nested.length === 0 ? {} : { children: nested }),
   };
   if (link?.anchor === "inner" && Object.keys(content).length > 0) {

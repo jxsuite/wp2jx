@@ -237,9 +237,10 @@ function operandOf(entry: Entry, ctx: ConvertCtx): Operand | string {
       return post ? { lit: String(post.parent) } : "the parent post id is not in the entry data";
     case "posttype": {
       if (post) return { lit: post.type };
-      return ctx.entryType === undefined
-        ? "the post type of the entry is unknown"
-        : { lit: ctx.entryType };
+      if (ctx.entryType !== undefined) return { lit: ctx.entryType };
+      // The items of a list of several types: each entry says what it is.
+      const r = currentRef(ctx, "postType");
+      return r ? refOperand(r) : "the post type of the entry is unknown";
     }
     case "postfeaturedimage": {
       const r = currentRef(ctx, "featuredImage");
@@ -327,6 +328,28 @@ function functionAnswer(entry: Entry, ctx: ConvertCtx): Maybe {
   if (entry.operator === "true") return value;
   if (entry.operator === "false") return not(value);
   return UNKNOWN;
+}
+
+/**
+ * `shortcode`: a site's own `[<taxonomy>_id]` shortcode (the first term of that taxonomy on the current
+ * post, the snippet every Cwicly site that filters by "my category" writes) is empty exactly when the
+ * entry has no term of that taxonomy. Any other shortcode is PHP the converter cannot read.
+ */
+function shortcodeAnswer(entry: Entry, ctx: ConvertCtx): Maybe {
+  const name = dataText(entry);
+  const taxonomy = name === undefined ? undefined : /^(.+)_id$/.exec(name)?.[1];
+  if (taxonomy === undefined) return UNKNOWN;
+  const known =
+    ctx.acf.taxonomies.has(taxonomy) ||
+    taxonomy === "category" ||
+    taxonomy === "post_tag" ||
+    [...ctx.model.terms.values()].some((t) => t.taxonomy === taxonomy);
+  const terms = currentRef(ctx, "terms");
+  if (!known || !terms) return UNKNOWN;
+  const value: Answer = isExprRef(terms)
+    ? { e: `(${optPath(terms.expr, taxonomy)} ?? []).length > 0` }
+    : when(((terms.value as Record<string, unknown[]> | undefined)?.[taxonomy] ?? []).length > 0);
+  return truth(entry.operator, value);
 }
 
 /** The ACF condition on a field: empty, not empty, true, false, or a comparison with `data`. */
@@ -481,6 +504,8 @@ function answerOf(entry: Entry, ctx: ConvertCtx, opts: VisibilityOptions): Maybe
       return guestAnswer(entry);
     case "functionreturn":
       return functionAnswer(entry, ctx);
+    case "shortcode":
+      return shortcodeAnswer(entry, ctx);
     case "queryhasitems": {
       if (opts.queryCount === undefined) return UNKNOWN;
       const has: Answer = { e: `(${opts.queryCount}) > 0` };

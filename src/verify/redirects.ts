@@ -76,27 +76,44 @@ export function rulesFromProject(redirects: ProjectRedirects | undefined): Redir
 const trimSlash = (path: string): string =>
   path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
 
+const escapeRegex = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * A source as the host reads it: a literal path, `:name` for one segment, and one `*` for any run
+ * of characters wherever it stands (`/docs/*`, `/essays-*`, a wildcard followed by more text), and
+ * whatever literal text follows it must match the end of the path. `/docs/*` also answers `/docs`.
+ */
+function compile(from: string): { pattern: RegExp; names: string[] } {
+  const source = trimSlash(from);
+  const names: string[] = [];
+  let out = "";
+  let splat = false;
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i]!;
+    if (c === "*" && !splat) {
+      splat = true;
+      names.push("splat");
+      const bare = out.endsWith("/") && i === source.length - 1;
+      out = bare ? `${out.slice(0, -1)}(?:/(.*))?` : `${out}(.*)`;
+    } else if (c === ":" && /[A-Za-z_]/.test(source[i + 1] ?? "")) {
+      const name = /^[A-Za-z_]\w*/.exec(source.slice(i + 1))![0];
+      names.push(name);
+      out += "([^/]+)";
+      i += name.length;
+    } else {
+      out += escapeRegex(c);
+    }
+  }
+  return { pattern: new RegExp(`^${out}$`), names };
+}
+
 /** Match one rule against a path; returns the destination with the captures substituted. */
 function apply(rule: RedirectRule, pathname: string): string | undefined {
-  const from = trimSlash(rule.from).split("/");
-  const path = trimSlash(pathname).split("/");
+  const { pattern, names } = compile(rule.from);
+  const found = pattern.exec(trimSlash(pathname));
+  if (found === null) return undefined;
   const captures = new Map<string, string>();
-  for (let i = 0; i < from.length; i++) {
-    const part = from[i] ?? "";
-    if (part === "*") {
-      captures.set("splat", path.slice(i).join("/"));
-      return substitute(rule.to, captures);
-    }
-    const here = path[i];
-    if (here === undefined) return undefined;
-    if (part.startsWith(":") && part.length > 1) {
-      if (here === "") return undefined;
-      captures.set(part.slice(1), here);
-      continue;
-    }
-    if (part !== here) return undefined;
-  }
-  if (path.length !== from.length) return undefined;
+  for (const [index, name] of names.entries()) captures.set(name, found[index + 1] ?? "");
   return substitute(rule.to, captures);
 }
 

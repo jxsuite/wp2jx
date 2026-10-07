@@ -1166,7 +1166,8 @@ const EXPECTED: Record<string, Record<string, number>> = {
   },
   "ap single-post": {
     kept: 52,
-    decidedHidden: 2,
+    // (The "More from this series" section of each of the two posts, which have no series: the shortcode condition is decided.)
+    decidedHidden: 4,
     text: 30,
     href: 14,
     src: 8,
@@ -1175,7 +1176,7 @@ const EXPECTED: Record<string, Record<string, number>> = {
   },
   "ap single-episode": {
     kept: 60,
-    decidedHidden: 18,
+    decidedHidden: 20,
     text: 34,
     href: 6,
     src: 8,

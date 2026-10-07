@@ -158,10 +158,18 @@ describe("noise configuration", () => {
     expect(css).toContain("animation: none !important");
   });
 
+  test("a --remove selector takes no space on either side", () => {
+    const css = maskCss(withMasks(DEFAULT_NOISE, [], [".ap-campaign-bar"]));
+    expect(css).toContain(".ap-campaign-bar { display: none !important; }");
+    expect(css).not.toContain(".ap-campaign-bar { visibility");
+  });
+
   test("withMasks adds to the defaults without changing them", () => {
     const before = DEFAULT_NOISE.blank.length;
-    withMasks(DEFAULT_NOISE, ["x"]);
+    const removed = DEFAULT_NOISE.remove.length;
+    withMasks(DEFAULT_NOISE, ["x"], ["y"]);
     expect(DEFAULT_NOISE.blank.length).toBe(before);
+    expect(DEFAULT_NOISE.remove.length).toBe(removed);
     expect(DEFAULT_NOISE.blockUrls).toContain("*nodedelivr.com*");
   });
 

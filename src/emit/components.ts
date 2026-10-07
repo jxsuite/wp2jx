@@ -154,6 +154,7 @@ import type {
 import { walkBlocks } from "../wp/blocks.ts";
 import { decodeEntities } from "../wp/model.ts";
 import { fluentFormFor } from "./fluentform.ts";
+import { geoMapFor } from "./geomap.ts";
 
 // ── Contract ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -499,6 +500,8 @@ function defaultResolvers(
       const name = placeholder.attrs["data-shortcode"] ?? "";
       const form = fluentFormFor(site, placeholder, say);
       if (form !== undefined) return form;
+      const map = geoMapFor(site, placeholder, say);
+      if (map !== undefined) return map;
       return neutral(
         placeholder,
         `shortcode:${name}`,

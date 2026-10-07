@@ -40,6 +40,7 @@ import type {
   WpPost,
 } from "../types.ts";
 import { parseBlocks } from "../wp/blocks.ts";
+import { isUnregisteredBlock } from "../wp/block-registry.ts";
 import { decodeEntities, termsOf } from "../wp/model.ts";
 import { php } from "../wp/seo.ts";
 import {
@@ -1340,16 +1341,25 @@ const postTitleBlock: BlockConverter = (block, ctx) => {
 const postContentBlock: BlockConverter = (block, ctx) => {
   const supports = supportsOf(block, ctx);
   const extra = ["entry-content", ...layoutClasses("post-content", block.attrs)];
-  const wrapper = (content: Pick<JxElement, "children">): JxElement =>
-    dynamicElement("div", "wp-block-post-content", supports, extra, content);
+  const wrapper = (
+    content: Pick<JxElement, "children" | "attributes">,
+    extraStyle: JxStyle = {},
+  ): JxElement =>
+    dynamicElement("div", "wp-block-post-content", supports, extra, content, extraStyle);
   const source = sourceOf(ctx);
   // A template string is how Jx names the rendered body of an entry (`children: "${state.entry.$children}"`),
   // which the element type does not list among its forms.
   if (source.kind === "entry") {
+    // WordPress's render callback returns nothing for an empty body, so an entry with none has no
+    // wrapper in the page at all (no margins, no gap in a flex parent): it is hidden, not emptied.
     return [
-      wrapper({
-        children: bind(ctx, "$children") as unknown as NonNullable<JxElement["children"]>,
-      }),
+      wrapper(
+        {
+          attributes: { hidden: `\${!((${ctx.entryExpr}.$children?.length ?? 0) > 0)}` },
+          children: bind(ctx, "$children") as unknown as NonNullable<JxElement["children"]>,
+        },
+        { "&[hidden]": { display: "none !important" } },
+      ),
     ];
   }
   if (source.kind === "post") {
@@ -1940,6 +1950,16 @@ export function convertCoreBlock(block: WpBlock, ctx: ConvertCtx): JxNode[] {
   if (converter) return converter(block, ctx);
   const nodes = staticBlock(block, ctx);
   const kept = nodes.length > 0 || block.innerBlocks.length > 0;
+  if (!kept && isUnregisteredBlock(ctx.model, block.name)) {
+    note(
+      ctx,
+      "info",
+      "block.unregistered",
+      `The block ${block.name} saved no markup and no plugin or theme of the site registers its namespace any more: WordPress prints nothing for it, so nothing is written.`,
+      { block: block.name },
+    );
+    return [];
+  }
   note(
     ctx,
     "warn",

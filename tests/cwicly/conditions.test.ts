@@ -245,7 +245,7 @@ describe("an ACF field empty or not", () => {
     ]);
   });
 
-  test("a field read from a user or a repeater row is dropped, and the block stays", async () => {
+  test("a field read from the current author, a row of a repeater, or a person outside a users loop is dropped and the block stays", async () => {
     const { ctx } = await entryCtx("ap", "single-post", "post");
     const user = blockVisibility(
       when([
@@ -259,9 +259,24 @@ describe("an ACF field empty or not", () => {
       ]),
       ctx,
     );
+    // Measured on the live pages: `currentauthor` reads no field there, so the condition is not decided.
     expect(user.hidden).toBeUndefined();
     expect(user.omit).toBeUndefined();
     expect(user.dropped).toHaveLength(1);
+    const person = blockVisibility(
+      when([
+        {
+          condition: "acf",
+          operator: "notempty",
+          acfGroup: "g",
+          acfField: "field_62d867cf864ee",
+          acfLocation: "userquery",
+        },
+      ]),
+      ctx,
+    );
+    expect(person.hidden).toBeUndefined();
+    expect(person.dropped).toHaveLength(1);
     const row = blockVisibility(
       when([
         {
@@ -314,9 +329,20 @@ describe("the current post", () => {
     expect(
       blockVisibility(when([{ condition: "posttype", operator: "===", data: "service" }]), ctx),
     ).toEqual({ dropped: [], omit: true });
+    // An entry with no one type (the items of a list of several) says what it is.
     const noType = (await entryCtx("fineline", "index")).ctx;
+    const mixed = blockVisibility(
+      when([{ condition: "posttype", operator: "===", data: "post" }]),
+      noType,
+    );
+    expect(mixed.dropped).toEqual([]);
+    expect(hiddenFor(mixed, { postType: "post" })).toBe(false);
+    expect(hiddenFor(mixed, { postType: "project" })).toBe(true);
+    expect(hiddenFor(mixed, {})).toBe(true);
+    // Where there is no entry at all (a component), it cannot be said.
+    const component = { ...noType, mode: "component" } as ConvertCtx;
     expect(
-      blockVisibility(when([{ condition: "posttype", operator: "===", data: "post" }]), noType)
+      blockVisibility(when([{ condition: "posttype", operator: "===", data: "post" }]), component)
         .dropped,
     ).toEqual(["posttype === post: the post type of the entry is unknown"]);
     const content = blockVisibility(
@@ -431,6 +457,30 @@ describe("the current post", () => {
       ctx,
     );
     expect(hiddenFor(thumb, { featuredImage: { src: "/a.jpg" } })).toBe(true);
+  });
+
+  test("a site's [<taxonomy>_id] shortcode is empty when the entry has no term of that taxonomy; any other shortcode is PHP", async () => {
+    const { ctx } = await entryCtx("ap", "single-episode", "episode");
+    const series = blockVisibility(
+      when([{ condition: "shortcode", operator: "true", data: "series_id" }]),
+      ctx,
+    );
+    expect(series.dropped).toEqual([]);
+    expect(hiddenFor(series, { terms: { series: [{ slug: "a" }] } })).toBe(false);
+    expect(hiddenFor(series, { terms: { series: [] } })).toBe(true);
+    expect(hiddenFor(series, { terms: { category: [{ slug: "a" }] } })).toBe(true);
+    expect(hiddenFor(series, {})).toBe(true);
+    const none = blockVisibility(
+      when([{ condition: "shortcode", operator: "false", data: "category_id" }]),
+      ctx,
+    );
+    expect(hiddenFor(none, { terms: { category: [{ slug: "a" }] } })).toBe(true);
+    expect(hiddenFor(none, { terms: {} })).toBe(false);
+    for (const data of ["guest_names", "not_a_taxonomy_id"]) {
+      expect(
+        blockVisibility(when([{ condition: "shortcode", operator: "true", data }]), ctx).dropped,
+      ).toEqual([`shortcode true ${data}: it runs a shortcode`]);
+    }
   });
 
   test("get_current_slug() is the last segment of the address: the archive's term, the entry's slug, or the page's own", async () => {
@@ -636,7 +686,7 @@ describe("what no static site can say", () => {
       [{ condition: "commentsopen", operator: "===", data: "true" }, "comments"],
       [{ condition: "postcomments", operator: ">", data: "3" }, "comments"],
       [{ condition: "commentisauthor", operator: "true", data: "" }, "comments"],
-      [{ condition: "shortcode", operator: "true", data: "series_id" }, "shortcode"],
+      [{ condition: "shortcode", operator: "true", data: "guest_names" }, "shortcode"],
     ];
     for (const [entry, why] of cases) {
       const v = blockVisibility(when([entry]), ctx);
@@ -920,26 +970,24 @@ describe("the census of every condition of both sites", () => {
     expect(c.binding + c.decidedOmit + c.decidedShown + c.dropped).toBe(c.entries);
   });
 
-  test("anabaptistperspectives: 32 of 53 are bindings or decided, 21 are dropped (queries, comments, shortcodes, post types of templates the census gives no type)", async () => {
+  test("anabaptistperspectives: 39 of 53 are bindings or decided, 14 are dropped (queries and comments)", async () => {
     const c = await census("ap");
     expect(c).toEqual({
       blocks: 64,
       switchedOff: 5,
       entries: 53,
       flags: 11,
-      binding: 21,
+      binding: 28,
       decidedOmit: 9,
       decidedShown: 2,
-      dropped: 21,
+      dropped: 14,
       reasons: {
         "acf: its field cannot be read here": 1,
         "commentapproved: comments are not carried over": 2,
         "commentisauthor: comments are not carried over": 2,
-        "posttype: the post type of the entry is unknown": 5,
         "queryhasitems: it depends on a query, and the block is not given the query's count": 7,
         "queryhasnextpage: it depends on a query, and the block is not given the query's count": 1,
         "queryhasprevpage: it depends on a query, and the block is not given the query's count": 1,
-        "shortcode: it runs a shortcode": 2,
       },
     });
     expect(c.binding + c.decidedOmit + c.decidedShown + c.dropped).toBe(c.entries);

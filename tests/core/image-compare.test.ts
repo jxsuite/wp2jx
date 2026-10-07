@@ -77,6 +77,55 @@ describe("icb/image-compare", () => {
     expect(ctx.report.entries().map((e) => e.code)).toContain("block.image-compare-static");
   });
 
+  test("the stage has the proportions of the taller image at its width, as the script sets it (the Manheim barn: a 2048x1536 before and a 1554x1180 after)", async () => {
+    const all = await sliders();
+    const manheim = all.find(
+      ({ block }) => (block.attrs.beforeImg as { id?: number } | undefined)?.id === 4586,
+    )!;
+    const ctx = await makeCtx("fineline", manheim.subject);
+    const before = ctx.mediaFor(4586)!;
+    const after = ctx.mediaFor(4585)!;
+    expect([before.width, before.height, after.width, after.height]).toEqual([
+      2048, 1536, 1554, 1180,
+    ]);
+    // 1180/1554 is taller than 1536/2048, and the live stage is 781px high at 1028.8px wide
+    expect(JSON.stringify(convertBlocks([manheim.block], ctx))).toContain(
+      '"aspectRatio":"1554 / 1180"',
+    );
+    // swapped, the same stage: it follows the image, not the side it is on
+    const swapped: WpBlock = {
+      ...manheim.block,
+      attrs: {
+        ...manheim.block.attrs,
+        beforeImg: manheim.block.attrs.afterImg,
+        afterImg: manheim.block.attrs.beforeImg,
+      },
+    };
+    expect(JSON.stringify(convertBlocks([swapped], ctx))).toContain('"aspectRatio":"1554 / 1180"');
+    // an image that does not know its size leaves the other one to say it
+    const bare = await makeCtx("fineline", manheim.subject);
+    const sized = bare.mediaFor.bind(bare);
+    bare.mediaFor = (id: number) => {
+      const found = sized(id);
+      return id === 4585 || found === undefined
+        ? found
+        : (({ width: _w, height: _h, ...rest }) => rest)(found);
+    };
+    expect(JSON.stringify(convertBlocks([manheim.block], bare))).toContain(
+      '"aspectRatio":"1554 / 1180"',
+    );
+    // and one that says it is zero pixels wide says nothing
+    const zero = await makeCtx("fineline", manheim.subject);
+    const real = zero.mediaFor.bind(zero);
+    zero.mediaFor = (id: number) => {
+      const found = real(id);
+      return id === 4586 && found !== undefined ? { ...found, width: 0, height: 0 } : found;
+    };
+    expect(JSON.stringify(convertBlocks([manheim.block], zero))).toContain(
+      '"aspectRatio":"1554 / 1180"',
+    );
+  });
+
   test("a vertical slider is clipped from the middle down, with its handle across", async () => {
     const [first] = await sliders();
     const ctx = await makeCtx("fineline", first!.subject);

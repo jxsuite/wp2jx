@@ -20,6 +20,7 @@
  */
 import type { Report, WpModel, WpPost, WpTerm } from "../types.ts";
 import { publicUrl } from "./model.ts";
+import { userProfiles } from "./profiles.ts";
 import { maybeUnserialize } from "./phpser.ts";
 
 // ── Public types ─────────────────────────────────────────────────────────────────────────────────
@@ -244,7 +245,17 @@ export interface AcfOptionsTarget {
   page: string;
 }
 
-export type AcfTarget = AcfPostTarget | AcfTermTarget | AcfOptionsTarget;
+/**
+ * A person: the field groups of the user form (`user_form == edit`, or `all`) apply, and the values are
+ * the profile meta read beside the model (`wp/profiles.ts`). The roles of a user are not read, so a rule
+ * on `user_role` cannot be evaluated for one.
+ */
+export interface AcfUserTarget {
+  kind: "user";
+  userId: number;
+}
+
+export type AcfTarget = AcfPostTarget | AcfTermTarget | AcfOptionsTarget | AcfUserTarget;
 
 /** The stored value of a link field, however it was written. */
 export interface AcfLink {
@@ -397,7 +408,9 @@ const describe = (target: AcfTarget): string =>
     ? `post:${target.postId ?? target.postType}`
     : target.kind === "term"
       ? `term:${target.termId ?? target.taxonomy}`
-      : `options:${target.page}`;
+      : target.kind === "user"
+        ? `user:${target.userId}`
+        : `options:${target.page}`;
 
 /** Which reports a module has already filed, so one fact is told once however often it is met. */
 const filed = new WeakMap<object, Set<string>>();
@@ -523,6 +536,7 @@ const EVALUATED_PARAMS = new Set([
   "taxonomy",
   "term",
   "options_page",
+  "user_form",
 ]);
 
 // ── Loading ──────────────────────────────────────────────────────────────────────────────────────
@@ -1379,6 +1393,16 @@ function matchRule(rule: AcfLocationRule, t: AcfTarget, known?: TermIndex): Verd
     case "options_page":
       return t.kind === "options" ? compare(t.page, rule) : false;
 
+    case "user_form": {
+      // The profile screen: a user form shows the group on "edit" and on "all", and never on "add".
+      if (t.kind !== "user") return false;
+      const shown = rule.value === "edit" || rule.value === "all";
+      return rule.operator === "!=" ? !shown : shown;
+    }
+
+    case "user_role":
+      return t.kind === "user" ? "unevaluable" : false;
+
     default:
       // The screens of other objects (a user form, a comment, a widget) never match a post or term, as in ACF,
       // and a parameter this tool does not know matches nothing (it was reported when the group was read).
@@ -1985,6 +2009,14 @@ function sourceOf(model: WpModel, target: AcfTarget, acf: AcfModel): Source | un
       keys: () => Object.keys(meta ?? {}),
     };
   }
+  if (target.kind === "user") {
+    const meta = userProfiles(model).get(target.userId)?.meta;
+    return {
+      get: (name) => (meta && Object.hasOwn(meta, name) ? meta[name] : undefined),
+      consumed,
+      keys: () => Object.keys(meta ?? {}),
+    };
+  }
   if (target.kind === "term") {
     const term = target.termId === undefined ? undefined : model.terms.get(target.termId);
     const meta = term?.meta;
@@ -2523,4 +2555,16 @@ export function toEntryData(
   const out: Record<string, unknown> = {};
   for (const [name, v] of converted) setOwn(out, keys.get(name)!, v);
   return out;
+}
+
+/** The names of the ACF fields that hold a person (`user` fields), wherever they nest. */
+export function userFieldNames(acf: AcfModel): Set<string> {
+  const names = new Set<string>();
+  const visit = (f: AcfField): void => {
+    if (f.type === "user") names.add(f.name);
+    for (const sub of f.subFields) visit(sub);
+    for (const layout of f.layouts) for (const sub of layout.subFields) visit(sub);
+  };
+  for (const group of acf.groups) for (const f of group.fields) visit(f);
+  return names;
 }

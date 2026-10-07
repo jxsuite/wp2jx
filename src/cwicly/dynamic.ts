@@ -347,15 +347,18 @@ function featuredSize(
   return found ? { width: found.width, height: found.height } : undefined;
 }
 
-/** `src || fallback`, both as final-form text, `false` (no attribute) when there is neither. */
+/**
+ * `src || fallback`, both as final-form text. With neither, the attribute is there and empty
+ * (`src=""`), because that is what the plugin prints for a dynamic image the entry has no file for:
+ * an `<img>` with no `src` attribute at all is laid out as an image with a box (the stylesheet's
+ * `aspect-ratio` gives it one), where an empty `src` is a broken image that takes no space.
+ */
 function withFallbackSrc(ctx: ConvertCtx, src: Val, fallback: string | undefined): string {
   if ("lit" in src) {
     const chosen = src.lit !== "" ? src.lit : fallback;
     return literalFinal(ctx, chosen ?? "");
   }
-  return fallback === undefined
-    ? `\${(${src.expr}) || false}`
-    : `\${(${src.expr}) || ${jsString(fallback)}}`;
+  return `\${(${src.expr}) || ${jsString(fallback ?? "")}}`;
 }
 
 /**

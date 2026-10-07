@@ -10,7 +10,7 @@
  *   `cwicly/tokens.ts` (so a template that binds `state.entry.data.<key>` and a static page that reads
  *   the post cannot disagree: the title, excerpt and ACF text are what WordPress prints, texturized and
  *   `wpautop`ed), with the dates in RFC 3339 UTC, `authorUrl` (the key `dynamic.ts` asks for), `seo`
- *   from Rank Math, `hasExcerpt`, and every key of every object in order (`sortDeep`): the same site
+ *   from Rank Math, `hasExcerpt`, `postType` (a list of several types asks each entry what it is), and every key of every object in order (`sortDeep`): the same site
  *   writes the same bytes. A string that holds `${` is spelled with a zero-width space between the two
  *   characters (`md.literal-template`): the build evaluates it wherever it is written.
  * - **Only published, routed posts get a file**, at the route's `file`. Drafts, private, pending and
@@ -24,7 +24,7 @@
  *   anything else is left as written and reported (`url.unresolved`). So the `format: "uri"` that
  *   `acfSchema` gives a `url` field is `"uri-reference"` here ({@link relaxAddressFormats}): a route
  *   is not a URI.
- * - **The schema** of a collection is `BASE_PROPERTIES`, `authorUrl`, `hasExcerpt` and `acfSchema` of
+ * - **The schema** of a collection is `BASE_PROPERTIES`, `authorUrl`, `hasExcerpt`, `postType` and `acfSchema` of
  *   the fields of every group that applies to one of its entries. A field is `required` only when every
  *   entry has a group that requires it (a group applies to the entries its location rules say, and
  *   requires nothing of the others). Each entry is checked against it (`schemaProblems` is what the
@@ -176,8 +176,11 @@ import { MD_ALL, serializeJxMarkdown } from "@jxsuite/parser/serialize";
 import { Document, visit } from "yaml";
 import { collectWpClasses } from "../core/block-css.ts";
 import { postData } from "../cwicly/tokens.ts";
+import { userProfiles } from "../wp/profiles.ts";
+import { recipeData } from "../wp/lazyblocks.ts";
 import { convertSubject } from "../convert.ts";
-import { replacePlaceholders, walkElements } from "../placeholders.ts";
+import { replacePlaceholders, walkElements, type Placeholder } from "../placeholders.ts";
+import { fluentFormFor } from "./fluentform.ts";
 import { sortedJson, type ClassStyles } from "./class-styles.ts";
 import { rewriteStyleUrls } from "./style-urls.ts";
 import { createReport } from "../report.ts";
@@ -2254,6 +2257,18 @@ const REPLACED_CODES = new Set([
 
 const plural = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`;
 
+/** The names and biography an author's profile holds, for `{authorinfo}`; undefined for an author with none. */
+function authorInfoOf(model: SiteContext["model"], id: number): Rec | undefined {
+  const meta = userProfiles(model).get(id)?.meta;
+  if (meta === undefined) return undefined;
+  const out: Rec = {};
+  for (const key of ["description", "first_name", "last_name"]) {
+    const value = meta[key];
+    if (typeof value === "string" && value !== "") out[key] = value;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
 /** The entry data of a post, as the collection stores it: the contract's keys, in order, as WordPress prints them. */
 async function entryData(
   work: SiteContext,
@@ -2285,13 +2300,13 @@ async function entryData(
   // ACF's own findings about the values (a field deleted since, a group switched off) belong to the entry that has them.
   const fields = acfValues(work.model, work.acf, postTarget(work.model, post), { report });
   // The two keys this module adds to the contract are not reserved by ACF's own list (`BASE_KEYS`), so a field of that name has taken the key.
-  for (const key of ["authorUrl", "hasExcerpt"]) {
+  for (const key of ["authorUrl", "hasExcerpt", "postType", "authorInfo"]) {
     if (!Object.hasOwn(fields, key)) continue;
     add(
       report,
       "warn",
       "entry.key-collision",
-      `An ACF field is called \`${key}\`, which is also a key of the entry data contract (${key === "authorUrl" ? "the address of the author's page" : "whether the post has an excerpt"}): the entry holds the field's value under it, and a template that reads the contract's key gets that. Rename the field to keep both.`,
+      `An ACF field is called \`${key}\`, which is also a key of the entry data contract (${key === "authorUrl" ? "the address of the author's page" : key === "postType" ? "the post's type" : key === "authorInfo" ? "the author's names and biography" : "whether the post has an excerpt"}): the entry holds the field's value under it, and a template that reads the contract's key gets that. Rename the field to keep both.`,
       where,
       url,
       { key },
@@ -2301,6 +2316,17 @@ async function entryData(
   // The contract has no key for the author's page; the templates ask for `authorUrl`.
   const authorUrl = work.urls.urlForAuthor(post.authorId);
   if (authorUrl !== undefined && data.authorUrl === undefined) data.authorUrl = authorUrl;
+  // A list that mixes types (a tag's posts and episodes) asks each entry what it is (`postType`).
+  if (data.postType === undefined) data.postType = post.type;
+  // What `{authorinfo}` prints of the author (the biography box of an essay's "Essay Author" section, the names):
+  // the profile's fields, for an author who has any.
+  const info = authorInfoOf(work.model, post.authorId);
+  if (info !== undefined && data.authorInfo === undefined) data.authorInfo = info;
+
+  // The data an embedded player's template reads from a linked post (`wp/lazyblocks.ts`): nothing for a gated entry.
+  for (const [key, value] of Object.entries(recipeData(work.model, post))) {
+    if (data[key] === undefined) data[key] = value;
+  }
 
   try {
     const seo = seoFor(
@@ -2422,6 +2448,7 @@ function dropDynamic(
 
 /** A body's placeholders have nothing to become in a Markdown entry: the shortcode keeps what it enclosed, the rest goes, and each is said. */
 function resolvePlaceholders(
+  site: SiteContext,
   nodes: JxNode[],
   report: Report,
   where: string,
@@ -2434,12 +2461,20 @@ function resolvePlaceholders(
     if (block !== undefined) found.blocks.add(block);
     dropped.set(tag, found);
   };
+  // A Fluent Forms form is static markup (a div with its HTML), which an entry carries as a directive.
+  const form = (placeholder: Placeholder): JxElement | undefined =>
+    fluentFormFor(site, placeholder, (entry) =>
+      add(report, entry.severity, entry.code, entry.message, where, url, entry.data),
+    );
+  const drop = (placeholder: Placeholder): JxNode[] | null => {
+    note(placeholder.tag, placeholder.block ?? placeholder.attrs["data-shortcode"]);
+    const kept = placeholder.element.children;
+    return placeholder.kind === "shortcode" && Array.isArray(kept) ? kept : null;
+  };
   const out = replacePlaceholders(nodes, {
-    "*": (placeholder) => {
-      note(placeholder.tag, placeholder.block ?? placeholder.attrs["data-shortcode"]);
-      const kept = placeholder.element.children;
-      return placeholder.kind === "shortcode" && Array.isArray(kept) ? kept : null;
-    },
+    shortcode: (placeholder) => form(placeholder) ?? drop(placeholder),
+    block: (placeholder) => form(placeholder) ?? drop(placeholder),
+    "*": drop,
   });
   for (const [tag, { count, blocks }] of [...dropped].sort(([a], [b]) => (a < b ? -1 : 1))) {
     add(
@@ -2482,6 +2517,7 @@ async function buildEntry(
   }
 
   const placed = resolvePlaceholders(
+    work,
     dropDynamic(converted.nodes, converted.state, report, where, url),
     report,
     where,
@@ -3139,6 +3175,14 @@ export async function buildCollections(
       ...BASE_PROPERTIES,
       authorUrl: { type: "string" },
       hasExcerpt: { type: "boolean" },
+      postType: { type: "string" },
+      ...(mine.some((b) => b.entry.frontmatter.authorInfo !== undefined)
+        ? { authorInfo: { type: "object" } }
+        : {}),
+      // Only a collection whose entries carry an embedded player's data (`wp/lazyblocks.ts`) names it.
+      ...(mine.some((b) => b.entry.frontmatter.captivate !== undefined)
+        ? { captivate: { type: "object" } }
+        : {}),
       ...relaxAddressFormats(fields.properties as Record<string, JsonSchema> | undefined),
     };
     // A group applies to some of the entries and not to others (a location rule on a taxonomy term, a

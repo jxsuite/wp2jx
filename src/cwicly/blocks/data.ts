@@ -137,6 +137,7 @@ import { createHash } from "node:crypto";
 import { parseBlocks } from "../../wp/blocks.ts";
 import { decodeEntities } from "../../wp/model.ts";
 import { entryKey, taxonomiesFor } from "../../wp/acf.ts";
+import { userProfiles } from "../../wp/profiles.ts";
 import type {
   BlockConverter,
   ConvertCtx,
@@ -153,6 +154,7 @@ import {
   jsString,
   parseLocation,
   postFacts,
+  userRef,
   resolveTokens,
   texturize,
   type EntryData,
@@ -332,7 +334,24 @@ export interface TermsPlan {
   dropped: string[];
 }
 
-export type QueryPlan = PostPlan | TermsPlan | Unsupported;
+/**
+ * A list of people: the users an ACF user field of the current post holds (`queryInclude`), a list of
+ * ids, or the people of some roles. Only people with a profile (`wp/profiles.ts`) are known. The block's
+ * own `fallback` pick (`226`) is the editor's sample: the live page lists nobody for a post whose field
+ * is empty (measured on an episode with no guest), so it is not used.
+ */
+export interface UsersPlan {
+  kind: "users";
+  /** The ACF field of the current post that names the people (its key). */
+  field: { key: string } | undefined;
+  ids: number[];
+  roles: string[];
+  rolesNotIn: string[];
+  order: "asc" | "desc";
+  dropped: string[];
+}
+
+export type QueryPlan = PostPlan | TermsPlan | UsersPlan | Unsupported;
 
 // ── What the export has ──────────────────────────────────────────────────────────────────────────
 
@@ -890,6 +909,55 @@ function urlRule(url: string, why: string): Cond {
   };
 }
 
+/**
+ * The author clauses: the author of the page being rendered (`queryAuthorName`, `queryAuthorIn`, source
+ * `authorname`: an author's own page, or "more by this author" on a post) or the authors a list of ids
+ * names (`queryAuthor`). An entry knows its author by the address of the author's page (`authorUrl`).
+ */
+function authorConds(env: PlanEnv, a: Rec): Cond[] {
+  const { ctx } = env;
+  const out: Cond[] = [];
+  const ofPage = ["queryAuthorName", "queryAuthorIn"].some((name) => {
+    const src = srcOf(a[name]);
+    return src.kind === "dynamic" && src.group === "authorname";
+  });
+  if (ofPage) {
+    const cur = env.current;
+    if (cur.kind === "entry" && isStateExpr(cur.expr) && !/^\$map\b/.test(cur.expr)) {
+      out.push({
+        js: `e.data.authorUrl === ${cur.expr}.data.authorUrl`,
+        dynamic: true,
+        why: "the author of the page",
+      });
+    } else if (cur.kind === "post") {
+      const url = ctx.urlForAuthor?.(cur.post.authorId);
+      if (url === undefined) drop(env, "the author of the page, who has no page of their own");
+      else
+        out.push({
+          js: `e.data.authorUrl === ${j(url)}`,
+          dynamic: false,
+          why: "the author of the page",
+        });
+    } else drop(env, "the author of the page, where this conversion has no page");
+  } else {
+    for (const name of ["queryAuthorName", "queryAuthorIn"])
+      if (holdsValue(a[name])) drop(env, name);
+  }
+  const ids = itemsOf(a.queryAuthor, COMMAS).map(Number).filter(Number.isInteger);
+  if (srcOf(a.queryAuthor).kind === "static" && ids.length > 0) {
+    const urls = ids
+      .map((id) => ctx.urlForAuthor?.(id))
+      .filter((u): u is string => u !== undefined);
+    out.push({
+      js: `${j(urls)}.includes(e.data.authorUrl)`,
+      dynamic: false,
+      why: `authors ${ids.join(",")}`,
+    });
+  } else if (srcOf(a.queryAuthor).kind === "dynamic")
+    drop(env, "authors read from a dynamic source");
+  return out;
+}
+
 function excludeConds(env: PlanEnv, a: Rec): Cond[] {
   const { ctx } = env;
   const out: Cond[] = [];
@@ -1020,6 +1088,9 @@ const READ_ATTRS = new Set([
   "querySticky",
   "queryPostStatus",
   "queryTaxonomies",
+  "queryAuthor",
+  "queryAuthorName",
+  "queryAuthorIn",
 ]);
 
 /** Whether an attribute holds anything that narrows or changes a query. */
@@ -1123,6 +1194,7 @@ function planPosts(block: WpBlock, ctx: ConvertCtx, env: PlanEnv): PostPlan {
   const conds: Cond[] = [
     ...(inherit ? [] : excludeConds(env, a)),
     ...taxConds(env, a),
+    ...authorConds(env, a),
     ...metaConds(env, a),
     ...(inherit ? [] : searchConds(env, a)),
   ];
@@ -1248,6 +1320,47 @@ function planTerms(block: WpBlock, env: PlanEnv): TermsPlan {
   };
 }
 
+/** Query attributes of a users query that name something a static list cannot follow. */
+const USER_QUERY_UNSUPPORTED = [
+  "queryMeta",
+  "queryWho",
+  "queryHasPublishedPosts",
+  "queryBlogId",
+  "querySearchColumn",
+];
+
+function planUsers(block: WpBlock, env: PlanEnv): UsersPlan {
+  const a = block.attrs;
+  const include = srcOf(a.queryInclude);
+  let field: UsersPlan["field"];
+  let ids: number[] = [];
+  if (include.kind === "static") {
+    ids = itemsOf(a.queryInclude, WP_ID_LIST).map(Number).filter(Number.isInteger);
+  } else if (include.kind === "dynamic") {
+    if (include.type === "acf" && include.field !== "") {
+      field = { key: include.field };
+    } else drop(env, `people read from ${include.group || include.type}`);
+  } else if (include.kind === "ref") drop(env, "people chosen by a component property");
+  const search = srcOf(a.querySearch);
+  if (search.kind === "dynamic" && search.group === "urlparameter") {
+    env.info.push({
+      code: "query.url-parameter",
+      message: `The query is filtered by the URL parameter ${j(search.field)}, which a static site never has: the list is the unfiltered one, as the live page's with no parameter.`,
+      detail: search.field,
+    });
+  } else if (search.kind !== "none") drop(env, "a search of the people");
+  for (const name of USER_QUERY_UNSUPPORTED) if (holdsValue(a[name])) drop(env, name);
+  return {
+    kind: "users",
+    field,
+    ids,
+    roles: itemsOf(a.queryRole, COMMAS),
+    rolesNotIn: itemsOf(a.queryRoleNotIn, COMMAS),
+    order: (staticOne(srcOf(a.queryOrder)) ?? "ASC").toUpperCase() === "DESC" ? "desc" : "asc",
+    dropped: env.dropped,
+  };
+}
+
 /**
  * What a `cwicly/query` block asks for, as a plan the rest of this module writes as Jx state (or
  * evaluates, for a Markdown entry and for the counts). `env.info` and `env.dropped` carry what was
@@ -1259,13 +1372,10 @@ export function planQuery(
 ): { plan: QueryPlan; info: PlanEnv["info"] } {
   const env: PlanEnv = { ctx, block, dropped: [], info: [], current: currentOf(ctx) };
   const type = str(block.attrs.queryType) ?? "posts";
-  if (type === "users" || type === "comments" || type === "products") {
+  if (type === "users") return { plan: planUsers(block, env), info: env.info };
+  if (type === "comments" || type === "products") {
     const why =
-      type === "users"
-        ? "the converted site has no users to list (the export carries no user accounts or their fields)"
-        : type === "comments"
-          ? "the converted site has no comments"
-          : "the converted site has no shop";
+      type === "comments" ? "the converted site has no comments" : "the converted site has no shop";
     return { plan: { kind: "unsupported", what: type, why }, info: [] };
   }
   if (type === "terms") return { plan: planTerms(block, env), info: env.info };
@@ -1286,10 +1396,14 @@ export interface EntryLike {
   data: EntryData;
 }
 
-const entryLike = (ctx: ConvertCtx, post: WpPost): EntryLike => ({
-  id: ctx.urlFor("post", post.id) ?? String(post.id),
-  data: postFacts(ctx, post),
-});
+const entryLike = (ctx: ConvertCtx, post: WpPost): EntryLike => {
+  const authorUrl = ctx.urlForAuthor?.(post.authorId);
+  return {
+    id: ctx.urlFor("post", post.id) ?? String(post.id),
+    // An entry holds the address of its author's page (`authorUrl`, written by the collections), which a clause on the author reads.
+    data: { ...postFacts(ctx, post), ...(authorUrl === undefined ? {} : { authorUrl }) },
+  };
+};
 
 /** The conditions of a plan compiled to one function over an entry: how the posts of a plan are selected now. */
 export function compileConditions(conds: readonly Cond[]): (e: EntryLike) => boolean {
@@ -1520,6 +1634,129 @@ function sortTerms(terms: WpTerm[], by: string, order: "asc" | "desc"): WpTerm[]
   });
 }
 
+const USER_ORDER: Readonly<Record<string, string>> = {
+  display_name: "title",
+  name: "title",
+  nicename: "slug",
+  login: "slug",
+  user_login: "slug",
+  user_nicename: "slug",
+  ID: "id",
+  id: "id",
+  // `date` is a post's key: WP_User_Query does not know it, and an `orderby` it cannot parse is
+  // `user_login` (the plugin passes the block's value on as it is), so the people are by login.
+  // An account's `user_nicename` is its login, lowercased and hyphenated, and the export has that.
+  date: "slug",
+  // Registration order is the order of the accounts.
+  registered: "id",
+  user_registered: "id",
+};
+
+/**
+ * The people of a users query as a source for a loop: the ACF user field of the current post (an
+ * expression over the entry, or the people it names now on a static page), a fixed list of ids, or the
+ * people of some roles. A person the export has no profile for is not on the list, and the report says so.
+ */
+export function userList(
+  ctx: ConvertCtx,
+  plan: UsersPlan,
+  block: WpBlock,
+): {
+  source: ListSource;
+  notes: { code: string; severity: "info" | "warn"; message: string; detail: string }[];
+} {
+  const notes: { code: string; severity: "info" | "warn"; message: string; detail: string }[] = [];
+  const person = (id: number): Rec | undefined => {
+    const found = userRef(ctx, id);
+    if (found === undefined) {
+      notes.push({
+        code: "query.user-missing",
+        severity: "warn",
+        message: `The query lists the user ${id}, who is not on the converted site (no account the export carries has that id).`,
+        detail: String(id),
+      });
+    }
+    return found as Rec | undefined;
+  };
+  const by = USER_ORDER[staticOne(srcOf(block.attrs.queryOrderBy)) ?? ""] ?? "slug";
+  const sorted = (rows: Rec[]): Rec[] => {
+    const flip = plan.order === "desc" ? -1 : 1;
+    return rows.sort((a, b) => {
+      const x = a[by] as string | number;
+      const y = b[by] as string | number;
+      return flip * (typeof x === "number" ? x - (y as number) : collate(String(x), String(y)));
+    });
+  };
+  const fixed = (): Rec[] => {
+    if (plan.field === undefined && plan.ids.length > 0) {
+      return sorted(plan.ids.map(person).filter((r): r is Rec => r !== undefined));
+    }
+    // The people of some roles: those with a profile, since no other account is read.
+    const ids = [...userProfiles(ctx.model).values()]
+      .filter(
+        (p) =>
+          (plan.roles.length === 0 || plan.roles.some((r) => p.roles.includes(r))) &&
+          !plan.rolesNotIn.some((r) => p.roles.includes(r)),
+      )
+      .map((p) => p.id);
+    if (plan.roles.length > 0 || plan.rolesNotIn.length > 0) {
+      notes.push({
+        code: "query.users-profiled",
+        severity: "info",
+        message: `The list of people${plan.roles.length > 0 ? ` of the role ${plan.roles.join(", ")}` : ""} holds the ${ids.length} accounts that have a profile (the photograph, position and biography fields): an account with none is not read, so it is not on the list.`,
+        detail: [...plan.roles, ...plan.rolesNotIn.map((r) => `!${r}`)].join(","),
+      });
+    }
+    return sorted(ids.map(person).filter((r): r is Rec => r !== undefined));
+  };
+  const staticSource = (rows: Rec[]): ListSource =>
+    rows.length === 0
+      ? NOTHING
+      : {
+          pointer: rowsPointer(
+            ctx,
+            `users_q${keyOf(str(block.attrs.queryId) ?? hashOf(rows))}`,
+            rows,
+          ),
+        };
+
+  if (plan.field === undefined) return { source: staticSource(fixed()), notes };
+  const info = fieldByKey(ctx.acf, plan.field.key);
+  if (info === undefined || info.field.type !== "user") {
+    notes.push({
+      code: "query.approximated",
+      severity: "warn",
+      message: `The query takes its people from the ACF field ${plan.field.key}, which ${info === undefined ? "no field group defines" : `is a ${info.field.type}, not a user field`}: the list is left empty.`,
+      detail: plan.field.key,
+    });
+    return { source: NOTHING, notes };
+  }
+  const found = acfRef(ctx, info, { kind: "current" });
+  if (!("ref" in found)) {
+    notes.push({
+      code: "query.approximated",
+      severity: "warn",
+      message: `The query takes its people from the ACF field ${info.field.name}, which cannot be read here (${found.problem}): the list is left empty.`,
+      detail: info.field.name,
+    });
+    return { source: NOTHING, notes };
+  }
+  const ref: Ref = found.ref;
+  if (!isExprRef(ref)) {
+    const held = ref.value === undefined || ref.value === null ? [] : [ref.value].flat();
+    return { source: staticSource(held as Rec[]), notes };
+  }
+  // A person is one object (a field that holds one) or a list of them; an entry with none lists nobody.
+  const pick = `[].concat(${ref.expr} ?? [])`;
+  // WP_User_Query orders the people it was given by the block's own order (registration, newest first, by default).
+  const flip = plan.order === "desc" ? -1 : 1;
+  const compare =
+    by === "id"
+      ? `${flip} * (a.id - b.id)`
+      : `${flip} * String(a.${by}).localeCompare(String(b.${by}))`;
+  return { source: { expr: `${pick}.slice().sort((a, b) => ${compare})` }, notes };
+}
+
 /** The terms a `terms` query lists, in order. */
 export function termRows(ctx: ConvertCtx, plan: TermsPlan): TermRow[] {
   let terms = plan.taxonomies.flatMap((tax) => termsIn(ctx, tax));
@@ -1547,7 +1784,15 @@ const LOOP = Symbol("wp2jx.data.loop");
  * (a query with no entries to show, or that this tool cannot translate: the template keeps its box).
  */
 export type Loop =
-  | { kind: "live"; source: ListSource; entryType?: string; terms?: boolean }
+  | {
+      kind: "live";
+      source: ListSource;
+      entryType?: string;
+      terms?: boolean;
+      users?: boolean;
+      /** The rows themselves, for a list the item is written out for (a component's terms). */
+      rows?: readonly unknown[];
+    }
   | { kind: "static"; posts: WpPost[] }
   | { kind: "none" };
 
@@ -1557,6 +1802,10 @@ const loopOf = (ctx: ConvertCtx): Loop | undefined =>
 /** Context overrides that carry a loop (or clear it, with `undefined`) to the blocks inside. */
 const withLoop = (loop: Loop | undefined, more: Partial<ConvertCtx> = {}): Partial<ConvertCtx> =>
   ({ ...more, [LOOP]: loop }) as unknown as Partial<ConvertCtx>;
+
+/** Whether the blocks being converted become a component (a Cwicly component or a template part). */
+const inComponent = (ctx: ConvertCtx): boolean =>
+  ctx.mode === "component" || (ctx as { inComponent?: boolean }).inComponent === true;
 
 /** A mapped array over a pointer. */
 function mapped(pointer: string, map: JxElement): JxElement {
@@ -1657,6 +1906,62 @@ function nodeExpr(value: unknown, depth: number): string {
   return JSON.stringify(value) ?? "undefined";
 }
 
+const hasLoopRefs = (value: unknown): boolean =>
+  value !== null &&
+  typeof value === "object" &&
+  (Array.isArray(value)
+    ? value.some(hasLoopRefs)
+    : "$prototype" in value || "$ref" in value || Object.values(value).some(hasLoopRefs));
+
+/** The value of a binding that reads the row alone, or `undefined` when it reads anything else (a name the build knows and this does not) or fails. */
+function rowValue(expr: string, row: unknown, index: number): { value: unknown } | undefined {
+  try {
+    return { value: new Function("$map", `return (${expr});`)({ item: row, index }) };
+  } catch {
+    return undefined;
+  }
+}
+
+/** A string of the item for one row: each binding of the row replaced by its value, any other left as it is. */
+function rowString(text: string, row: unknown, index: number): unknown {
+  if (!text.includes("${")) return text;
+  const parts = bindingParts(text);
+  const values = parts.map((p) =>
+    p.expr === undefined ? undefined : rowValue(p.expr, row, index),
+  );
+  const only = parts[0]!;
+  if (parts.length === 1 && only.expr !== undefined) {
+    const v = values[0];
+    return v !== undefined && (v.value === null || typeof v.value !== "object") ? v.value : text;
+  }
+  return parts
+    .map((p, i) =>
+      p.expr === undefined
+        ? p.lit
+        : values[i] === undefined
+          ? `\${${p.expr}}`
+          : String(values[i]!.value),
+    )
+    .join("");
+}
+
+function rowNode(value: unknown, row: unknown, index: number): unknown {
+  if (typeof value === "string") return rowString(value, row, index);
+  if (Array.isArray(value)) return value.map((v) => rowNode(v, row, index));
+  if (value !== null && typeof value === "object")
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rowNode(v, row, index)]));
+  return value;
+}
+
+/**
+ * The item once per row, with the row's values written in: the children of a list whose rows are known
+ * and that must not be a `$ref` (a component's), or `undefined` when the item holds a loop of its own.
+ */
+export function writtenOut(item: JxElement, rows: readonly unknown[]): JxNode[] | undefined {
+  if (hasLoopRefs(item)) return undefined;
+  return rows.map((row, index) => rowNode(item, row, index) as JxNode);
+}
+
 /** The children of a loop's element: the mapped array over a pointer, or the computed children that write each item of an expression's list. */
 export function loopChildren(source: ListSource, item: JxElement): JxNode[] {
   if ("pointer" in source) return [mapped(source.pointer, item)];
@@ -1710,15 +2015,19 @@ function sayHidden(ctx: ConvertCtx, block: WpBlock, source: ListSource, item: Jx
 /** The context a loop item is converted in: `$map.item` is the entry, and the loop is not the block's own any more. */
 function itemContext(loop: Extract<Loop, { kind: "live" }>): Partial<ConvertCtx> {
   const more: Record<string, unknown> =
-    loop.terms === true
-      ? { termExpr: "$map.item" }
-      : {
-          mode: "entry",
-          entryExpr: "$map.item",
-          // `$map` inside is the entry; an enclosing repeater's row is out of reach.
-          rowExpr: undefined,
-          ...(loop.entryType === undefined ? {} : { entryType: loop.entryType }),
-        };
+    loop.users === true
+      ? // A person is a row, not the entry: the page's own entry is still the entry.
+        { rowExpr: "$map.item" }
+      : loop.terms === true
+        ? { termExpr: "$map.item" }
+        : {
+            mode: "entry",
+            entryExpr: "$map.item",
+            // `$map` inside is the entry; an enclosing repeater's row is out of reach.
+            rowExpr: undefined,
+            // The page's own type is not the items' (a list of several types has none: they carry `postType`).
+            entryType: loop.entryType,
+          };
   return withLoop(undefined, more as Partial<ConvertCtx>);
 }
 
@@ -1956,7 +2265,8 @@ const query: BlockConverter = (block, ctx) => {
         loop = {
           kind: "live",
           source,
-          ...(plan.types[0] === undefined ? {} : { entryType: plan.types[0] }),
+          // A list of several types has no one type for its items: they carry their own (`postType`).
+          ...(plan.types.length === 1 ? { entryType: plan.types[0]! } : {}),
         };
         const shown = lengthOf(source);
         // `found_posts` ignores the page size: a list that is cut has a second source, with no limit, only if a block asks.
@@ -2005,6 +2315,23 @@ const query: BlockConverter = (block, ctx) => {
           },
         );
       }
+    } else if (plan.kind === "users") {
+      if (targetOf(ctx) === "markdown") {
+        say(
+          ctx,
+          block,
+          "block.unsupported",
+          "warn",
+          "A list of people has no static form in a Markdown entry: it is left empty.",
+          { detail: "users-markdown", feature: "query-users" },
+        );
+      } else {
+        const people = userList(ctx, plan, block);
+        loop = { kind: "live", source: people.source, users: true };
+        counts = { shown: lengthOf(people.source), total: () => lengthOf(people.source) };
+        for (const note of people.notes)
+          say(ctx, block, note.code, note.severity, note.message, { detail: note.detail });
+      }
     } else if (targetOf(ctx) === "markdown") {
       say(
         ctx,
@@ -2024,7 +2351,14 @@ const query: BlockConverter = (block, ctx) => {
         `terms_${keyOf(plan.taxonomies.join("_"))}_q${keyOf(str(block.attrs.queryId) ?? hashOf(plan))}`,
         rows,
       );
-      loop = { kind: "live", source: { pointer: `#/state/${key}` }, terms: true };
+      // Rows a component can list as they are: a mapped array is a `$ref`, which keeps the component
+      // from being static, and a computed list is not expanded inside a component by the build.
+      loop = {
+        kind: "live",
+        source: { pointer: `#/state/${key}` },
+        terms: true,
+        ...(inComponent(ctx) ? { rows } : {}),
+      };
       const shown = `state.${key}.length`;
       counts = { shown, total: () => shown };
       if (rows.length === 0) {
@@ -2192,7 +2526,9 @@ const queryTemplate: BlockConverter = (block, ctx) =>
         sayHidden(ctx, block, loop.source, built);
         return {
           tag: "div",
-          children: loopChildren(loop.source, built),
+          children:
+            (loop.rows !== undefined && writtenOut(built, loop.rows)) ||
+            loopChildren(loop.source, built),
           attributes: { "cc-query-template": "" },
         };
       }

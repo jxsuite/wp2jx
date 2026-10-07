@@ -121,10 +121,17 @@ export const DEFAULT_NOISE: NoiseConfig = {
   ],
 };
 
-/** The mask lists with extra selectors added (`--mask`). The extra ones blank: the box stays. */
-export function withMasks(base: NoiseConfig, extraBlank: readonly string[]): NoiseConfig {
+/**
+ * The mask lists with extra selectors added: `--mask` ones blank (the box stays), `--remove` ones leave
+ * the layout (an element that is on one side only because the dump is older than the live site).
+ */
+export function withMasks(
+  base: NoiseConfig,
+  extraBlank: readonly string[],
+  extraRemove: readonly string[] = [],
+): NoiseConfig {
   return {
-    remove: [...base.remove],
+    remove: [...base.remove, ...extraRemove],
     blank: [...base.blank, ...extraBlank],
     blockUrls: [...base.blockUrls],
   };

@@ -27,6 +27,7 @@ import {
   linkAttributes,
   markupContent,
   markupNodes,
+  paragraphValue,
   placeholder,
   prepare,
   record,
@@ -1680,3 +1681,65 @@ describe("the whole corpus", () => {
 // A parse of the built HTML is how the tests above that build read their pages.
 void parseFragment;
 void blockLink;
+
+describe("paragraphValue", () => {
+  /** What the binding prints for a value, as the build evaluates it. */
+  const printed = (binding: string, state: unknown): unknown =>
+    new Function("state", `return \`${binding.replace(/^\$\{/, "${").replaceAll("`", "\\`")}\`;`)(
+      state,
+    );
+
+  test("a paragraph's last closing tag is left to the box that holds it", () => {
+    const binding = paragraphValue("${state.entry.data.description ?? ''}");
+    const html = (v: string) => printed(binding, { entry: { data: { description: v } } });
+    // `<p>` + `<p>a</p>` + `</p>` would open an empty paragraph after the text (the plugin's page has none).
+    expect(html("<p>a</p>\n")).toBe("<p>a");
+    expect(html("<p>a</p><p>b</p>")).toBe("<p>a</p><p>b");
+    expect(html('  <p class="x">a</p>')).toBe('  <p class="x">a');
+    expect(html("plain text")).toBe("plain text");
+    // Only a value that opens a paragraph of its own closes the box that holds it.
+    expect(html("a</p>")).toBe("a</p>");
+    expect(html("<strong>bold</strong>")).toBe("<strong>bold</strong>");
+    expect(html("")).toBe("");
+  });
+
+  test("the browser then reads the same boxes as the plugin's markup", () => {
+    const binding = paragraphValue("${state.v}");
+    const wrapped = `<p>${printed(binding, { v: "<p>a</p>\n" })}</p>`;
+    const paragraphs = (markup: string): string[] =>
+      [...parseFragment(markup).childNodes]
+        .filter((n) => n.nodeName === "p")
+        .map((n) =>
+          ("childNodes" in n ? (n.childNodes as { value?: string }[]) : [])
+            .map((c) => c.value ?? "")
+            .join(""),
+        );
+    expect(paragraphs(wrapped)).toEqual(paragraphs("<p></p><p>a</p>"));
+    // What it replaces printed a third, empty box.
+    expect(paragraphs("<p><p>a</p>\n</p>")).toHaveLength(3);
+  });
+
+  test("a binding that is not one whole value, and text that is not a binding, are kept", () => {
+    expect(paragraphValue("<strong>Tags:</strong> ")).toBe("<strong>Tags:</strong> ");
+    expect(paragraphValue("Tags ${state.a} and ${state.b}")).toBe("Tags ${state.a} and ${state.b}");
+    expect(paragraphValue("${`x ${state.a}`}")).toBe("${`x ${state.a}`}");
+  });
+
+  test("real: the episode's description paragraph gives up its closing tag; a heading that prints the same field does not", async () => {
+    const subject: Subject = { kind: "template", slug: "single-episode" };
+    const ctx = await ctxOf("ap", subject, { mode: "entry", entryType: "episode" });
+    const b = await realBlock("ap", subject, "paragraph-cb35144");
+    const p = el(ctx.convert([b])[0]);
+    expect(p.tagName).toBe("p");
+    expect(p.innerHTML).toBe(paragraphValue("${state.entry.data.description ?? ''}"));
+    const same = (tag: string) =>
+      el(
+        assemble(prepare(b, ctx)!, {
+          forceTag: tag,
+          content: { innerHTML: "${state.entry.data.description}" },
+        }).nodes[0],
+      ).innerHTML;
+    expect(same("p")).toBe(paragraphValue("${state.entry.data.description}"));
+    expect(same("h3")).toBe("${state.entry.data.description}");
+  });
+});

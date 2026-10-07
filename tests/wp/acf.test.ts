@@ -424,13 +424,17 @@ describe("loadAcf: anabaptistperspectives", () => {
     });
   });
 
-  test("a group attached to users applies to no post, and says so", () => {
+  test("a group attached to the user form applies to a person and to no post or term", () => {
     const { acf, report } = ap;
     const users = acf.groups.find((g) => g.title === "Users")!;
     expect(users.location).toEqual([[{ param: "user_form", operator: "==", value: "edit" }]]);
-    expect(codes(report, "acf.location-other-object")).toHaveLength(1);
-    expect(codes(report, "acf.location-other-object")[0]!.data).toEqual({ objects: "users" });
+    expect(codes(report, "acf.location-other-object")).toEqual([]);
     expect(codes(report, "acf.location-unsupported")).toEqual([]);
+    expect(groupsFor(acf, { kind: "user", userId: 226 })).toContain(users);
+    expect(
+      groupsFor(acf, { kind: "term", taxonomy: "category", termId: 1, slug: "a" }),
+    ).not.toContain(users);
+    expect(groupsFor(acf, { kind: "post", postType: "post", postId: 1 })).not.toContain(users);
   });
 
   test("a field named like a key of the entry data contract is reported and renamed", () => {
@@ -4127,7 +4131,6 @@ describe("groupsFor: parameters, as the report on loading says them", () => {
 
   test("the screens of other objects are told once each, with what they are, and apply to no post or term", () => {
     const objects: [string, string][] = [
-      ["user_form", "users"],
       ["user_role", "users"],
       ["comment", "comments"],
       ["nav_menu", "menus"],
@@ -4154,6 +4157,30 @@ describe("groupsFor: parameters, as the report on loading says them", () => {
         expect(groupsFor(acf, target)).toEqual([]);
       }
     }
+  });
+
+  test("the user form shows a group on edit and on all, never on add; a role cannot be told", () => {
+    const rule = (value: string, operator = "==") => [[{ param: "user_form", operator, value }]];
+    const person = { kind: "user", userId: 7 } as AcfTarget;
+    for (const [value, operator, applies] of [
+      ["edit", "==", true],
+      ["all", "==", true],
+      ["add", "==", false],
+      ["register", "==", false],
+      ["edit", "!=", false],
+      ["add", "!=", true],
+    ] as const) {
+      const { report, acf } = locate(rule(value, operator), page());
+      expect([value, operator, groupsFor(acf, person).length === 1]).toEqual([
+        value,
+        operator,
+        applies,
+      ]);
+      expect(codes(report, "acf.location-other-object")).toEqual([]);
+      expect(groupsFor(acf, page())).toEqual([]);
+    }
+    const { acf } = locate([[{ param: "user_role", operator: "==", value: "editor" }]], page());
+    expect(groupsFor(acf, person)).toEqual([]);
   });
 
   test("a rule about the viewer is a warning of its own, and a parameter nobody knows is another", () => {

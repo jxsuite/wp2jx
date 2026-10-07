@@ -43,6 +43,7 @@
  * `dynamic.unrouted-reference`, `link.unresolved`, `token.approximated`.
  */
 import { decodeEntities, publicUrl, termsOf } from "../wp/model.ts";
+import { userProfiles } from "../wp/profiles.ts";
 import { acfValues, entryKey, postTarget, termTarget, toEntryData, zoneClock } from "../wp/acf.ts";
 import type { AcfField, AcfGroup, AcfModel, EntryHooks, EntryImage, EntryRef } from "../wp/acf.ts";
 import { php } from "../wp/seo.ts";
@@ -896,6 +897,48 @@ function cacheFor(ctx: ConvertCtx): Map<string, EntryData> {
 /** ACF's own findings about a value belong to the module that writes the entry, not to every page that reads it. */
 const DISCARD = { add: () => undefined, entries: () => [] } as const;
 
+/** The ACF fields of a person's profile in the shapes of the entry data contract, none for a person with no profile. */
+/** A person as an entry holds a reference to one: `{id, slug, title, url}` and the profile's own fields. */
+export function userRef(ctx: ConvertCtx, id: number): EntryRef | undefined {
+  return hooksFor(ctx).user(id);
+}
+
+export function userFields(
+  ctx: ConvertCtx,
+  id: number,
+  hasProfile: boolean,
+): Record<string, unknown> {
+  if (!hasProfile) return {};
+  const key = `user-fields:${id}`;
+  const cache = cacheFor(ctx);
+  const hit = cache.get(key);
+  if (hit) return hit;
+  // A person's field that refers to a person is read as a bare reference: no profile inside a profile.
+  const bare: EntryHooks = {
+    ...hooksFor(ctx),
+    user: (other) => {
+      const user = ctx.model.users.get(other) ?? userProfiles(ctx.model).get(other);
+      return user
+        ? {
+            id: other,
+            slug: user.slug,
+            title: user.displayName,
+            url: ctx.urlForAuthor?.(other) ?? "",
+          }
+        : undefined;
+    },
+  };
+  // ACF reads a wysiwyg value through `acf_the_content`, `wpautop` among its filters: the site prints
+  // the paragraphs, not the stored text (a biography pasted from a word processor has none stored).
+  const values = acfValues(ctx.model, ctx.acf, { kind: "user", userId: id }, { report: DISCARD });
+  for (const raw of Object.values(values)) {
+    if (raw.type === "wysiwyg" && typeof raw.value === "string") raw.value = php.wpautop(raw.value);
+  }
+  const data = toEntryData(values, bare) as EntryData;
+  cache.set(key, data);
+  return data;
+}
+
 function hooksFor(ctx: ConvertCtx): EntryHooks {
   /** An object the field holds that exists but has no page of its own (a podcast, a form entry) is still there: the field is filled. */
   const unrouted = (kind: "post" | "term", id: number): void => {
@@ -933,8 +976,20 @@ function hooksFor(ctx: ConvertCtx): EntryHooks {
       return { id, slug: term.slug, title: decodeEntities(term.name), url: url ?? "" };
     },
     user(id): EntryRef | undefined {
-      const user = ctx.model.users.get(id);
-      return user ? { id, slug: user.slug, title: user.displayName, url: "" } : undefined;
+      const profile = userProfiles(ctx.model).get(id);
+      const user = ctx.model.users.get(id) ?? profile;
+      if (!user) return undefined;
+      // A person the site has a page for (an author) links there; a guest or a host who never posted has none.
+      const url = ctx.urlForAuthor?.(id) ?? "";
+      // What the site prints about the person (the ACF fields of the user form) travels with the reference, so
+      // a template that lists hosts and guests reads their photograph, position and biography from the entry.
+      return {
+        ...userFields(ctx, id, profile !== undefined),
+        id,
+        slug: user.slug,
+        title: user.displayName,
+        url,
+      };
     },
     missing(kind, id, field) {
       report(
@@ -1331,6 +1386,40 @@ export function parseLocation(location: string | undefined): AcfScope {
   return { kind: "unsupported", detail: loc };
 }
 
+/**
+ * Where the profile fields of the person a location names are: `userquery` is the person of the users
+ * query loop the block sits in (an item of it, `$map.item`), and `user_<id>` a person known now.
+ * `currentauthor` is not read: see below.
+ */
+function userSource(
+  ctx: ConvertCtx,
+  detail: string,
+): { expr: string } | { fields: Record<string, unknown> } | { problem: string } {
+  if (detail === "userquery") {
+    const row = extrasOf(ctx).rowExpr;
+    return row === undefined
+      ? { problem: "a field of a person in a list of users needs the users query it is in" }
+      : { expr: row };
+  }
+  if (detail === "currentauthor") {
+    // Measured on the live pages: the block prints its own fallback (an image block `src=""` and its
+    // fallback picture on an essay, an empty picture on an author page) whatever the author holds. The
+    // plugin's `currentauthor` location reads nothing there, so nothing is read here.
+    return { problem: "the plugin's currentauthor location reads no field on the live pages" };
+  }
+  const id = /^user_(\d+)$/.exec(detail)?.[1];
+  if (id !== undefined) {
+    return profileOf(ctx, Number(id))
+      ? { fields: userFields(ctx, Number(id), true) }
+      : { problem: `the user ${id} has no profile in the export` };
+  }
+  return {
+    problem: `the field is read from a user (${detail}), which the converted site cannot name`,
+  };
+}
+
+const profileOf = (ctx: ConvertCtx, id: number): boolean => userProfiles(ctx.model).has(id);
+
 /** The reference to an ACF field's value for a scope, or why there is none. */
 export function acfRef(
   ctx: ConvertCtx,
@@ -1382,10 +1471,18 @@ export function acfRef(
       );
       return { ref: walk({ value: toEntryData(values, hooksFor(ctx))[entryKey(top)] }) };
     }
-    case "user":
+    case "user": {
+      const where = userSource(ctx, scope.detail);
+      if ("problem" in where) return where;
+      const key = entryKey(top);
       return {
-        problem: `the field is read from a user (${scope.detail}), and the converted site has no users`,
+        ref: walk(
+          "expr" in where
+            ? { expr: optPath(where.expr, key) }
+            : { value: (where.fields as Record<string, unknown>)[key] },
+        ),
       };
+    }
     case "unsupported":
       return { problem: `the location "${scope.detail}" is not one this tool can read` };
   }
@@ -1588,6 +1685,17 @@ export function fieldText(ctx: ConvertCtx, f: AcfField, ref: Ref): Val | undefin
       return undefined;
   }
 }
+
+/** What `{authorinfo=…}` an author page's entry holds. */
+const AUTHOR_PAGE_INFO: ReadonlySet<string> = new Set(["first_name", "last_name", "description"]);
+
+/** What `{userquery=…}` names of a person, and where the item of the loop holds it. */
+const USER_QUERY_KEYS: Readonly<Record<string, string>> = {
+  display_name: "title",
+  user_nicename: "slug",
+  ID: "id",
+  id: "id",
+};
 
 // ── The token table ──────────────────────────────────────────────────────────────────────────────
 
@@ -2014,6 +2122,11 @@ function acfField(env: Env, args: string[]): Outcome {
     text = textOfRef(ref);
   } else {
     text = fieldText(ctx, info.field, ref);
+    // Measured on the live pages: a person's biography (a wysiwyg field of the user form) prints as text,
+    // its `<p>` tags and all, where the same kind of field of a post prints as markup.
+    if (text !== undefined && scope.kind === "user" && info.field.type === "wysiwyg") {
+      text = escapedText({ ...text, html: false });
+    }
     if (text === undefined) {
       report(
         ctx,
@@ -2026,6 +2139,20 @@ function acfField(env: Env, args: string[]): Outcome {
     }
   }
   return orElse(subbed ? text : withoutPhpZero(info.field, text), fallback) ?? litV("");
+}
+
+/**
+ * What `esc_html` makes of a value, as the text the page shows. It does not escape the `&` of a
+ * character reference that is already there (`&quot;` stays `&quot;`), so the browser reads it as the
+ * character; the emitter below this escapes every `&`, so the references are read here, once.
+ */
+function escapedText(v: Val): Val {
+  if ("lit" in v) return { ...v, lit: decodeEntities(v.lit) };
+  const read =
+    "(s) => String(s).replace(/&(#\\d+|#[xX][0-9a-fA-F]+|quot|amp|lt|gt|apos|nbsp);/g, " +
+    "(m, e) => e[0] === '#' ? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : +e.slice(1)) " +
+    ": ({quot: '\\x22', amp: '&', lt: '<', gt: '>', apos: '\\x27', nbsp: '\\xa0'})[e])";
+  return { ...v, expr: `(${read})(${v.expr})` };
 }
 
 /** The field types whose value is one scalar, which Cwicly's `if ($field)` reads as empty when it is `0` or `"0"`. */
@@ -2143,8 +2270,6 @@ const UNSUPPORTED: Readonly<Record<string, string>> = {
   formcomment: "comments are not carried over",
   currentcommenter: "comments are not carried over",
   commentcookiescheck: "comments are not carried over",
-  userquery: "user queries need a user list, which the converted site does not have",
-  userqueryurl: "user queries need a user list, which the converted site does not have",
   loginurl: "the converted site has no login",
   directlogout: "the converted site has no login",
   postquery: "query output is the query converter's",
@@ -2268,9 +2393,11 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
   posttype: (_a, env) => {
     const post = subjectPost(env.ctx);
     if (post) return litV(post.type);
-    return env.ctx.entryType === undefined
-      ? drop("the post type of the entry is unknown")
-      : litV(env.ctx.entryType);
+    if (env.ctx.entryType !== undefined) return litV(env.ctx.entryType);
+    const r = currentRef(env.ctx, "postType");
+    return r && isExprRef(r)
+      ? exprV(`${r.expr} ?? ''`)
+      : drop("the post type of the entry is unknown");
   },
   postparentid: () => drop("the parent post id is not in the entry data"),
   postcategories: (_a, env) => termNames(env, "{postcategories}", "category"),
@@ -2294,6 +2421,28 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const wanted = attr(env, "dynamicWordPressAuthorInfo") ?? "description";
     const r = wanted === "display_name" ? currentRef(env.ctx, "author") : undefined;
     if (r) return withFallback(env, textOfRef(r));
+    // An author page's own entry holds the profile's names and biography.
+    if (
+      env.ctx.mode === "entry" &&
+      env.ctx.entryExpr === "state.author" &&
+      AUTHOR_PAGE_INFO.has(wanted)
+    ) {
+      return withFallback(env, exprV(`${optPath(entryDataExpr(env.ctx), wanted)} ?? ''`));
+    }
+    // The author of an entry or of a page: their biography and names, as the entry (`authorInfo`) holds them.
+    if (AUTHOR_PAGE_INFO.has(wanted)) {
+      if (env.ctx.mode === "entry") {
+        return withFallback(
+          env,
+          exprV(`${optPath(optPath(entryDataExpr(env.ctx), "authorInfo"), wanted)} ?? ''`),
+        );
+      }
+      const author = subjectPost(env.ctx)?.authorId;
+      const held =
+        author === undefined ? undefined : userProfiles(env.ctx.model).get(author)?.meta[wanted];
+      if (author !== undefined)
+        return withFallback(env, litV(typeof held === "string" ? held : ""));
+    }
     const post = subjectPost(env.ctx);
     const user = post ? env.ctx.model.users.get(post.authorId) : undefined;
     if (user && wanted === "user_nicename") return litV(user.slug);
@@ -2310,6 +2459,22 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const id = post?.authorId;
     const url = id === undefined ? undefined : extrasOf(env.ctx).urlForAuthor?.(id);
     return url === undefined ? drop("the author archive is not on the converted site") : litV(url);
+  },
+  // The person of a users query loop: an item of it is `{id, slug, title, url, …profile fields}`.
+  userquery: (a, env) => {
+    const row = extrasOf(env.ctx).rowExpr;
+    if (row === undefined) return drop("a user query token outside the loop of a users query");
+    const name = a[0] ?? "display_name";
+    const key = USER_QUERY_KEYS[name];
+    return key === undefined
+      ? drop(`the user's ${name} is not carried over`)
+      : exprV(`${optPath(row, key)} ?? ''`);
+  },
+  userqueryurl: (_a, env) => {
+    const row = extrasOf(env.ctx).rowExpr;
+    return row === undefined
+      ? drop("a user query token outside the loop of a users query")
+      : exprV(`${optPath(row, "url")} ?? ''`);
   },
   authorcustomfield: () => drop("user meta is not carried over"),
   usercustomfield: () => litV(""),

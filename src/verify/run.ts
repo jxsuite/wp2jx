@@ -63,6 +63,8 @@ export interface VerifyOptions {
   build?: boolean;
   /** Extra CSS selectors to blank (`visibility:hidden`) on both sides. */
   masks?: string[];
+  /** Selectors taken out of the layout on both sides (`display: none`). */
+  removes?: string[];
   /** Where the reports go. Default `<out>/.wp2jx-verify`. */
   reportDir?: string;
   /** URLs in flight. Default 1. */
@@ -249,7 +251,8 @@ export async function runVerify(options: VerifyOptions): Promise<VerifyOutcome> 
       options.chrome === undefined ? {} : { executablePath: options.chrome },
     );
     const resolver = createResolver({ liveUrl: live, localOrigin: server.origin, rules });
-    const noise = options.noise ?? withMasks(DEFAULT_NOISE, options.masks ?? []);
+    const noise =
+      options.noise ?? withMasks(DEFAULT_NOISE, options.masks ?? [], options.removes ?? []);
     const keeper = new ShotKeeper(reportDir, imageCount);
     const slugs = new Set<string>();
     const named = chosen.map((url) => ({ url, slug: slugOf(url, slugs) }));

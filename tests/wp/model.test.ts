@@ -19,6 +19,7 @@ import {
   publicUrl,
   termsOf,
 } from "../../src/wp/model.ts";
+import { addReferencedUsers, referencedUsers, userProfiles } from "../../src/wp/profiles.ts";
 import { fixtureDb, readFixtureJson, readFixtureText } from "../helpers/fixture-db.ts";
 
 // ── Independent expectations ─────────────────────────────────────────────────────────────────────
@@ -1086,6 +1087,8 @@ interface Fake {
   termmeta?: [termId: number, key: string, value: string, metaId?: number][] | null;
   /** null: no users table at all (a multisite sub-site) */
   users?: { ID: number; user_nicename: string; display_name: string }[] | null;
+  /** Rows of the usermeta table (absent: no such table). */
+  usermeta?: [userId: number, key: string, value: string | null][];
   /** null: no Rank Math table at all */
   redirections?:
     | {
@@ -1134,6 +1137,9 @@ async function fakeSite(fake: Fake): Promise<{ db: WpDb; done: () => Promise<voi
   create("term_relationships", `(object_id integer, term_taxonomy_id integer, term_order integer)`);
   if (fake.users !== null) {
     create("users", `(ID integer, user_login text, user_nicename text, display_name text)`);
+  }
+  if (fake.usermeta !== undefined) {
+    create("usermeta", `(umeta_id integer, user_id integer, meta_key text, meta_value text)`);
   }
   if (fake.termmeta !== null) {
     create("termmeta", `(meta_id integer, term_id integer, meta_key text, meta_value text)`);
@@ -1235,6 +1241,14 @@ async function fakeSite(fake: Fake): Promise<{ db: WpDb; done: () => Promise<voi
       u.ID,
       u.user_nicename,
       u.display_name,
+    ]);
+  let nextUserMetaId = 1;
+  for (const [userId, key, value] of fake.usermeta ?? [])
+    sqlite.run(`insert into wp_usermeta values (?, ?, ?, ?)`, [
+      nextUserMetaId++,
+      userId,
+      key,
+      value,
     ]);
   for (const r of fake.redirections ?? []) {
     sqlite.run(`insert into wp_rank_math_redirections values (?, ?, ?, ?, 0, ?)`, [
@@ -3549,3 +3563,178 @@ describe.skipIf(!LIVE)(
     });
   },
 );
+
+describe("user profiles", () => {
+  const people = [
+    { ID: 1, user_nicename: "ada", display_name: "Ada Author" },
+    { ID: 2, user_nicename: "guest-gus", display_name: "Gus Guest" },
+    { ID: 3, user_nicename: "nobody", display_name: "No Profile" },
+  ];
+  const usermeta: [number, string, string | null][] = [
+    [1, "bio", "Ada writes."],
+    [1, "_bio", "field_62d867cf871e7"],
+    [1, "picture", "7310"],
+    [1, "_picture", "field_62d867cf864ee"],
+    [1, "description", "Ada, in WordPress's own box"],
+    [1, "first_name", "Ada"],
+    [1, "last_name", "Author"],
+    [3, "first_name", "No"],
+    [3, "last_name", "Profile"],
+    [1, "additional_profile_urls", 'a:1:{i:0;s:8:"http://a";}'],
+    [1, "_additional_profile_urls", "field_62d867cf86aaa"],
+    // what an account holds that no page shows
+    [1, "session_tokens", 'a:1:{s:3:"abc";a:0:{}}'],
+    [1, "wp_capabilities", 'a:2:{s:6:"editor";b:1;s:5:"staff";b:0;}'],
+    [2, "wp_capabilities", 'a:2:{s:5:"staff";b:1;s:12:"board_member";b:1;}'],
+    [1, "user_email", "ada@example.test"],
+    [1, "billing_address", "1 Private Road"],
+    [1, "google_access_token", "secret"],
+    // a `_key` row whose value merely starts like a field key is not one: nothing of `stuff` is read
+    [1, "stuff", "Private note"],
+    [1, "_stuff", "fields of study"],
+    // a guest who never posted
+    [2, "position", "Co-host"],
+    [2, "_position", "field_62fea1aa7c14c"],
+    [2, "last_login", "yesterday"],
+    // a `_key` row that is not an ACF field reference names nothing
+    [3, "_logged_in", "1"],
+    [3, "logged_in", "1"],
+    [3, "bio", null],
+    [3, "_bio", "field_62d867cf871e7"],
+  ];
+  const posts = [{ ID: 10, post_author: 1, post_title: "x", post_name: "x" }];
+
+  test("only the fields an ACF group stores, and the description, are read; the rest of an account is not", async () => {
+    const { model } = await loadFake({ users: people, usermeta, posts });
+    const profiles = userProfiles(model);
+    // User 3 has the field rows ACF writes for every account and no value in any of them: no profile.
+    expect([...profiles.keys()]).toEqual([1, 2]);
+    const ada = profiles.get(1)!;
+    expect(ada).toMatchObject({ id: 1, slug: "ada", displayName: "Ada Author" });
+    expect(Object.keys(ada.meta).sort()).toEqual([
+      "_additional_profile_urls",
+      "_bio",
+      "_picture",
+      "additional_profile_urls",
+      "bio",
+      "description",
+      "first_name",
+      "last_name",
+      "picture",
+    ]);
+    expect(ada.meta.bio).toBe("Ada writes.");
+    // The role names, and no more of the capabilities row: a role that is switched off is not held.
+    expect(ada.roles).toEqual(["editor"]);
+    expect(ada.meta.additional_profile_urls).toEqual(["http://a"]);
+    const everything = JSON.stringify([...profiles.values()]);
+    for (const secret of [
+      "session",
+      "capabilities",
+      "ada@example",
+      "Private Road",
+      "secret",
+      "yesterday",
+      "Private note",
+      "stuff",
+    ])
+      expect(everything).not.toContain(secret);
+    // The model's own users are what they were: an id, an address name and a display name.
+    expect([...model.users.keys()]).toEqual([1]);
+    expect(model.users.get(1)).toEqual({ id: 1, slug: "ada", displayName: "Ada Author" });
+  });
+
+  test("a person who never posted gets the account's name and address name; a person with only empty fields has no profile", async () => {
+    const { model } = await loadFake({ users: people, usermeta, posts });
+    const gus = userProfiles(model).get(2)!;
+    expect(gus).toMatchObject({ slug: "guest-gus", displayName: "Gus Guest" });
+    expect(gus.meta).toEqual({ position: "Co-host", _position: "field_62fea1aa7c14c" });
+    expect(gus.roles).toEqual(["staff", "board_member"]);
+    expect(userProfiles(model).has(3)).toBe(false);
+  });
+
+  test("the profiles are told once, naming the fields and no one", async () => {
+    const { report } = await loadFake({ users: people, usermeta, posts });
+    const told = report.filter((e) => e.code === "wp.user-profiles");
+    expect(told).toHaveLength(1);
+    expect(told[0]).toMatchObject({
+      severity: "info",
+      data: { people: 2, fields: ["additional_profile_urls", "bio", "picture", "position"] },
+    });
+    expect(JSON.stringify(told[0])).not.toContain("Ada");
+  });
+
+  test("no usermeta table, no users table, or no ACF rows: no profiles, and no error", async () => {
+    for (const fake of [
+      { users: people, posts },
+      { users: null, usermeta, posts },
+      { users: people, usermeta: [[1, "nickname", "Ada"]] as [number, string, string][], posts },
+    ] as Fake[]) {
+      const { model, report } = await loadFake(fake);
+      expect(userProfiles(model).size).toBe(0);
+      expect(report.filter((e) => e.code === "wp.user-profiles")).toEqual([]);
+    }
+    // A model nobody loaded here has none either.
+    expect(userProfiles({} as WpModel).size).toBe(0);
+  });
+});
+
+describe("the people the posts name in a user field", () => {
+  const users = [
+    { ID: 1, user_nicename: "ada", display_name: "Ada Author" },
+    { ID: 2, user_nicename: "guest-gus", display_name: "Gus Guest" },
+    { ID: 3, user_nicename: "host-hal", display_name: "Hal Host" },
+    { ID: 4, user_nicename: "unnamed", display_name: "Nobody Names Me" },
+  ];
+  const posts = [{ ID: 10, post_author: 1, post_title: "x", post_name: "x" }];
+  const meta: [number, string, string][] = [
+    [10, "host", "3"],
+    [10, "guest", 'a:2:{i:0;s:1:"2";i:1;s:1:"1";}'],
+    [10, "other", "4"],
+  ];
+
+  test("the ids are read from the meta under the names of the user fields, one or many", async () => {
+    const { model } = await loadFake({ users, posts, meta });
+    expect(referencedUsers(model, new Set(["host", "guest"]))).toEqual([1, 2, 3]);
+    expect(referencedUsers(model, new Set())).toEqual([]);
+    expect(referencedUsers(model, new Set(["missing"]))).toEqual([]);
+    // An id that is not a number names nobody.
+    const bad = await loadFake({ users, posts, meta: [[10, "host", "x"]] });
+    expect(referencedUsers(bad.model, new Set(["host"]))).toEqual([]);
+  });
+
+  test("a person who wrote nothing is added with the account's names, a profile is kept, and no one else is", async () => {
+    const { db, done } = await fakeSite({
+      users,
+      posts,
+      meta,
+      usermeta: [
+        [1, "bio", "Ada writes."],
+        [1, "_bio", "field_62d867cf871e7"],
+      ],
+    });
+    const model = await loadModel(db, {});
+    expect([...userProfiles(model).keys()]).toEqual([1]);
+    await addReferencedUsers(db, model, referencedUsers(model, new Set(["host", "guest"])));
+    await done();
+    const profiles = userProfiles(model);
+    expect([...profiles.keys()]).toEqual([1, 2, 3]);
+    expect(profiles.get(1)!.meta.bio).toBe("Ada writes.");
+    expect(profiles.get(3)).toEqual({
+      id: 3,
+      slug: "host-hal",
+      displayName: "Hal Host",
+      meta: {},
+      roles: [],
+    });
+    // Naming a person again, or nobody, changes nothing.
+    expect(profiles.has(4)).toBe(false);
+  });
+
+  test("a database with no users table adds nobody, and says nothing", async () => {
+    const { db, done } = await fakeSite({ users: null, posts, meta });
+    const model = await loadModel(db, {});
+    await addReferencedUsers(db, model, [3]);
+    await done();
+    expect(userProfiles(model).size).toBe(0);
+  });
+});

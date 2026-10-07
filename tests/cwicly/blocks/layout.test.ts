@@ -1084,9 +1084,11 @@ describe("image", () => {
       alt: "",
       width: 1400,
       height: 1000,
+      // the plugin prints a plain src, so the natural width is the file's own
+      sizes: "1400px",
     });
     expect(img.className).toBe("image-c6194e7 image-cover");
-    // srcset and sizes are the Jx build's.
+    // the srcset is the Jx build's.
     expect(JSON.stringify(nodes)).not.toContain("srcset");
   });
 
@@ -1115,6 +1117,10 @@ describe("image", () => {
     const { nodes } = await convertBlock("fineline", subject, b);
     const img = el(nodes[0]);
     expect(img.attributes).toMatchObject({ width: 768, height: 599 });
+    // The tag is a plain src of the 768px file: the rebuilt srcset keeps that natural width, because a
+    // grid column holding a `width: 120%` image takes its track from it (the kitchen cabinet page's
+    // process steps were 683px wide, from the build's `50vw`, where the live ones are 768px).
+    expect(img.attributes).toMatchObject({ sizes: "768px" });
     // The file is still the one original of its family: Jx regenerates the sizes.
     expect(String(attrsOf(img).src)).toMatch(/-scaled\.png$/);
     // An image edited in WordPress (a `-e<time>` file) names its own sizes.
@@ -1233,7 +1239,7 @@ describe("image", () => {
     });
   });
 
-  test("an image of an entry is its featured image: the attribute disappears when the entry has none", async () => {
+  test("an image of an entry is its featured image: the src is empty when the entry has none, as the plugin prints it", async () => {
     const subject: Subject = { kind: "template", slug: "single-project" };
     const b = await findBlock(
       "fineline",
@@ -1245,7 +1251,7 @@ describe("image", () => {
       entryType: "project",
     });
     const img = el(nodes[0]);
-    expect(String(attrsOf(img).src)).toMatch(/^\$\{\(.*\) \|\| false\}$/);
+    expect(String(attrsOf(img).src)).toMatch(/^\$\{\(.*\) \|\| ''\}$/);
     expect(String(attrsOf(img).alt)).toContain("state.entry.data");
   });
 
@@ -1259,12 +1265,17 @@ describe("image", () => {
       .get(thumbnail)!
       .sizes.find((x) => x.name === "medium_large")!;
     expect(attrsOf(nodes[0])).toMatchObject({ width: size.width, height: size.height });
+    // printed with a srcset by the plugin, and the sizes WordPress gives one
+    expect(attrsOf(nodes[0]).sizes).toBe(
+      `auto, (max-width: ${size.width}px) 100vw, ${size.width}px`,
+    );
     // an entry's image is bound, so the entry's own data is all there is: no dimensions are written
     const bound = await convertBlock("fineline", { kind: "template", slug: "index" }, b, {
       mode: "entry",
       entryType: "project",
     });
     expect(attrsOf(bound.nodes[0])).not.toHaveProperty("width");
+    expect(attrsOf(bound.nodes[0])).not.toHaveProperty("sizes");
   });
 
   test("an image of a component is its property: the build leaves src out when the instance passes none", async () => {

@@ -13,11 +13,13 @@ import {
   supportsOf,
 } from "../../src/core/blocks.ts";
 import { targetOf } from "../../src/core/static.ts";
+import { fitBody, sentinelsFor, writeBody } from "../../src/emit/collections.ts";
 import { texturizeHtml } from "../../src/cwicly/tokens.ts";
 import { nodesToHtml } from "../../src/html.ts";
 import type { ConvertCtx, JxElement, JxNode, ReportEntry, WpBlock } from "../../src/types.ts";
 import { parseBlocks, walkBlocks } from "../../src/wp/blocks.ts";
 import { decodeEntities } from "../../src/wp/model.ts";
+import { setUnregisteredBlockNamespaces } from "../../src/wp/block-registry.ts";
 import { FIXTURES } from "../helpers/fixture-db.ts";
 import { buildJxProject, cleanupJxProjects, validateJxProject } from "../helpers/jx-build.ts";
 import {
@@ -2031,6 +2033,14 @@ describe("dynamic blocks: an entry template binds to the entry", () => {
     expect(classes(figure)[0]).toMatch(/^jx-/);
   });
 
+  test("the body of an entry is hidden when the entry has none, as WordPress prints no box for an empty one", async () => {
+    const r = await entry(`<!-- wp:post-content /-->`);
+    const div = firstEl(r.nodes);
+    expect(div.attributes).toEqual({ hidden: "${!((state.entry.$children?.length ?? 0) > 0)}" });
+    expect(div.style).toEqual({ "&[hidden]": { display: "none !important" } });
+    expect(div.children as unknown).toBe("${state.entry.$children}");
+  });
+
   test("built through Jx with a real entry, every binding shows the entry's own value", async () => {
     const r = await entry(TEMPLATE_MARKUP);
     const md = [
@@ -2108,7 +2118,7 @@ describe("dynamic blocks: an entry template binds to the entry", () => {
       `<a href="/post_tag/x/" rel="tag">X &amp; Y</a><span class="wp-block-post-terms__separator">, </span><a href="/post_tag/z/" rel="tag">Z</a>`,
     );
     expect(body).toMatch(
-      /<div class="wp-block-post-content[^>]*><p>Hello\s+<em>world<\/em>\s+body\.<\/p><\/div>/,
+      /<div class="[^"]*wp-block-post-content[^>]*><p>Hello\s+<em>world<\/em>\s+body\.<\/p><\/div>/,
     );
     expect(html).toContain(`:has(img[src=""]) { display: none }`);
   });
@@ -2376,6 +2386,34 @@ describe("convertCoreBlock: names it does not know", () => {
     ]);
     expect(entriesOf(r.ctx, "block.unsupported")[0]).toMatchObject({ data: { kept: false } });
     expect(entriesOf(r.ctx, "block.unsupported")[0]!.message).toContain("placeholder");
+  });
+
+  test("one of a namespace no plugin registers any more prints nothing, as WordPress does, and says so", async () => {
+    const site = await loadSite("fineline");
+    const model = { ...site.model } as typeof site.model;
+    setUnregisteredBlockNamespaces(model, new Set(["fluentfom"]));
+    const r = await convertMarkup(
+      `<!-- wp:fluentfom/guten-block {"formId":"9"} /-->`,
+      "fineline",
+      FL_PAGE,
+      {
+        model,
+      },
+    );
+    expect(r.nodes).toEqual([]);
+    expect(entriesOf(r.ctx, "block.unregistered")[0]).toMatchObject({
+      severity: "info",
+      data: { block: "fluentfom/guten-block" },
+    });
+    expect(entriesOf(r.ctx, "block.unsupported")).toEqual([]);
+    // what it saved is still printed
+    const kept = await convertMarkup(
+      `<!-- wp:fluentfom/box --><div class="box">saved</div><!-- /wp:fluentfom/box -->`,
+      "fineline",
+      FL_PAGE,
+      { model },
+    );
+    expect(kept.html).toBe(`<div class="box">saved</div>`);
   });
 
   test("an unknown block's inner blocks are converted and kept", async () => {
@@ -2787,6 +2825,13 @@ describe("edges of the dynamic blocks", () => {
   });
 });
 
+/** What an entry holds once the collections module has fitted a converted body and written it, read back. */
+const writtenAsEntry = (nodes: JxNode[]): JxNode[] => {
+  const sentinels = sentinelsFor(nodes);
+  const fitted = fitBody(nodes, sentinels);
+  return (transpileJxMarkdown(writeBody(fitted.nodes, sentinels)).children ?? []) as JxNode[];
+};
+
 describe("Markdown entries keep their text through the serializer", () => {
   /** Text with a mark after every node, so a colon run (`:30`) ends where its element does. */
   const marked = (nodes: readonly JxNode[]): string => {
@@ -2816,10 +2861,7 @@ describe("Markdown entries keep their text through the serializer", () => {
         entries++;
         const ctx = await driven(siteName, subject);
         const nodes = ctx.convert(subjectBlocks(loaded, subject));
-        const entry = serializeJxMarkdown({ title: "t", slug: "s", children: nodes } as never, {
-          mode: "roundtrip",
-        });
-        const back = (transpileJxMarkdown(entry).children ?? []) as JxNode[];
+        const back = writtenAsEntry(nodes);
         const written = marked(nodes);
         const read = marked(back);
         if (bare(written) === bare(read)) continue;
@@ -2899,9 +2941,7 @@ describe("the converted nodes are valid Jx", () => {
 
 describe("Markdown entries: what the serializer cannot write is put right or reported", () => {
   const entry = (markup: string, site: SiteName = "fineline") => page(markup, "markdown", site);
-  const roundTrip = (nodes: JxNode[]): JxNode[] =>
-    transpileJxMarkdown(serializeJxMarkdown({ children: nodes } as never, { mode: "roundtrip" }))
-      .children as JxNode[];
+  const roundTrip = (nodes: JxNode[]): JxNode[] => writtenAsEntry(nodes);
 
   /** A real post of a site, converted as the entry it is. */
   async function realEntry(siteName: SiteName, id: number) {
@@ -2917,13 +2957,27 @@ describe("Markdown entries: what the serializer cannot write is put right or rep
         `<!-- wp:heading --><h2 class="wp-block-heading">Title<br></h2><!-- /wp:heading -->` +
         `<!-- wp:list --><ul class="wp-block-list"><!-- wp:list-item --><li>item<br></li><!-- /wp:list-item --></ul><!-- /wp:list -->`,
     );
+    // `<p><br></p>` is the editor's empty line, which the page shows: it stays, and the entry writes it
+    // as a line (the other breaks are the ones that show nothing)
     expect(r.html).toBe(
-      `<p>text</p><p>text</p><p><strong>bold</strong></p><h2 class="wp-block-heading">Title</h2><ul><li>item</li></ul>`,
+      `<p>text</p><p><br></p><p>text</p><p><strong>bold</strong></p><h2 class="wp-block-heading">Title</h2><ul><li>item</li></ul>`,
     );
     expect(textOfNodes(roundTrip(r.nodes))).not.toContain("\\");
     const said = entriesOf(r.ctx, "block.line-break-dropped");
     expect(said.every((e) => e.severity === "info")).toBe(true);
-    expect(said.reduce((n, e) => n + Number(e.data!.breaks), 0)).toBe(6);
+    expect(said.reduce((n, e) => n + Number(e.data!.breaks), 0)).toBe(5);
+  });
+
+  test("a block that is nothing but breaks keeps one line for each, as the page shows them", async () => {
+    const r = await entry(
+      `${para("<br><br><br>")}<!-- wp:heading --><h2 class="wp-block-heading"><br></h2><!-- /wp:heading -->`,
+    );
+    expect(r.html).toBe(`<p><br><br><br></p><h2 class="wp-block-heading"><br></h2>`);
+    expect(entriesOf(r.ctx, "block.line-break-dropped")).toEqual([]);
+    const back = roundTrip(r.nodes);
+    expect(textOfNodes(back)).not.toContain("\\");
+    // three lines in the paragraph and one in the heading
+    expect((textOfNodes(back).match(/\u00a0/g) ?? []).length).toBe(4);
   });
 
   test("a line break between two lines is a line break: it is the one the serializer writes", async () => {
@@ -2933,10 +2987,16 @@ describe("Markdown entries: what the serializer cannot write is put right or rep
     expect(entriesOf(r.ctx, "block.line-break-dropped")).toEqual([]);
   });
 
-  test("real: fineline post 3518 (a paragraph that is only a break) reads back with no backslash", async () => {
-    const { ctx, back } = await realEntry("fineline", 3518);
+  test("real: fineline post 3518 (a paragraph that is only a break) keeps the blank line the live page shows, and reads back with no backslash", async () => {
+    const { nodes, back } = await realEntry("fineline", 3518);
     expect(textOfNodes(back)).not.toContain("\\");
-    expect(entriesOf(ctx, "block.line-break-dropped").length).toBeGreaterThan(0);
+    // `<p><br></p>` between the sentence that introduces the second cost table and the table: the page
+    // spaces them by a line, and so does the entry (a paragraph holding a no-break space)
+    const html = nodesToHtml(nodes);
+    expect(html).toMatch(/log cabin\.[\s\u00a0]*<\/p><p><br><\/p><figure/);
+    const at = back.findIndex((node) => typeof node !== "string" && node.textContent === "\u00a0");
+    expect(at).toBeGreaterThan(0);
+    expect(nodesToHtml(back.slice(at - 1, at + 2))).toContain("</p><p>\u00a0</p><figure");
   });
 
   test("real: a poem of one span per line (ap post 738) keeps its lines, and its note marker", async () => {

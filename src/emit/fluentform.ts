@@ -439,9 +439,17 @@ const usedBySite = new WeakMap<
   Map<string, { id: number; css: string; turnstile: boolean }>
 >();
 
+/**
+ * What a site's draws are filed under: its table of forms, which every copy of the site shares (the posts'
+ * work site is the site with its own routes, a different object that holds the same forms).
+ */
+const keyOf = (site: { forms?: ReadonlyMap<number, FluentForm> }): object => site.forms ?? site;
+
 /** The forms drawn so far for a site and the styler rules of the style each was drawn in, in the order first drawn. */
-export function usedForms(site: object): { id: number; css: string; turnstile: boolean }[] {
-  return [...(usedBySite.get(site)?.values() ?? [])];
+export function usedForms(site: {
+  forms?: ReadonlyMap<number, FluentForm>;
+}): { id: number; css: string; turnstile: boolean }[] {
+  return [...(usedBySite.get(keyOf(site))?.values() ?? [])];
 }
 
 /** The form a `fluentform` shortcode or the Fluent Forms block names, when the placeholder is one of those. */
@@ -503,13 +511,14 @@ export function fluentFormFor(
   const turnstile = turnstileOf(site.model?.options);
   const rendered = renderFluentForm(form, found.themeStyle, turnstile);
   const used =
-    usedBySite.get(site) ?? new Map<string, { id: number; css: string; turnstile: boolean }>();
+    usedBySite.get(keyOf(site)) ??
+    new Map<string, { id: number; css: string; turnstile: boolean }>();
   used.set(`${id}|${rendered.className}`, {
     id,
     css: rendered.css,
     turnstile: turnstile !== undefined,
   });
-  usedBySite.set(site, used);
+  usedBySite.set(keyOf(site), used);
   say({
     severity: "warn",
     code: "form.not-submittable",

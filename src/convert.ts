@@ -40,6 +40,8 @@ import {
   texturizeHtml,
 } from "./cwicly/tokens.ts";
 import { finishNodes } from "./jx-util.ts";
+import { isUnregisteredBlock } from "./wp/block-registry.ts";
+import { lazyBlock } from "./cwicly/blocks/lazyblocks.ts";
 import {
   INTERNAL_MARKERS,
   collectPlaceholders,
@@ -302,6 +304,16 @@ function unsupportedBlock(block: WpBlock, ctx: ConvertCtx): JxNode[] {
     );
   }
   const kept = nodes.length > 0 || block.innerBlocks.length > 0;
+  if (!kept && isUnregisteredBlock(ctx.model, block.name)) {
+    note(
+      ctx,
+      "info",
+      "block.unregistered",
+      `The block ${block.name} saved no markup and no plugin or theme of the site registers its namespace any more: WordPress prints nothing for it, so nothing is written.`,
+      { block: block.name },
+    );
+    return [];
+  }
   note(
     ctx,
     "warn",
@@ -326,6 +338,23 @@ const isNodeList = (value: unknown): value is JxNode[] =>
 const describeResult = (value: unknown): string =>
   value === null ? "null" : Array.isArray(value) ? "a list with a hole in it" : typeof value;
 
+/**
+ * Whether the editor's own visibility setting hides the block (`metadata.blockVisibility: false`, the
+ * "Hide" switch of WordPress 6.9). The render filter answers an empty string for it before the block's
+ * renderer runs, so neither the block nor its inner blocks reach the page, whatever kind of block it is.
+ * (The setting can also be an object of viewports, which hides the block at some widths only; that
+ * form is not read here.)
+ */
+export function hiddenByEditor(block: WpBlock): boolean {
+  const metadata = block.attrs.metadata;
+  return (
+    typeof metadata === "object" &&
+    metadata !== null &&
+    !Array.isArray(metadata) &&
+    (metadata as Record<string, unknown>).blockVisibility === false
+  );
+}
+
 function convertBlock(
   block: WpBlock,
   ctx: ConvertCtx,
@@ -333,13 +362,29 @@ function convertBlock(
 ): JxNode[] {
   // Freeform (classic) HTML has no name; the core module registers it as `core/freeform`.
   const name = block.name ?? "core/freeform";
+  if (hiddenByEditor(block)) {
+    note(
+      ctx,
+      "info",
+      "block.hidden",
+      `The block ${name} is hidden in the editor (its visibility setting is off): WordPress prints nothing for it or what it holds, and so does this.`,
+      { block: block.name, classID: block.attrs.classID },
+    );
+    return [];
+  }
   const key = Object.hasOwn(registry, name)
     ? name
     : name.startsWith("core-embed/") && Object.hasOwn(registry, "core/embed")
       ? "core/embed"
       : undefined;
   const converter = key === undefined ? undefined : registry[key];
-  if (converter === undefined) return unsupportedBlock(block, ctx);
+  if (converter === undefined) {
+    // A Lazy Blocks block is named by its slug, so no table lists it: the recipes are asked for it.
+    return (
+      (name.startsWith("lazyblock/") ? lazyBlock(block, ctx) : undefined) ??
+      unsupportedBlock(block, ctx)
+    );
+  }
   try {
     const nodes: unknown = converter(block, ctx);
     if (isNodeList(nodes)) return nodes;

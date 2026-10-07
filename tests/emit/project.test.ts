@@ -28,7 +28,11 @@ import {
   checkProjectPath,
   checkReferences,
   composeStyle,
+  entryHeadingRules,
+  EVERY_WIDTH,
   layerAfterMedia,
+  themeSupportsResponsiveEmbeds,
+  withoutSupersededPages,
   supersededFiles,
   liftMediaBlocks,
   CORE_CSS_PATH,
@@ -72,6 +76,8 @@ import {
 import { createReport } from "../../src/report.ts";
 import { loadSiteContext } from "../../src/site.ts";
 import type { ReportEntry } from "../../src/types.ts";
+import { openDb } from "../../src/wp/db.ts";
+import { DEFAULT_EXCLUDED_POST_TYPES } from "../../src/wp/model.ts";
 import { fixtureCssDir } from "../helpers/fixture-css.ts";
 import { fixtureDb } from "../helpers/fixture-db.ts";
 import { TMP_ROOT } from "../helpers/jx-build.ts";
@@ -473,6 +479,98 @@ describe("supersededFiles", () => {
   });
 });
 
+describe("withoutSupersededPages", () => {
+  test("a page at the address of a redirect is not written; the others, and an entry's address, are", () => {
+    const pages = {
+      files: [{ path: "pages/about.json" }, { path: "pages/index.json" }],
+      pages: [
+        { route: "/about/", file: "pages/about.json" },
+        { route: "/", file: "pages/index.json" },
+      ],
+    };
+    withoutSupersededPages(["/about", "/hardwood-floor-refinishing"], pages);
+    expect(pages.files).toEqual([{ path: "pages/index.json" }]);
+    expect(pages.pages).toEqual([{ route: "/", file: "pages/index.json" }]);
+    withoutSupersededPages([], pages);
+    expect(pages.pages).toHaveLength(1);
+  });
+});
+
+describe("entryHeadingRules", () => {
+  // The keys and values the pilot's core CSS gave (`.has-background:is(h1):where(.wp-block-heading)` and the five after it).
+  const heading = [1, 2, 3, 4, 5, 6]
+    .map((n) => `.has-background:is(h${n}):where(.wp-block-heading)`)
+    .join(", ");
+  const core = {
+    ":where(.wp-block-columns.has-background)": { padding: "1.25em 2.375em" },
+    [heading]: { padding: "1.25em 2.375em" },
+    ".wp-block-embed iframe": { maxWidth: "100%" },
+  };
+  const entry = (content: string) => ({ content });
+
+  test("an entry that holds a heading with a background gets the library's padding once more, one class stronger", () => {
+    const rules = entryHeadingRules(core, [
+      entry(
+        '::::h2{className="wp-block-heading has-cc-color-1-background-color has-background"}\nTitle\n:::',
+      ),
+    ]);
+    expect(rules).toEqual([
+      {
+        selector: [1, 2, 3, 4, 5, 6]
+          .map((n) => `:root .has-background:is(h${n}):where(.wp-block-heading)`)
+          .join(", "),
+        style: { padding: "1.25em 2.375em" },
+      },
+    ]);
+  });
+
+  test("nothing without such a heading (a list or a plain heading with the class is not one), without core CSS, or for a rule with only a media block", () => {
+    expect(
+      entryHeadingRules(core, [
+        entry(':::h3{className="wp-block-heading"}\nPlain\n:::'),
+        // a class that only contains the word is not the class
+        entry(':::h2{className="wp-block-heading nothas-background has-background-dim"}\nX\n:::'),
+        entry(':::p{className="has-background"}\nA paragraph\n:::'),
+        entry('a `:::h2{className="has-background"}` in a sentence'),
+      ]),
+    ).toEqual([]);
+    expect(entryHeadingRules(undefined, [entry(':::h2{className="has-background"}')])).toEqual([]);
+    expect(
+      entryHeadingRules({ [heading]: { "@--sm": { padding: "1em" } } }, [
+        entry(':::h2{className="has-background"}'),
+      ]),
+    ).toEqual([]);
+  });
+});
+
+describe("themeSupportsResponsiveEmbeds", () => {
+  test("the pilot's theme asks for responsive embeds, which is why its pages' body carries wp-embed-responsive", () => {
+    if (!HAVE_WP) return;
+    expect(themeSupportsResponsiveEmbeds(WP_TREE, "cwicly")).toBe(true);
+  });
+
+  test("a theme without the call, one that is not there, a live address and no root say no", () => {
+    const root = tmp("theme-support");
+    mkdirSync(join(root, "wp-content/themes/plain"), { recursive: true });
+    writeFileSync(
+      join(root, "wp-content/themes/plain/functions.php"),
+      "<?php add_theme_support('post-thumbnails'); // 'responsive-embeds' in a comment\n",
+    );
+    mkdirSync(join(root, "wp-content/themes/spaced"), { recursive: true });
+    writeFileSync(
+      join(root, "wp-content/themes/spaced/functions.php"),
+      '<?php add_theme_support( "responsive-embeds" );\n',
+    );
+    expect(themeSupportsResponsiveEmbeds(root, "plain")).toBe(false);
+    expect(themeSupportsResponsiveEmbeds(root, "spaced")).toBe(true);
+    expect(themeSupportsResponsiveEmbeds(root, "missing")).toBe(false);
+    expect(themeSupportsResponsiveEmbeds(root, "")).toBe(false);
+    expect(themeSupportsResponsiveEmbeds(root, undefined)).toBe(false);
+    expect(themeSupportsResponsiveEmbeds("https://finelinepainting.pro", "cwicly")).toBe(false);
+    expect(themeSupportsResponsiveEmbeds(undefined, "cwicly")).toBe(false);
+  });
+});
+
 describe("layerAfterMedia", () => {
   const MEDIA = { "--": "1366px", "--md": "(max-width: 992px)", "--sm": "(max-width: 576px)" };
   // The pilot's gallery: the global class says two columns below 992px, the post says three at every width.
@@ -677,6 +775,17 @@ describe("ownerDecisions", () => {
     e({ code: "dynamic.missing-image", where: "post:3", data: { id: 4009 } }),
     e({ code: "interaction.approximated", where: "template:a//h", data: { feature: "nav-modal" } }),
     e({ code: "link.unsupported", where: "template:a//p", data: { action: "infiniteButtonLoad" } }),
+    e({
+      code: "media.undecodable",
+      where: "post:1470",
+      data: { file: "2021/04/iOS.heic.jpg", publicPath: "/media/2021/04/iOS.heic.jpg" },
+    }),
+    e({
+      code: "template.shortcode-dropped",
+      severity: "info",
+      where: "template:a//p",
+      data: { shortcode: "dkpdf-button" },
+    }),
     e({ code: "style.fallback", severity: "info" }),
   ];
   const decisions = ownerDecisions(entries);
@@ -692,6 +801,7 @@ describe("ownerDecisions", () => {
       "urls",
       "markdown",
       "redirects",
+      "undecodable",
       "media",
     ]);
     expect(ownerDecisions([e({ code: "style.fallback" })])).toEqual([]);
@@ -743,9 +853,11 @@ describe("ownerDecisions", () => {
     expect(byId("redirects").examples).toEqual(["/a (dangling)", "/b (loop)"]);
     expect(byId("media").examples).toEqual(["2024/a.jpg: 1 place", "attachment 4009: 1 place"]);
     expect(byId("behaviours").examples).toEqual([
+      "dkpdf-button: 1 place",
       "infiniteButtonLoad: 1 place",
       "nav-modal: 1 place",
     ]);
+    expect(byId("undecodable").examples).toEqual(["2021/04/iOS.heic.jpg: 1 place"]);
     expect(byId("conditions").examples).toEqual(["template:a//t: functionreturn === pa"]);
   });
 
@@ -1190,13 +1302,13 @@ describe("fineline: what only that site shows", () => {
     );
   });
 
-  test("fineline: the post Rank Math sends away is not written, its redirect is, and the build has a refresh page there instead", async () => {
+  test("fineline: the post Rank Math sends away stays in its collection, and the build writes the redirect's refresh page over its own", async () => {
     await ensure("fineline");
     const redirects = projectOf("fineline").redirects as Record<string, unknown>;
     expect(redirects["/hardwood-floor-refinishing"]).toBe("/service/hardwood-floor-refinishing/");
     const dir = full.get("fineline")!.dir;
-    expect(existsSync(join(dir, "content/post/hardwood-floor-refinishing.md"))).toBe(false);
-    // the post next to it is untouched
+    // The blog index on the source site lists this post, so the entry is written; only its page gives way.
+    expect(existsSync(join(dir, "content/post/hardwood-floor-refinishing.md"))).toBe(true);
     expect(existsSync(join(dir, "content/post/the-benefits-of-premium-paint.md"))).toBe(true);
     // The refresh page Jx writes at the address (not the page): it leads to the destination.
     expect(readFileSync(join(dir, "dist/hardwood-floor-refinishing/index.html"), "utf8")).toContain(
@@ -1206,9 +1318,32 @@ describe("fineline: what only that site shows", () => {
     expect(
       result.report.filter((x) => x.code === "redirect.supersedes-page").map((x) => x.where),
     ).toEqual(["redirect:hardwood-floor-refinishing/"]);
+    // The redirect is not dropped as shadowed by the entry it supersedes.
     expect(
-      result.report.some((x) => x.code === "jx.build-warning" && x.message.includes("collides")),
+      result.report.some(
+        (x) =>
+          x.code === "project.redirect-shadowed" &&
+          x.data?.source === "/hardwood-floor-refinishing",
+      ),
     ).toBe(false);
+    // The blog index's cards include it.
+    expect(readFileSync(join(dir, "dist/blog/index.html"), "utf8")).toContain(
+      "How to Refinish a Hardwood Floor",
+    );
+  });
+
+  test("fineline: the library's padding for a heading with a background is written once more for the posts that hold one, and the base layout carries the embed class", async () => {
+    if (!HAVE_WP) return;
+    await ensure("fineline");
+    const style = projectOf("fineline").style as Record<string, Record<string, string>>;
+    // The hoisted rules follow the design system's conditional blocks, in a block of their own.
+    const hoisted = style[EVERY_WIDTH] as unknown as Record<string, Record<string, string>>;
+    const twin = Object.keys(hoisted).find((k) => k.startsWith(":root .has-background:is(h1)"));
+    expect(twin).toBeDefined();
+    expect(hoisted[twin!]).toEqual({ padding: "1.25em 2.375em" });
+    expect(readFileSync(join(full.get("fineline")!.dir, "layouts/base.json"), "utf8")).toContain(
+      "wp-site-blocks wp-embed-responsive",
+    );
   });
 
   test("a redirect whose source is a page this run wrote is dropped and said, and `/search` (the templates' own page) is no redirect", async () => {
@@ -1447,6 +1582,61 @@ describe("dry run, media and options", () => {
     expect(second.media.downloaded).toBe(0);
     expect(second.media.skipped).toBe(first.media.planned);
     expect(second.files.written).toEqual([]);
+  });
+
+  test("a picture the image optimiser cannot decode (a HEIC under a .jpg name) is said, and its references opt out of the optimiser so the build goes on", async () => {
+    const heic = Uint8Array.from([
+      0,
+      0,
+      0,
+      24,
+      ...[..."ftypheic"].map((c) => c.charCodeAt(0)),
+      0,
+      0,
+      0,
+      0,
+    ]);
+    const sink = memorySink();
+    const opts = await optionsFor("fineline", {
+      postTypes: NARROW,
+      media: true,
+      sink,
+      fetch: async (url: string) =>
+        new Response(new URL(url).pathname.toLowerCase().endsWith(".jpg") ? heic : PNG),
+    });
+    const result = await migrateSite(opts);
+    const bad = result.report.filter((e) => e.code === "media.undecodable");
+    expect(bad.length).toBeGreaterThan(0);
+    for (const e of bad) {
+      expect(e.severity).toBe("warn");
+      expect(e.message).toContain("HEIC");
+      expect(e.message).toContain("data-no-optimize");
+      expect(e.data?.publicPath).toMatch(/^\/media\/.*\.jpg$/i);
+    }
+    const unreadable = new Set(bad.map((e) => String(e.data?.publicPath)));
+    // Every image of a page that names one of them opts out; every other image does not.
+    let marked = 0;
+    for (const [path, data] of sink.files) {
+      if (!path.startsWith("pages/") || !path.endsWith(".json")) continue;
+      const walk = (node: unknown): void => {
+        if (Array.isArray(node)) return node.forEach(walk);
+        if (node === null || typeof node !== "object") return;
+        const n = node as { tagName?: string; attributes?: Record<string, unknown> };
+        const src = n.attributes?.src;
+        if (n.tagName === "img" && typeof src === "string" && src.startsWith("/media/")) {
+          const out = n.attributes?.["data-no-optimize"] !== undefined;
+          expect([src, out]).toEqual([src, unreadable.has(src)]);
+          if (out) marked++;
+        }
+        Object.values(node).forEach(walk);
+      };
+      walk(JSON.parse(data as string));
+    }
+    expect(marked).toBeGreaterThan(0);
+    // A second run with the files in place says the same and changes nothing.
+    const again = await migrateSite(opts);
+    expect(again.report.filter((e) => e.code === "media.undecodable")).toHaveLength(bad.length);
+    expect(again.files.written).toEqual([]);
   });
 
   test("a dry run keeps the media an earlier run fetched in the manifest, and removes none of it", async () => {
@@ -2094,6 +2284,95 @@ describe("the forms a page draws", () => {
     });
     expect(sink.files.has("public/css/fluentform.css")).toBe(false);
     expect(JSON.stringify(result.project.$head)).not.toContain("fluentform");
+  });
+});
+
+// ── Interactive Geo Maps ─────────────────────────────────────────────────────────────────────────
+
+describe("the maps a page draws", () => {
+  /** The fixture site with every post type it holds (the location template needs its terms), without the maps when asked. */
+  async function siteWithMaps(withMaps: boolean) {
+    const opts = await optionsFor("fineline");
+    const db = await openDb(opts.db!, { prefix: opts.prefix! });
+    let types: string[];
+    try {
+      const rows = await db.query<{ post_type: string }>(
+        `select distinct post_type from ${db.table("posts")} order by post_type`,
+      );
+      types = rows.map((r) => String(r.post_type)).filter((t) => withMaps || t !== "igmap");
+    } finally {
+      await db.close();
+    }
+    return loadSiteContext({
+      db: opts.db!,
+      prefix: opts.prefix!,
+      cssFrom: opts.cssFrom!,
+      componentPrefix: "fp",
+      postTypes: types.filter((t) => !DEFAULT_EXCLUDED_POST_TYPES.includes(t)),
+    });
+  }
+
+  test("the plugin's stylesheet is written once and linked, and the template prints the map's stage", async () => {
+    const plugin = tmp("geomap-plugin");
+    const css = join(
+      plugin,
+      "wp-content",
+      "plugins",
+      "interactive-geo-maps",
+      "assets",
+      "public",
+      "css",
+    );
+    mkdirSync(css, { recursive: true });
+    writeFileSync(join(css, "styles.min.css"), ".map_wrapper .map_aspect_ratio{height:0}");
+    const sink = memorySink();
+    const result = await migrateSite({
+      site: await siteWithMaps(true),
+      pluginFrom: plugin,
+      wpFrom: false,
+      sink,
+      now: NOW,
+      media: false,
+    });
+    expect(String(sink.files.get("public/css/geo-map.css"))).toContain(
+      ".map_wrapper .map_aspect_ratio{height:0}",
+    );
+    const hrefs = (result.project.$head as { attributes?: { href?: string } }[]).map(
+      (h) => h.attributes?.href,
+    );
+    expect(hrefs.filter((h) => h === "/css/geo-map.css")).toHaveLength(1);
+    expect(String(sink.files.get("pages/service_area/[slug].json"))).toContain("map_wrapper_3197");
+    expect(result.report.some((e) => e.code === "map.not-interactive")).toBe(true);
+    expect(result.report.some((e) => e.code === "map.css-missing")).toBe(false);
+  });
+
+  test("a map's stylesheet that cannot be read is reported, and the stage keeps its own size", async () => {
+    const sink = memorySink();
+    const result = await migrateSite({
+      site: await siteWithMaps(true),
+      pluginFrom: false,
+      wpFrom: false,
+      sink,
+      now: NOW,
+      media: false,
+    });
+    expect(result.report.some((e) => e.code === "map.css-missing")).toBe(true);
+    expect(String(sink.files.get("public/css/geo-map.css"))).toContain("height:0");
+  });
+
+  test("a site whose database has no map prints nothing for the shortcode and ships no map stylesheet", async () => {
+    const sink = memorySink();
+    const result = await migrateSite({
+      site: await siteWithMaps(false),
+      pluginFrom: false,
+      wpFrom: false,
+      sink,
+      now: NOW,
+      media: false,
+    });
+    expect(sink.files.has("public/css/geo-map.css")).toBe(false);
+    expect(result.report.some((e) => e.code === "map.missing")).toBe(true);
+    expect(JSON.stringify(result.project.$head)).not.toContain("geo-map");
   });
 });
 

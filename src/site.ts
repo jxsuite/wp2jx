@@ -35,6 +35,11 @@ import {
   type OrderedCssIndex,
 } from "./cwicly/css.ts";
 import { readCwiclyOptions, type CwiclyOptionsFull } from "./cwicly/options.ts";
+import {
+  findUnregisteredNamespaces,
+  setUnregisteredBlockNamespaces,
+  usedBlockNamespaces,
+} from "./wp/block-registry.ts";
 import { convertBlocks, ensureConverters, withOverrides } from "./convert.ts";
 import { planMedia, type MediaPlan } from "./media.ts";
 import { createReport } from "./report.ts";
@@ -56,7 +61,8 @@ import type {
   WpModel,
   WpPost,
 } from "./types.ts";
-import { loadAcf, type AcfModel } from "./wp/acf.ts";
+import { loadAcf, userFieldNames, type AcfModel } from "./wp/acf.ts";
+import { addReferencedUsers, referencedUsers } from "./wp/profiles.ts";
 import { loadFluentForms, type FluentForm } from "./wp/fluentform.ts";
 import { parseBlocks, walkBlocks } from "./wp/blocks.ts";
 import { openDb } from "./wp/db.ts";
@@ -346,8 +352,18 @@ export function cssPlanFor(site: Pick<SiteContext, "model">, subject: Subject): 
   // A template's file is enqueued before the parts it renders; a post's after everything it embeds.
   if (own !== undefined && subject.kind !== "post") names.add(own);
   const post = subjectPost(site, subject);
-  if (post) visit(parseBlocks(post.content));
-  if (own !== undefined) names.add(own);
+  let styled = false;
+  if (post) {
+    const blocks = parseBlocks(post.content);
+    visit(blocks);
+    walkBlocks(blocks, (block) => {
+      if (block.name?.startsWith("cwicly/") && block.attrs.isStyling === true) styled = true;
+    });
+  }
+  // Cwicly writes a post's file when the post has a styled block of its own and not otherwise: a post of
+  // core blocks has none, and asking the site for one (a request each, hundreds on a site of essays) only
+  // learns that.
+  if (own !== undefined && (subject.kind !== "post" || styled)) names.add(own);
   const all = [...names];
   return { names: all.filter(isCssFileName), invalid: all.filter((name) => !isCssFileName(name)) };
 }
@@ -437,16 +453,18 @@ export async function reportOwnCss(
 ): Promise<void> {
   const own = ownCssName(site, subject);
   if (own === undefined || !isCssFileName(own)) return;
-  const index = await parsedFile(site, own);
-  if (index.artifacts.length === 0) return;
-  const post = subjectPost(site, subject);
-  const url = post && post.type !== "wp_block" ? publicUrl(site.model.site, post) : undefined;
   // A missing file is nothing when the subject has no styled Cwicly block (Cwicly writes none then);
   // with one, the block's style comes from its attributes instead, which is worth a line.
   let styled = false;
   walkBlocks(subjectBlocks(site, subject), (block) => {
     if (block.name?.startsWith("cwicly/") && block.attrs.isStyling === true) styled = true;
   });
+  // A post with none is not asked for a file (`cssPlanFor`).
+  if (subject.kind === "post" && !styled) return;
+  const index = await parsedFile(site, own);
+  if (index.artifacts.length === 0) return;
+  const post = subjectPost(site, subject);
+  const url = post && post.type !== "wp_block" ? publicUrl(site.model.site, post) : undefined;
   const believed = remembersOf(site.cssSource)?.(own);
   for (const artifact of index.artifacts) {
     const missing = artifact.code === CSS_ARTIFACT.missingFile;
@@ -837,6 +855,7 @@ export async function loadSiteContext(opts: LoadSiteOptions): Promise<SiteContex
   const report = opts.report ?? createReport();
   const db = await openDb(opts.db, opts.prefix === undefined ? {} : { prefix: opts.prefix });
   let model: WpModel;
+  let acf: AcfModel;
   let forms: Map<number, FluentForm> = new Map();
   try {
     const postTypes = opts.postTypes ?? (await publishedPostTypes(db));
@@ -852,12 +871,14 @@ export async function loadSiteContext(opts: LoadSiteOptions): Promise<SiteContex
         where: "site",
       });
     }
+    // The people a post names in a user field and no profile has (a guest who never wrote anything).
+    acf = loadAcf(model, report);
+    await addReferencedUsers(db, model, referencedUsers(model, userFieldNames(acf)));
   } finally {
     await db.close();
   }
 
   const options = readCwiclyOptions(model.options, report);
-  const acf = loadAcf(model, report);
   const media = planMedia(
     model,
     opts.siteUrl === undefined ? {} : { siteUrl: opts.siteUrl.replace(/\/+$/, "") },
@@ -878,6 +899,10 @@ export async function loadSiteContext(opts: LoadSiteOptions): Promise<SiteContex
     } else {
       pluginSource = dirPluginSource(opts.pluginFrom);
       theme = dirThemeCss(opts.pluginFrom);
+      setUnregisteredBlockNamespaces(
+        model,
+        await findUnregisteredNamespaces(opts.pluginFrom, usedBlockNamespaces(model)),
+      );
     }
     if (theme === null) {
       report.add({
@@ -1051,6 +1076,8 @@ export interface SubjectCtx extends ConvertCtx {
    * taken key gets `<key>_2`. The emitter writes the entries into the page's `state`.
    */
   defineState(key: string, definition: unknown): string;
+  /** The blocks become a component (a Cwicly component or a template part), not a page or a layout. */
+  readonly inComponent?: boolean;
 }
 
 const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
@@ -1113,6 +1140,7 @@ export async function subjectSession(
     mediaFor: (attachmentId) => site.media.mediaFor(attachmentId),
     mediaForUrl: (url) => site.media.mediaForUrl(url),
     convert: (blocks, more) => convertBlocks(blocks, more ? withOverrides(ctx, more) : ctx),
+    inComponent: subject.kind === "component" || subject.kind === "part",
     defineState(key, definition) {
       let use = key;
       for (let n = 2; state.has(use) && !sameJson(state.get(use), definition); n++)

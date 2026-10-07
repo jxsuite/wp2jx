@@ -63,6 +63,28 @@ describe("matchRedirect", () => {
     expect(matchRedirect(rules, "/docs")?.to).toBe("/documentation/");
   });
 
+  test("a star with text after it answers only the paths that end in that text (anabaptistperspectives' `/*/true`)", () => {
+    const tail = parseRedirects("/*/true /:splat 301");
+    expect(matchRedirect(tail, "/essays/true")?.to).toBe("/essays");
+    expect(matchRedirect(tail, "/a/b/true/")?.to).toBe("/a/b");
+    expect(matchRedirect(tail, "/about/")).toBeUndefined();
+    expect(matchRedirect(tail, "/")).toBeUndefined();
+    expect(matchRedirect(tail, "/true/trues")).toBeUndefined();
+  });
+
+  test("only the first star is a wildcard; a second one is the character", () => {
+    const two = parseRedirects("/a/*/b/* /z 301");
+    expect(matchRedirect(two, "/a/x/b/y")).toBeUndefined();
+    expect(matchRedirect(two, "/a/x/b/*")?.to).toBe("/z");
+  });
+
+  test("a star inside a segment is a prefix rule (`/essays-*`), and takes the rest as the splat", () => {
+    const prefix = parseRedirects("/essays-* /essays/:splat 301");
+    expect(matchRedirect(prefix, "/essays-old-name/")?.to).toBe("/essays/old-name");
+    expect(matchRedirect(prefix, "/essays/old-name/")).toBeUndefined();
+    expect(matchRedirect(prefix, "/essays")).toBeUndefined();
+  });
+
   test("a bare star in the destination is the splat, as the build writes it when the author did", () => {
     expect(matchRedirect(parseRedirects("/x/* /y/* 301"), "/x/q/r")?.to).toBe("/y/q/r");
   });

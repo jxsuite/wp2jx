@@ -10,6 +10,7 @@
  * 4. entry mode against static mode: a binding, evaluated over the entry data of a real post, prints
  *    what the static resolution of the same token prints for that post.
  */
+import { setUserProfiles } from "../../src/wp/profiles.ts";
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse, parseFragment } from "parse5";
@@ -42,6 +43,7 @@ import {
   orElse,
   optPath,
   parseToken,
+  userFields,
   POST_CONTENT_TAG,
   postData,
   printsAcfRaw,
@@ -1384,7 +1386,7 @@ describe("an entry template", () => {
     expect(out).not.toContain("${");
   });
 
-  test("a read that needs a user or a row of a loop is unresolved and says why, with the block's fallback", async () => {
+  test("the current author's field is not read, and a person of a users loop needs the loop: each says why, with the block's fallback", async () => {
     const { ctx } = await realCtx(
       "ap",
       { kind: "template", slug: "single-post" },
@@ -1395,15 +1397,163 @@ describe("an entry template", () => {
         "https://media.anabaptistperspectives.org/2022/06/2022-06_Conversation1.png",
       dynamicStaticFallbackID: 1098,
     });
+    // The current author: the live pages print the block's fallback (no field is read).
     expect(
       resolveTokens("{acffield=field_62d867cf864ee=currentauthor=false=1098=0-1-1-image}", ctx, fb),
     ).toMatch(/^\/media\//);
+    expect(ctx.report.entries().filter((e) => e.code === "dynamic.unsupported")).toHaveLength(1);
+    expect(ctx.report.entries().at(-1)?.message).toContain("currentauthor");
+    // A person of a users query is the loop's row: outside a loop there is none.
+    expect(
+      resolveTokens("{acffield=field_62d867cf864ee=userquery=false=1098=0-1-1-image}", ctx, fb),
+    ).toMatch(/^\/media\//);
     const entries = ctx.report.entries().filter((e) => e.code === "dynamic.unsupported");
-    expect(entries).toHaveLength(1);
-    expect(entries[0]?.message).toContain("currentauthor");
+    expect(entries).toHaveLength(2);
+    expect(entries[1]?.message).toContain("users query");
     expect(resolveTokens("{acfrepeater=sub}", ctx)).toBe("");
     const row = Object.assign(Object.create(ctx), { rowExpr: "$map.item" }) as ConvertCtx;
     expect(resolveTokens("{acfrepeater=sub}", row)).toBe("${$map.item?.sub ?? ''}");
+    // The tokens of a users loop read the person the row is.
+    expect(resolveTokens("{userquery=display_name}", row)).toBe("${$map.item?.title ?? ''}");
+    expect(resolveTokens("{userquery=user_nicename}", row)).toBe("${$map.item?.slug ?? ''}");
+    expect(resolveTokens("{userqueryurl}", row)).toBe("${$map.item?.url ?? ''}");
+    // A person's biography prints as text on the live pages (its tags show), not as markup, and the
+    // character references in it are read as `esc_html` leaves them: once, and not double-escaped.
+    const bio = resolveTokens("{acffield=field_62d867cf871e7=userquery}", row);
+    expect(bio.startsWith("${") && bio.endsWith("}")).toBe(true);
+    const shown = (value: unknown): unknown =>
+      new Function("$map", `return ${bio.slice(2, -1)};`)({ item: { bio: value } });
+    expect(
+      shown('<p class=\\"x\\">a &quot;b&quot; &amp; c &#39;d&#x41;&nbsp;e &lt;i&gt;</p>\n'),
+    ).toBe('<p class=\\"x\\">a "b" & c \'dA\u00a0e <i></p>\n');
+    // A reference it does not know, and the `&` of a double-escaped one, stay what they are.
+    expect(shown("&nope; &amp;quot;")).toBe("&nope; &quot;");
+    expect(shown(undefined)).toBe("");
+    expect(resolveTokens("{userquery=user_email}", row)).toBe("");
+    expect(resolveTokens("{userquery=display_name}", ctx)).toBe("");
+  });
+});
+
+describe("a person's biography", () => {
+  test("is a wysiwyg value: ACF's wpautop makes its paragraphs before the page prints it as text", async () => {
+    const { ctx } = await realCtx(
+      "ap",
+      { kind: "template", slug: "single-post" },
+      { mode: "entry", entryType: "post" },
+    );
+    const model = { ...ctx.model } as typeof ctx.model;
+    setUserProfiles(
+      model,
+      new Map([
+        [
+          9100,
+          {
+            id: 9100,
+            slug: "ada",
+            displayName: "Ada",
+            meta: { bio: "First &amp; last\n\nSecond <b>bold</b>", position: "A &amp; B" },
+            roles: [],
+          },
+        ],
+      ]),
+    );
+    const own = { ...ctx, model } as ConvertCtx;
+    // The row of a users loop is what the entry data holds: the paragraphs are made there, once.
+    expect(userFields(own, 9100, true).bio).toBe(
+      "<p>First &amp; last</p>\n<p>Second <b>bold</b></p>\n",
+    );
+    expect(userFields(own, 9100, true).position).toBe("A &amp; B");
+    // The person known now: the paragraphs the site printed, shown as text (their tags and their entities read once).
+    expect(resolveTokens("{acffield=field_62d867cf871e7=user_9100}", own)).toBe(
+      "<p>First & last</p>\n<p>Second <b>bold</b></p>\n",
+    );
+    // A field that is not a wysiwyg gets no paragraphs.
+    expect(resolveTokens("{acffield=field_62fea1aa7c14c=user_9100}", own)).not.toContain("<p>");
+  });
+});
+
+describe("authorinfo on an author's page and on a post", () => {
+  test("the names and the biography are read from the author's entry, or the post's `authorInfo`; the rest is not carried over", async () => {
+    const { ctx } = await realCtx(
+      "ap",
+      { kind: "template", slug: "author" },
+      { mode: "entry", entryExpr: "state.author", entryType: "page" },
+    );
+    const info = (name: string) =>
+      resolveTokens(
+        "{authorinfo}",
+        ctx,
+        block("cwicly/heading", { dynamic: "wordpress", dynamicWordPressAuthorInfo: name }),
+      );
+    expect(info("first_name")).toBe("${state.author.data?.first_name ?? ''}");
+    expect(info("last_name")).toBe("${state.author.data?.last_name ?? ''}");
+    expect(info("description")).toBe("${state.author.data?.description ?? ''}");
+    // No one chose a field: the block's default is the biography.
+    expect(
+      resolveTokens("{authorinfo}", ctx, block("cwicly/paragraph", { dynamic: "wordpress" })),
+    ).toBe("${state.author.data?.description ?? ''}");
+    expect(info("user_url")).toBe("");
+    expect(info("user_email")).toBe("");
+    // On a post's template the author's names and biography are the entry's `authorInfo`.
+    const { ctx: post } = await realCtx(
+      "ap",
+      { kind: "template", slug: "single-post" },
+      { mode: "entry", entryType: "post" },
+    );
+    expect(
+      resolveTokens(
+        "{authorinfo}",
+        post,
+        block("cwicly/heading", { dynamic: "wordpress", dynamicWordPressAuthorInfo: "first_name" }),
+      ),
+    ).toBe("${state.entry.data?.authorInfo?.first_name ?? ''}");
+    expect(
+      resolveTokens("{authorinfo}", post, block("cwicly/paragraph", { dynamic: "wordpress" })),
+    ).toBe("${state.entry.data?.authorInfo?.description ?? ''}");
+    expect(
+      resolveTokens(
+        "{authorinfo}",
+        post,
+        block("cwicly/heading", { dynamic: "wordpress", dynamicWordPressAuthorInfo: "user_url" }),
+      ),
+    ).toBe("");
+  });
+});
+
+describe("authorinfo on a static page", () => {
+  test("the page's author's biography and names are written now; an author with none prints nothing", async () => {
+    const { ctx, loaded } = await realCtx("ap", { kind: "post", id: 819 });
+    const post = loaded.model.posts.get(819)!;
+    const model = { ...loaded.model } as typeof loaded.model;
+    setUserProfiles(
+      model,
+      new Map([
+        [
+          post.authorId,
+          {
+            ...loaded.model.users.get(post.authorId)!,
+            meta: { description: "A biography & more.", first_name: "Given", last_name: "" },
+            roles: [],
+          },
+        ],
+      ]),
+    );
+    const at = { ...ctx, model } as ConvertCtx;
+    const info = (name?: string, over: ConvertCtx = at) =>
+      resolveTokens(
+        "{authorinfo}",
+        over,
+        block("cwicly/paragraph", {
+          dynamic: "wordpress",
+          ...(name === undefined ? {} : { dynamicWordPressAuthorInfo: name }),
+        }),
+      );
+    expect(info()).toBe("A biography & more.");
+    expect(info("first_name")).toBe("Given");
+    expect(info("last_name")).toBe("");
+    // An author with no profile prints nothing, and the other fields are still not carried over.
+    expect(info("description", ctx)).toBe("");
+    expect(info("user_email")).toBe("");
   });
 });
 
@@ -1865,11 +2015,11 @@ describe("the census of every token of both sites", () => {
       unresolved: c.unresolved,
     }).toEqual({
       total: 884,
-      resolved: 140,
+      resolved: 144,
       stripped: 326,
       classTokens: 310,
       notTokens: 34,
-      unresolved: 74,
+      unresolved: 70,
     });
     // What cannot be carried over: comments, logins, user queries, shortcodes, pagination, and the author's own profile.
     expect(Object.keys(c.unresolvedBy).sort()).toEqual([

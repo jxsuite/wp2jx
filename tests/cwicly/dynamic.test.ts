@@ -800,7 +800,7 @@ describe("blockImage", () => {
     expect(blockImage(block("cwicly/image", {}), ctx)).toBeUndefined();
   });
 
-  test("the featured image of an entry is a binding that leaves the attribute out when the entry has none", async () => {
+  test("the featured image of an entry is a binding that prints an empty src, as the plugin does, when the entry has none", async () => {
     const img = await imageBlock("fineline", { kind: "template", slug: "index" }, "image-c110644");
     const { ctx } = await realCtx(
       "fineline",
@@ -809,7 +809,7 @@ describe("blockImage", () => {
     );
     const spec = blockImage(img, ctx);
     expect(spec).toEqual({
-      src: "${(state.entry.data.featuredImage?.src ?? '') || false}",
+      src: "${(state.entry.data.featuredImage?.src ?? '') || ''}",
       alt: "${state.entry.data.featuredImage?.alt ?? ''}",
       width: "${(state.entry.data.featuredImage?.width ?? '') || false}",
       height: "${(state.entry.data.featuredImage?.height ?? '') || false}",
@@ -822,7 +822,7 @@ describe("blockImage", () => {
     };
     expect(evalTemplate(spec?.src ?? "", have)).toBe("/media/a.jpg");
     expect(evalTemplate(String(spec?.width ?? ""), have)).toBe("800");
-    expect(evalTemplate(spec?.src ?? "", { entry: { data: {} } })).toBe("false");
+    expect(evalTemplate(spec?.src ?? "", { entry: { data: {} } })).toBe("");
   });
 
   test("on a static page it is the featured image's file at the size the block asks for", async () => {
@@ -972,7 +972,7 @@ describe("blockImage", () => {
     ).toBe("${state.eager ? 'lazy' : 'eager'}");
   });
 
-  test("an avatar has no file on the converted site: the fallback image is used, and the rest is reported", async () => {
+  test("the picture of the current author is not read (the live page prints the block's fallback): the fallback image is used, and the rest is reported", async () => {
     const img = await imageBlock("ap", { kind: "template", slug: "single-post" }, "image-c8732a8");
     const { ctx, loaded } = await realCtx(
       "ap",

@@ -35,6 +35,7 @@ import type {
 } from "../types.ts";
 import { tableExists } from "./db.ts";
 import { isSerialized, maybeUnserialize } from "./phpser.ts";
+import { loadUserProfiles, setUserProfiles } from "./profiles.ts";
 
 export interface LoadOptions {
   /**
@@ -512,6 +513,9 @@ export async function loadModel(db: WpDb, opts: LoadOptions = {}): Promise<WpMod
     }
   }
 
+  // ── the people the site shows: their profile fields, read beside the model (`wp/profiles.ts`) ──
+  const profiles = await loadUserProfiles(db, users, report);
+
   // ── menus ──
   const menuItems = await loadMenuItems(db, termOfTaxonomyRow, report);
 
@@ -521,7 +525,7 @@ export async function loadModel(db: WpDb, opts: LoadOptions = {}): Promise<WpMod
   // ── comments: the model has no place for them, so they are reported ──
   if (report) await reportComments(db, posts, site, report);
 
-  return {
+  const model: WpModel = {
     site,
     options,
     posts,
@@ -533,6 +537,8 @@ export async function loadModel(db: WpDb, opts: LoadOptions = {}): Promise<WpMod
     menuItems,
     redirects,
   };
+  setUserProfiles(model, profiles);
+  return model;
 }
 
 // ── Pieces ───────────────────────────────────────────────────────────────────────────────────────

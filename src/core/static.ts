@@ -974,16 +974,18 @@ function markdownSafe(nodes: JxNode[], found: Found, literal = false): JxNode[] 
     if (typeof tag === "string" && LINE_HOSTS.has(tag) && Array.isArray(node.children)) {
       const breaks = trimTrailingBreaks(node.children);
       if (breaks > 0) {
-        found.breaks += breaks;
-        if (node.children.length === 0) {
-          delete node.children;
-          if (
-            DROP_WHEN_EMPTY.has(tag) &&
-            node.textContent === undefined &&
-            node.innerHTML === undefined
-          ) {
-            continue;
-          }
+        if (
+          node.children.length === 0 &&
+          DROP_WHEN_EMPTY.has(tag) &&
+          node.textContent === undefined &&
+          node.innerHTML === undefined
+        ) {
+          // A block that is nothing but breaks (`<p><br></p>`, the editor's empty line) shows a line for
+          // each one, and the page it sits on is spaced by it: the entry's own fitting writes those lines.
+          node.children = Array.from({ length: breaks }, () => ({ tagName: "br" }));
+        } else {
+          found.breaks += breaks;
+          if (node.children.length === 0) delete node.children;
         }
       }
     }

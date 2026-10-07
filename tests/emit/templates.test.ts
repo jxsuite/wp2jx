@@ -13,7 +13,14 @@ import { readFileSync } from "node:fs";
 import { posix } from "node:path";
 import { fromHtml } from "hast-util-from-html";
 import { buildCollections } from "../../src/emit/collections.ts";
-import { buildPages, hierarchyLayout } from "../../src/emit/pages.ts";
+import { setUserProfiles } from "../../src/wp/profiles.ts";
+import {
+  buildPages,
+  EMPTY_SHORTCODES,
+  hierarchyLayout,
+  leftOutShortcode,
+  SERVER_ONLY_SHORTCODES,
+} from "../../src/emit/pages.ts";
 import {
   archiveLabel,
   authorRobots,
@@ -28,7 +35,6 @@ import {
   countEntryBodies,
   crumbsFor,
   cwiclyRule,
-  EMPTY_SHORTCODES,
   fragmentParts,
   isPageTemplate,
   layoutFor,
@@ -1559,6 +1565,23 @@ describe("layouts", () => {
     expect(doc.$elements).toBeUndefined();
   });
 
+  test("a theme that supports responsive embeds has the wrapper carry wp-embed-responsive, the body class every one of the library's embed rules starts from", async () => {
+    const doc = docOf(
+      await buildTemplates(site("ap"), { responsiveEmbeds: true }),
+      "layouts/base.json",
+    );
+    expect(childrenOf(doc)).toEqual([
+      {
+        tagName: "div",
+        className: "wp-site-blocks wp-embed-responsive",
+        children: [{ tagName: "slot" }],
+      },
+    ]);
+    const used = (await buildTemplates(site("ap"), { responsiveEmbeds: true })).used.wpClasses;
+    expect(used.has("wp-embed-responsive")).toBe(true);
+    expect(out("ap").used.wpClasses.has("wp-embed-responsive")).toBe(false);
+  });
+
   test("ap: the page layout prints the title and the breadcrumb the template had, bound to the page's own entry", () => {
     const doc = docOf(out("ap"), "layouts/page.json");
     const kids = childrenOf(doc) as JxElement[];
@@ -1623,6 +1646,15 @@ describe("layouts", () => {
     const reasons = o.report.entries().filter((e) => e.code === "template.shortcode-empty");
     expect(reasons.length).toBeGreaterThan(0);
     expect(reasons.map((e) => e.severity)).toEqual(reasons.map(() => "info"));
+    // The PDF button links to a file the live server makes per request: no placeholder text on every essay.
+    expect(fileOf(o, "layouts/single-post.json")).not.toContain("[dkpdf-button]");
+    expect(fileOf(o, "pages/essays/[slug].json")).not.toContain("dkpdf");
+    expect(
+      o.report
+        .entries()
+        .filter((e) => e.code === "template.shortcode-dropped")
+        .map((e) => [e.severity, e.data?.shortcode]),
+    ).toEqual([["info", "dkpdf-button"]]);
   });
 
   test("ap: the part components nest: the header holds the top menu and the mobile menu through $elements", () => {
@@ -2329,6 +2361,29 @@ describe("Fluent Forms in a template", () => {
   });
 });
 
+describe("Interactive Geo Maps in a template", () => {
+  test("the location template's `[display-map id='3197']` becomes the map's empty stage, not its text", async () => {
+    const o = await buildTemplates(site("fineline"), { only: ["taxonomy-location"] });
+    const doc = JSON.stringify([...jsonFiles(o).values()]);
+    expect(doc).toContain("geomap:3197");
+    expect(doc).toContain("map_wrapper_3197");
+    expect(doc).toContain("padding-top:56%");
+    expect(doc).not.toContain("[display-map");
+    const said = o.report.entries().filter((e) => e.code.startsWith("map."));
+    expect(said.map((e) => e.code)).toEqual(["map.not-interactive"]);
+    expect(said[0]!.where).toBe("template:cwicly//taxonomy-location");
+    expect(
+      o.report
+        .entries()
+        .some(
+          (e) =>
+            e.code === "template.placeholder-neutral" &&
+            JSON.stringify(e.data).includes("display-map"),
+        ),
+    ).toBe(false);
+  });
+});
+
 describe("slotContent", () => {
   test("the first element that printed the entry's body keeps its box and holds the slot", () => {
     const nodes = [
@@ -2360,6 +2415,42 @@ describe("slotContent", () => {
       el("div", { children: [] }),
     ]);
     expect(slotsIn(done.nodes)).toBe(1);
+  });
+
+  test("the slot is not hidden for an empty entry: the page that fills it has a body of its own", () => {
+    const hiding = "${!((state.entry.$children?.length ?? 0) > 0)}";
+    const box = () =>
+      el("div", {
+        className: "box",
+        attributes: { hidden: hiding, id: "b" } as never,
+        style: { color: "red", "&[hidden]": { display: "none !important" } } as never,
+        children: ENTRY_BODY as unknown as JxNode[],
+      });
+    const done = slotContent([box(), box()]);
+    expect(done.nodes[0]).toEqual(
+      el("div", {
+        className: "box",
+        attributes: { id: "b" } as never,
+        style: { color: "red" } as never,
+        children: [{ tagName: "slot" }],
+      }),
+    );
+    // Only the box that holds the slot is rewritten; an emptied one keeps what it had.
+    expect((done.nodes[1] as JxElement).attributes).toEqual({ hidden: hiding, id: "b" });
+    const bare = el("div", {
+      attributes: { hidden: hiding } as never,
+      style: { "&[hidden]": { display: "none !important" } } as never,
+      children: ENTRY_BODY as unknown as JxNode[],
+    });
+    expect(slotContent([bare]).nodes).toEqual([el("div", { children: [{ tagName: "slot" }] })]);
+    // A condition of the author's own is not ours to remove.
+    const own = el("div", {
+      attributes: { hidden: "${!state.entry.data.show}" } as never,
+      children: ENTRY_BODY as unknown as JxNode[],
+    });
+    expect((slotContent([own]).nodes[0] as JxElement).attributes).toEqual({
+      hidden: "${!state.entry.data.show}",
+    });
   });
 
   test("a binding that only looks like the body is left alone", () => {
@@ -2521,6 +2612,18 @@ describe("withoutShortcodeText", () => {
     expect([...EMPTY_SHORTCODES].sort()).toEqual(["dkpdf-pdf-remove", "dkpdf-remove"]);
     // The breadcrumb is not among them: the live pages print it.
     expect(EMPTY_SHORTCODES.has("rank_math_breadcrumb")).toBe(false);
+  });
+
+  test("a shortcode only a server can answer is left out with its reason; any other has no such entry", () => {
+    expect([...SERVER_ONLY_SHORTCODES.keys()]).toEqual(["dkpdf-button"]);
+    expect(leftOutShortcode("dkpdf-button")).toMatchObject({
+      code: "template.shortcode-dropped",
+      data: { shortcode: "dkpdf-button" },
+    });
+    expect(leftOutShortcode("/dkpdf-button", "page")?.code).toBe("page.shortcode-dropped");
+    expect(leftOutShortcode("dkpdf-remove", "page")?.code).toBe("page.shortcode-empty");
+    expect(leftOutShortcode("give_form")).toBeUndefined();
+    expect(leftOutShortcode("rank_math_breadcrumb")).toBeUndefined();
   });
 });
 
@@ -3077,7 +3180,7 @@ describe("what a template can get wrong", () => {
           nodes: [
             marker("dkpdf-remove"),
             marker("/dkpdf-remove"),
-            marker("/dkpdf-button"),
+            marker("/give_form"),
             ...converted.nodes,
           ],
         };
@@ -3086,7 +3189,7 @@ describe("what a template can get wrong", () => {
     const text = fileOf(o, "layouts/page.json");
     expect(text).not.toContain("dkpdf-remove");
     // A shortcode that does print something is kept as a visible stand-in, closing tag or not.
-    expect(text).toContain("shortcode:/dkpdf-button");
+    expect(text).toContain("shortcode:/give_form");
     expect(o.report.entries().filter((e) => e.code === "template.shortcode-empty")).toHaveLength(1);
   });
 
@@ -3691,7 +3794,18 @@ function decodeTitle(title: string): string {
 describe("ap: the built page has the live page's top-level blocks, in order", () => {
   /** A block by its tag and its classes (the order the classes are written in is not a thing the page shows). */
   const skeleton = (doc: Hast): string[] =>
-    siteBlocks(doc).map((e) => `${e.tagName}.${classOf(e).split(" ").sort().join(".")}`);
+    siteBlocks(doc)
+      // A block the entry's own data hides (`hidden`) is not on the page the visitor sees.
+      .filter((e) => e.properties?.hidden === undefined)
+      // (`jx-…` is the scope class Jx gives an element with a style of its own and no class: not something the page shows.)
+      .map(
+        (e) =>
+          `${e.tagName}.${classOf(e)
+            .split(" ")
+            .filter((c) => !/^jx-[0-9a-f]+$/.test(c))
+            .sort()
+            .join(".")}`,
+      );
 
   /** Whether `a` is `b` with some entries left out, in order. */
   const isSubsequence = (a: string[], b: string[]): boolean => {
@@ -4356,6 +4470,60 @@ describe("boundHead leaves an attribute out only by not writing the tag", () => 
     expect(authorRobots({}, "0")).toBe("noindex, nofollow");
     // nosnippet suppresses the advanced list too.
     expect(authorRobots({ robots_global: ["nosnippet"] })).toBe("follow, index, nosnippet");
+  });
+
+  test("an author with a profile has its fields in the author's data, under the page's own keys", async () => {
+    const loaded = site("ap");
+    const dp = loaded.routes.dynamicPages().find((d) => d.kind === "authors")!;
+    const route = dp.routes[0]!;
+    const user = loaded.model.users.get(Number(route.id))!;
+    const model = { ...loaded.model } as typeof loaded.model;
+    setUserProfiles(
+      model,
+      new Map([
+        [
+          user.id,
+          {
+            ...user,
+            meta: {
+              position: "Co-founder",
+              _position: "field_62fea1aa7c14c",
+              first_name: "Given",
+              last_name: "Family Name",
+              description: "A line about them.",
+            },
+            roles: [],
+          },
+        ],
+      ]),
+    );
+    const o = await buildTemplates({ ...loaded, model } as typeof loaded, { only: ["author"] });
+    const value = (dp.paths as { values: string[] }).values.find((v) =>
+      route.jxRoute.endsWith(`/${v}/`),
+    )!;
+    const data = parse(fileOf(o, `content/author/${value}.json`)) as Record<string, unknown>;
+    expect(data).toMatchObject({
+      first_name: "Given",
+      last_name: "Family Name",
+      description: "A line about them.",
+      position: "Co-founder",
+      name: user.displayName,
+      slug: user.slug,
+      url: route.jxRoute,
+    });
+    // Someone with no profile has the display name split in two, and no biography.
+    const [first = "", ...rest] = user.displayName.split(" ");
+    const bare = await buildTemplates(loaded, { only: ["author"] });
+    expect(parse(fileOf(bare, `content/author/${value}.json`))).toMatchObject({
+      first_name: first,
+      last_name: rest.join(" "),
+      description: "",
+    });
+    // Someone with no profile has only the page's keys.
+    const other = o.files.find(
+      (f) => f.path.startsWith("content/author/") && !f.path.endsWith(`/${value}.json`),
+    );
+    if (other !== undefined) expect(parse(other.content)).not.toHaveProperty("position");
   });
 
   test("the author's description comes from Rank Math's option, rendered for the name", async () => {

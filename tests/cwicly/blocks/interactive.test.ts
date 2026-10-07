@@ -29,7 +29,7 @@ import type { DefaultTreeAdapterMap } from "parse5";
 import puppeteer from "puppeteer-core";
 import type { Browser, Page } from "puppeteer-core";
 import { coreConverters } from "../../../src/core/blocks.ts";
-import { withRegistry } from "../../../src/convert.ts";
+import { hiddenByEditor, withRegistry } from "../../../src/convert.ts";
 import { layoutConverters } from "../../../src/cwicly/blocks/layout.ts";
 import { parseCwiclyCss } from "../../../src/cwicly/css.ts";
 import { nodesToHtml } from "../../../src/html.ts";
@@ -187,6 +187,7 @@ async function census(site: SiteName) {
   const counts = new Map<string, number>();
   const converted = new Map<string, number>();
   const empty = new Map<string, number>();
+  const hidden = new Map<string, number>();
   const failures: string[] = [];
   const reports: ReportEntry[] = [];
   for (const subject of allSubjects(loaded)) {
@@ -211,10 +212,14 @@ async function census(site: SiteName) {
       counts.set(name, (counts.get(name) ?? 0) + 1);
       const out = (await runFor(site, subject)).ctx.convert([b]);
       converted.set(name, (converted.get(name) ?? 0) + 1);
-      if (out.length === 0) empty.set(name, (empty.get(name) ?? 0) + 1);
+      // A block the editor hides prints nothing by design; it is counted apart from one that converts to nothing.
+      if (out.length === 0) {
+        const into = hiddenByEditor(b) ? hidden : empty;
+        into.set(name, (into.get(name) ?? 0) + 1);
+      }
     }
   }
-  return { counts, converted, empty, failures, reports };
+  return { counts, converted, empty, hidden, failures, reports };
 }
 
 describe("the census", () => {
@@ -233,6 +238,8 @@ describe("the census", () => {
       expect(c.converted.get(name)).toBe(n);
     }
     expect(Object.fromEntries(c.empty)).toEqual({});
+    // The one menu the editor's Hide switch turns off (the `header-updated-menu` part) prints nothing.
+    expect(Object.fromEntries(c.hidden)).toEqual({ "cwicly/menu": 1 });
   });
 
   test("anabaptistperspectives: every interactive block converts", async () => {
@@ -1528,6 +1535,10 @@ describe("menus", () => {
           if (b.name === "cwicly/menu") menus.push(b);
         });
         for (const b of menus) {
+          if (hiddenByEditor(b)) {
+            expect(run.ctx.convert([b])).toEqual([]);
+            continue;
+          }
           const holder = byTag(run.ctx.convert([b]), "wp2jx-menu")[0];
           expect(readPlaceholder(holder as JxElement)?.attrs["data-menu"]).toBe(
             b.attrs.menuSelected as string,

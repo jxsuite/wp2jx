@@ -115,19 +115,23 @@
  * the conversions and the menus report, located at their subject.
  */
 import { collectWpClasses } from "../core/block-css.ts";
-import { jsString, termData, texturize } from "../cwicly/tokens.ts";
+import { jsString, termData, texturize, userFields } from "../cwicly/tokens.ts";
+import { userProfiles } from "../wp/profiles.ts";
 import { convertSubject, dedupeRules, type Converted } from "../convert.ts";
 import { htmlToNodes } from "../html.ts";
 import { escapeTemplate, htmlEscapeExpr } from "../jx-util.ts";
 import { fluentFormFor } from "./fluentform.ts";
+import { geoMapFor } from "./geomap.ts";
 import { rewriteStyleUrls } from "./style-urls.ts";
 import { menuResolvers, newUsed as newMenusUsed, type MenusUsed } from "./menus.ts";
 import {
+  EMPTY_SHORTCODES,
   ENTRY_STATE_KEY,
   componentFile,
   headEntries,
   hoistedStyle,
   layoutPath,
+  leftOutShortcode,
   literalText,
   misplacedBindings,
   relativeRef,
@@ -233,6 +237,13 @@ export interface TemplatesOptions {
   convert?: (site: SiteContext, subject: Subject, opts?: SubjectOptions) => Promise<Converted>;
   /** `cwicly_custom_code` as the design system returns it. Default: the site's own options. */
   customCode?: { head?: string; bodyOpen: string; footer: string };
+  /**
+   * The theme asks for responsive embeds (`add_theme_support('responsive-embeds')`): WordPress then puts
+   * `wp-embed-responsive` on `<body>`, and the block library's aspect-ratio rules for embeds
+   * (`.wp-embed-responsive .wp-embed-aspect-16-9 .wp-block-embed__wrapper:before`) all start there. A
+   * Jx page has no body of its own to class, so the document frame's `wp-site-blocks` div carries it.
+   */
+  responsiveEmbeds?: boolean;
 }
 
 export interface TemplateFile {
@@ -1275,8 +1286,28 @@ export function slotContent(nodes: readonly JxNode[]): { nodes: JxNode[]; found:
     if (!isEntryBody(element)) continue;
     found++;
     element.children = found === 1 ? [{ tagName: "slot" }] : [];
+    if (found === 1) withoutEmptyBodyHiding(element);
   }
   return { nodes: copy, found };
+}
+
+/** `core/post-content` hides its box when the entry has no body (`state.entry.$children` empty). */
+const EMPTY_BODY = /^\$\{!\(\(state\.entry\.\$children\?\.length \?\? 0\) > 0\)\}$/;
+
+/**
+ * A layout's slot is filled by the page, which has a body of its own: the entry that hiding reads
+ * does not exist there, and a box that stayed hidden would take the whole page with it.
+ */
+function withoutEmptyBodyHiding(element: JxElement): void {
+  const attributes = element.attributes as Record<string, unknown> | undefined;
+  if (typeof attributes?.hidden !== "string" || !EMPTY_BODY.test(attributes.hidden)) return;
+  delete attributes.hidden;
+  if (Object.keys(attributes).length === 0) delete element.attributes;
+  const style = element.style as Record<string, unknown> | undefined;
+  if (style) {
+    delete style["&[hidden]"];
+    if (Object.keys(style).length === 0) delete element.style;
+  }
 }
 
 /** A tree's elements that are `wp2jx-template-part` placeholders of the given parts. */
@@ -1377,14 +1408,6 @@ export function withoutShortcodeText(nodes: readonly JxNode[]): {
 }
 
 // ── Placeholders ─────────────────────────────────────────────────────────────────────────────────
-
-/**
- * Shortcodes that print nothing on the live pages of the sites this was built from: the markers of the
- * PDF plugin's `[dkpdf-remove]`, which only keep the section out of a PDF. Removed and said
- * (`template.shortcode-empty`). (Rank Math's `[rank_math_breadcrumb]` is NOT here: it prints a real
- * `nav.rank-math-breadcrumb` on every page that has the shortcode, see {@link breadcrumbNode}.)
- */
-export const EMPTY_SHORTCODES: ReadonlySet<string> = new Set(["dkpdf-remove", "dkpdf-pdf-remove"]);
 
 /**
  * One crumb after `Home`: text known now (with the address it links to, when it has one), or an
@@ -1530,6 +1553,7 @@ interface Env {
   menus: MenusUsed;
   used: TemplatesUsed;
   customCode: { head?: string; bodyOpen: string; footer: string };
+  responsiveEmbeds: boolean;
   converted: Map<string, Promise<Converted>>;
 }
 
@@ -1664,19 +1688,19 @@ function resolversFor(
       }
       // A closing tag (`[/dkpdf-remove]`) is the same shortcode's own.
       const base = name.replace(/^\//, "");
-      if (EMPTY_SHORTCODES.has(base)) {
-        once(`shortcode-empty|${base}`, {
-          severity: "info",
-          code: "template.shortcode-empty",
-          message: `The shortcode [${base}] printed nothing on the live pages and is left out.`,
-          data: { shortcode: base },
-        });
+      const left = leftOutShortcode(base);
+      if (left !== undefined) {
+        once(`${left.code}|${base}`, { severity: "info", ...left });
         return Array.isArray(placeholder.element.children) ? placeholder.element.children : null;
       }
       const form = fluentFormFor(site, placeholder, (entry) =>
         once(`${entry.code}|${placeholder.attrs["data-attributes"] ?? ""}|${entry.message}`, entry),
       );
       if (form !== undefined) return form;
+      const map = geoMapFor(site, placeholder, (entry) =>
+        once(`${entry.code}|${placeholder.attrs["data-attributes"] ?? ""}|${entry.message}`, entry),
+      );
+      if (map !== undefined) return map;
       once(`shortcode|${name}`, {
         severity: "warn",
         code: "template.placeholder-neutral",
@@ -2034,7 +2058,11 @@ function baseLayout(env: Env): string {
   const children: JxNode[] = [
     ...open,
     ...fragmentNodes(env, "globalheader"),
-    { tagName: "div", className: "wp-site-blocks", children: [{ tagName: "slot" }] },
+    {
+      tagName: "div",
+      className: env.responsiveEmbeds ? "wp-site-blocks wp-embed-responsive" : "wp-site-blocks",
+      children: [{ tagName: "slot" }],
+    },
     ...fragmentNodes(env, "globalfooter"),
     ...foot,
   ];
@@ -2503,6 +2531,9 @@ const AUTHOR_SCHEMA: TermCollectionDef["schema"] = {
     author: { type: "string" },
     authorUrl: { type: "string", format: "uri-reference" },
     url: { type: "string", format: "uri-reference" },
+    first_name: { type: "string" },
+    last_name: { type: "string" },
+    description: { type: "string" },
     seo: { type: "object" },
   },
   required: ["id", "name", "slug"],
@@ -2579,6 +2610,13 @@ async function dataSet(
       if (!user) continue;
       const name0 = decodeEntities(user.displayName);
       data = {
+        // What the site prints about the person (photograph, position, biography) is theirs, under the
+        // keys their ACF fields have; the keys below are the page's own and win.
+        ...(sample === undefined
+          ? {}
+          : userFields(sample, user.id, userProfiles(site.model).has(user.id))),
+        // What `{authorinfo=…}` prints on an author page: the profile's names, or the display name split in two.
+        ...authorInfo(site.model, user, name0),
         id: value,
         name: name0,
         title: name0,
@@ -2618,6 +2656,26 @@ async function dataSet(
     },
     files,
     has: headHas(seos),
+  };
+}
+
+/**
+ * The WordPress profile fields an author page prints through `{authorinfo=…}`: the first and last name
+ * (the display name split at its first space when the account holds none) and the biography box.
+ */
+function authorInfo(
+  model: SiteContext["model"],
+  user: { id: number; displayName: string },
+  name: string,
+): { first_name: string; last_name: string; description: string } {
+  const meta = userProfiles(model).get(user.id)?.meta ?? {};
+  const given = typeof meta.first_name === "string" ? meta.first_name : "";
+  const family = typeof meta.last_name === "string" ? meta.last_name : "";
+  const [first = "", ...rest] = name.split(" ");
+  return {
+    first_name: given !== "" || family !== "" ? given : first,
+    last_name: given !== "" || family !== "" ? family : rest.join(" "),
+    description: typeof meta.description === "string" ? meta.description : "",
   };
 }
 
@@ -3357,6 +3415,7 @@ export async function buildTemplates(
     menus: used.menus,
     used,
     customCode: opts.customCode ?? site.options.customCode,
+    responsiveEmbeds: opts.responsiveEmbeds === true,
     converted: new Map(),
   };
   const files: TemplateFile[] = [];

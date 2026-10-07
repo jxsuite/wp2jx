@@ -90,6 +90,7 @@ import { collectWpClasses } from "../core/block-css.ts";
 import { postData } from "../cwicly/tokens.ts";
 import { convertSubject, dedupeRules, type Converted } from "../convert.ts";
 import { fluentFormFor } from "./fluentform.ts";
+import { geoMapFor } from "./geomap.ts";
 import { rewriteStyleUrls } from "./style-urls.ts";
 import {
   childNodes,
@@ -215,6 +216,53 @@ export interface PagesOutput {
 }
 
 // ── Layouts ──────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Shortcodes that print nothing on the live pages of the sites this was built from: the markers of the
+ * PDF plugin's `[dkpdf-remove]`, which only keep the section out of a PDF. Removed and said
+ * (`template.shortcode-empty`). (Rank Math's `[rank_math_breadcrumb]` is NOT here: it prints a real
+ * `nav.rank-math-breadcrumb` on every page that has the shortcode, see {@link breadcrumbNode}.)
+ */
+export const EMPTY_SHORTCODES: ReadonlySet<string> = new Set(["dkpdf-remove", "dkpdf-pdf-remove"]);
+
+/**
+ * Shortcodes whose output only a server can make, and that print a link or a button rather than
+ * content: a page without them is not misleading, and the visible placeholder text (`[dkpdf-button]`)
+ * would stand on every page that carries them. Left out and said (`template.shortcode-dropped`).
+ */
+export const SERVER_ONLY_SHORTCODES: ReadonlyMap<string, string> = new Map([
+  [
+    "dkpdf-button",
+    "it links to a PDF that the live server makes from the page for each request, which a static site has no way to serve",
+  ],
+]);
+
+/**
+ * What the report says for a shortcode that is left out instead of shown as a placeholder, or
+ * undefined for any other: {@link EMPTY_SHORTCODES} print nothing live, {@link SERVER_ONLY_SHORTCODES}
+ * need a server.
+ */
+export function leftOutShortcode(
+  name: string,
+  scope: "page" | "template" = "template",
+): { code: string; message: string; data: { shortcode: string } } | undefined {
+  const base = name.replace(/^\//, "");
+  if (EMPTY_SHORTCODES.has(base)) {
+    return {
+      code: `${scope}.shortcode-empty`,
+      message: `The shortcode [${base}] printed nothing on the live pages and is left out.`,
+      data: { shortcode: base },
+    };
+  }
+  const why = SERVER_ONLY_SHORTCODES.get(base);
+  return why === undefined
+    ? undefined
+    : {
+        code: `${scope}.shortcode-dropped`,
+        message: `The shortcode [${base}] is left out: ${why}.`,
+        data: { shortcode: base },
+      };
+}
 
 const firstMeta = (site: Pick<SiteContext, "model">, id: number, key: string): unknown =>
   site.model.postMeta.get(id)?.[key]?.[0];
@@ -888,10 +936,19 @@ export async function buildPages(site: SiteContext, opts: PageOptions = {}): Pro
     },
     shortcode: (placeholder) => {
       const name = placeholder.attrs["data-shortcode"] ?? "";
+      const left = leftOutShortcode(name, "page");
+      if (left !== undefined) {
+        page.report.add({ severity: "info", ...left, where: page.where, url: page.url });
+        return Array.isArray(placeholder.element.children) ? placeholder.element.children : null;
+      }
       const form = fluentFormFor(site, placeholder, (entry) =>
         page.report.add({ ...entry, where: page.where, url: page.url }),
       );
       if (form !== undefined) return form;
+      const map = geoMapFor(site, placeholder, (entry) =>
+        page.report.add({ ...entry, where: page.where, url: page.url }),
+      );
+      if (map !== undefined) return map;
       page.report.add({
         severity: "warn",
         code: "page.placeholder-neutral",

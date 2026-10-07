@@ -27,6 +27,8 @@ Options
   --only <substring>       only URLs whose path contains this
   --viewports <w,w>        widths to capture (default ${DEFAULT_VIEWPORTS.join(",")})
   --build                  run jx build in the project first
+  --remove <selector>      take this CSS selector out of the layout on both sides (repeatable): for what
+                           one side has only because the database is older than the live site
   --mask <selector>        blank this CSS selector on both sides (repeatable); the built-in masks hide
                            chat widgets, cookie banners, maps and video embeds, carousels, review
                            widgets, and fineline's injected spam block and script
@@ -50,6 +52,7 @@ const FLAGS = {
   viewports: { type: "string" },
   build: { type: "boolean" },
   mask: { type: "string", multiple: true },
+  remove: { type: "string", multiple: true },
   "report-dir": { type: "string" },
   "live-cache": { type: "string" },
   concurrency: { type: "string" },
@@ -111,6 +114,7 @@ export function parseVerifyArgs(args: string[]): VerifyOptions | "help" {
   }
   if (values.build === true) options.build = true;
   if (values.mask !== undefined) options.masks = values.mask;
+  if (values.remove !== undefined) options.removes = values.remove;
   if (values["report-dir"] !== undefined) options.reportDir = values["report-dir"];
   if (values["live-cache"] !== undefined) options.liveCache = values["live-cache"];
   if (values.concurrency !== undefined)

@@ -2,13 +2,13 @@
  * `icb/image-compare`: the Image Compare Block plugin's before and after slider.
  *
  * The block saves no markup (`<!-- wp:icb/image-compare {…} /-->`): the plugin's PHP prints a
- * container and its script builds the slider in the browser, sizing the stage to the before image. A
+ * container and its script builds the slider in the browser, sizing the stage to its taller image. A
  * static page cannot run the script, but the slider's resting state (both images, the second clipped
  * to the right half, a handle in the middle) is plain markup and the plugin's own `view.css` styles it,
  * so that is what the converter writes. What a visitor loses is the dragging: the images stay split
  * at the middle (`block.image-compare-static`, info).
  *
- * The stage is as tall as the before image is at the stage's width; the script writes that height in
+ * The stage is as tall as the taller of the two images is at the stage's width; the script writes that height in
  * pixels, and an `aspect-ratio` says the same without it. A stage height the block states for a device
  * (`styles.container.height`) is a script setting too and is not carried.
  *
@@ -55,6 +55,24 @@ function pickedImage(
   };
 }
 
+/**
+ * The image that sets the stage's height: the script gives the stage, and both images, the tallest of
+ * the heights the images have at the stage's width (`Math.max` over their rendered heights), so it is
+ * the one with the larger height for its width, not the before image. When only one image knows its
+ * size that one stands in for both, as the stage then follows the only ratio there is.
+ */
+function tallestOf(
+  ...images: { width?: number; height?: number }[]
+): { width: number; height: number } | undefined {
+  let best: { width: number; height: number } | undefined;
+  for (const image of images) {
+    const { width, height } = image;
+    if (width === undefined || height === undefined || !(width > 0) || !(height > 0)) continue;
+    if (best === undefined || height / width > best.height / best.width) best = { width, height };
+  }
+  return best;
+}
+
 export const imageCompareBlock: BlockConverter = (block: WpBlock, ctx) => {
   const a = block.attrs;
   const before = pickedImage(ctx, a.beforeImg);
@@ -71,10 +89,8 @@ export const imageCompareBlock: BlockConverter = (block: WpBlock, ctx) => {
   }
   const vertical = a.orientation === "vertical";
   const width = typeof a.width === "string" && a.width !== "" ? a.width : "80%";
-  const ratio =
-    before.width !== undefined && before.height !== undefined
-      ? `aspect-ratio:${before.width} / ${before.height};`
-      : "";
+  const tallest = tallestOf(before, after);
+  const ratio = tallest === undefined ? "" : `aspect-ratio:${tallest.width} / ${tallest.height};`;
   const clip = vertical ? "inset(50% 0px 0px 0px)" : "inset(0px 0px 0px 50%)";
   const handle = vertical
     ? `<div class="icb-comparison-slider-handle icb-slider-vertical default" style="top:50%"><div class="icb-default-icon"></div></div>`

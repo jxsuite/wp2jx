@@ -555,7 +555,7 @@ describe("what is left out is reported", () => {
       "redirect:about/",
       "redirect:project/barn",
     ]);
-    expect(about("redirect.supersedes-page")[0]!.message).toContain("the page is not written");
+    expect(about("redirect.supersedes-page")[0]!.message).toContain("in place of the page");
     // the home page and the posts page are not a page of their own: the page stays, the rule gives way, said
     expect(about("redirect.shadowed").map((e) => e.where)).toEqual([
       "redirect:/",

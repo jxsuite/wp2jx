@@ -41,6 +41,7 @@ import { createReport } from "../../../src/report.ts";
 import { walkBlocks } from "../../../src/wp/blocks.ts";
 import { decodeEntities, termsOf } from "../../../src/wp/model.ts";
 import { postData } from "../../../src/cwicly/tokens.ts";
+import { setUserProfiles } from "../../../src/wp/profiles.ts";
 import type { ConvertCtx, JxElement, JxNode, WpBlock, WpPost, WpTerm } from "../../../src/types.ts";
 import {
   collectedState,
@@ -57,7 +58,9 @@ import {
   termRows,
   variantClasses,
   loopChildren,
+  writtenOut,
   lengthOf,
+  userList,
   usesInComputedLists,
   type ListSource,
   type PostPlan,
@@ -1258,13 +1261,13 @@ describe("the plan of a posts query: the current entry, exclusions, meta, search
         queryAuthor: st([]), // empty
         queryDate: [{ multiple: false }], // a date query: not read
         queryPostParent: st("12"),
-        queryAuthorName: dyn("authorname"),
+        queryCommentCount: st("3"),
         queryHideEmpty: false,
         queryPostStatus: pick("publish"), // read (only published posts are entries)
       }),
       ctx,
     );
-    expect(plan.dropped.sort()).toEqual(["queryAuthorName", "queryDate", "queryPostParent"]);
+    expect(plan.dropped.sort()).toEqual(["queryCommentCount", "queryDate", "queryPostParent"]);
   });
 
   test("queryInherit is the template's own main query: its post type, and the archive's term", async () => {
@@ -1280,7 +1283,6 @@ describe("the plan of a posts query: the current entry, exclusions, meta, search
 
   test("queries that are not lists of entries are unsupported, with the reason", () => {
     for (const [queryType, what] of [
-      ["users", "users"],
       ["comments", "comments"],
       ["products", "products"],
     ] as const) {
@@ -1683,6 +1685,257 @@ describe("a query block", () => {
     expect(state.get("project_q7")).toMatchObject({ $prototype: "ContentCollection", limit: 3 });
   });
 
+  test("a users query is a plan: the people an ACF user field of the post holds, a list of ids, or the people of roles; the block's own pick is not used", async () => {
+    const ctx = await makeCtx(
+      "ap",
+      { kind: "template", slug: "single-episode" },
+      { mode: "entry", entryType: "episode" },
+    );
+    const field = planOf(
+      queryBlock({
+        queryType: "users",
+        queryOrder: st("DESC"),
+        queryOrderBy: st("date"),
+        queryInclude: {
+          source: "dynamic",
+          type: "acf",
+          group: "g",
+          field: "field_62d867cf7c18b",
+          fallback: "226, 153",
+        },
+      }),
+      ctx,
+    );
+    expect(field.plan).toMatchObject({
+      kind: "users",
+      field: { key: "field_62d867cf7c18b" },
+      ids: [],
+      order: "desc",
+    });
+    expect(
+      planOf(queryBlock({ queryType: "users", queryInclude: st("4, 9") }), ctx).plan,
+    ).toMatchObject({ kind: "users", field: undefined, ids: [4, 9] });
+    expect(
+      planOf(
+        queryBlock({
+          queryType: "users",
+          queryRole: pick("staff", "editor"),
+          queryRoleNotIn: pick("subscriber"),
+        }),
+        ctx,
+      ).plan,
+    ).toMatchObject({ kind: "users", roles: ["staff", "editor"], rolesNotIn: ["subscriber"] });
+    // What a static list cannot follow is said, and the request's own search is the unfiltered list.
+    const odd = planOf(
+      queryBlock({
+        queryType: "users",
+        queryMeta: [{ key: "x" }],
+        querySearch: dyn("urlparameter", "s"),
+        queryInclude: dyn("postterms"),
+      }),
+      ctx,
+    );
+    expect(odd.plan).toMatchObject({ kind: "users" });
+    expect((odd.plan as { dropped: string[] }).dropped.join(" ")).toContain("queryMeta");
+    expect((odd.plan as { dropped: string[] }).dropped.join(" ")).toContain("postterms");
+    expect(odd.info.map((i) => i.code)).toEqual(["query.url-parameter"]);
+  });
+
+  test("the people of a users query are a loop whose row is the person: the post's own entry is still the entry, and the tokens read the row", async () => {
+    const seen: ConvertCtx[] = [];
+    registerConverters({
+      "x/probe": (_b, c) => {
+        seen.push(c);
+        return [];
+      },
+    });
+    const person = block(
+      "cwicly/heading",
+      { headingTag: "h3", dynamic: "userquery", dynamicWordPressType: "display_name" },
+      [],
+      "<h3>{userquery=display_name}</h3>",
+    );
+    const { nodes, ctx: made } = await convertQuery(
+      {
+        queryType: "users",
+        queryPostType: undefined,
+        queryOrder: st("DESC"),
+        queryOrderBy: st("date"),
+        queryInclude: {
+          source: "dynamic",
+          type: "acf",
+          group: "g",
+          field: "field_62d867cf7c18b",
+          fallback: "226",
+        },
+      },
+      [templateBlock([person, block("x/probe")])],
+      { mode: "entry", entryExpr: "state.entry", entryType: "episode" } as Partial<ConvertCtx>,
+      { kind: "template", slug: "single-episode" },
+      "ap",
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      mode: "entry",
+      entryExpr: "state.entry",
+      rowExpr: "$map.item",
+    });
+    const root = nodes[0] as JxElement;
+    const template = (root.children as JxElement[])[0]!;
+    // The host field holds one person or several: the list is computed from the entry, newest account first.
+    const expr = String((template.children as string[])[0]);
+    expect(expr).toContain("[].concat(state.entry.data.host ?? [])");
+    expect(expr).toContain(".sort((a, b) => -1 * String(a.slug).localeCompare(String(b.slug)))");
+    expect(expr).toContain("$i0?.title ?? ''");
+    // The block's own pick (226) is the editor's sample: an episode with no host lists nobody, as the live page does.
+    expect(expr).not.toContain("226");
+    expect(expr).not.toContain("r.length");
+    expect(made.report.entries().some((e) => e.code === "block.unsupported")).toBe(false);
+  });
+
+  test("the people of roles and of a list of ids are the profiles that hold them, in the block's order, and the report says what the list can hold", async () => {
+    const base = await fresh("ap", { kind: "post", id: 819 });
+    const model = { ...base.model } as typeof base.model;
+    const person = (id: number, name: string, roles: string[]) => ({
+      id,
+      slug: name.toLowerCase().replace(/ /g, "-"),
+      displayName: name,
+      meta: { position: `${name}'s position` },
+      roles,
+    });
+    setUserProfiles(
+      model,
+      new Map([
+        [9001, person(9001, "Ada Staff", ["staff"])],
+        [9002, person(9002, "Bea Board", ["board_member"])],
+        [9003, person(9003, "Cy Staff", ["staff", "board_member"])],
+        [9004, person(9004, "Di Reader", ["subscriber"])],
+      ]),
+    );
+    const ctx = { ...base, model } as ConvertCtx;
+    const plan = (attrs: Record<string, unknown>): QueryPlan =>
+      planOf(queryBlock({ queryType: "users", ...attrs }), ctx).plan;
+    const names = (source: ListSource): string[] => {
+      const key = "pointer" in source ? source.pointer.replace("#/state/", "") : "";
+      const rows = collectedState(ctx).get(key) as { title: string }[] | undefined;
+      return (rows ?? []).map((r) => r.title);
+    };
+    const run = (attrs: Record<string, unknown>) => {
+      const q = queryBlock({ queryType: "users", ...attrs });
+      const p = planQuery(q, ctx).plan;
+      if (p.kind !== "users") throw new Error("not a users plan");
+      return userList(ctx, p, q);
+    };
+    expect(plan({ queryRole: pick("staff") })).toMatchObject({ kind: "users" });
+    const staff = run({
+      queryRole: pick("staff"),
+      queryOrderBy: st("display_name"),
+      queryOrder: st("DESC"),
+    });
+    expect(names(staff.source)).toEqual(["Cy Staff", "Ada Staff"]);
+    expect(staff.notes.map((n) => n.code)).toEqual(["query.users-profiled"]);
+    expect(
+      names(run({ queryRoleNotIn: pick("subscriber"), queryOrderBy: st("display_name") }).source),
+    ).toEqual(["Ada Staff", "Bea Board", "Cy Staff"]);
+    // `registered` is the order of the accounts, newest first for DESC.
+    expect(
+      names(
+        run({
+          queryRole: pick("board_member"),
+          queryOrder: st("DESC"),
+          queryOrderBy: st("registered"),
+        }).source,
+      ),
+    ).toEqual(["Cy Staff", "Bea Board"]);
+    const ids = run({ queryInclude: st("9004, 9001, 99999"), queryOrderBy: st("display_name") });
+    expect(names(ids.source)).toEqual(["Ada Staff", "Di Reader"]);
+    expect(ids.notes).toMatchObject([{ code: "query.user-missing", detail: "99999" }]);
+    // The rows are the person as an entry holds one: the account and the profile's fields.
+    const key = (ids.source as { pointer: string }).pointer.replace("#/state/", "");
+    expect((collectedState(ctx).get(key) as Record<string, unknown>[])[0]).toMatchObject({
+      id: 9001,
+      slug: "ada-staff",
+      title: "Ada Staff",
+      url: "",
+    });
+    // Nobody holds the role: an empty list the build computes, not an empty mapped array.
+    expect(run({ queryRole: pick("nobody") }).source).toEqual({ expr: "[]" });
+    // The field of the post is read from the entry; a field that is not a user field is left empty and said.
+    const wrong = run({
+      queryInclude: {
+        source: "dynamic",
+        type: "acf",
+        group: "g",
+        field: "field_nope",
+        fallback: "",
+      },
+    });
+    expect(wrong.source).toEqual({ expr: "[]" });
+    expect(wrong.notes[0]).toMatchObject({ code: "query.approximated", severity: "warn" });
+  });
+
+  test("`date` is not an order of users: WP_User_Query falls back to the login, as it does for any key it cannot parse", async () => {
+    const base = await fresh("ap", { kind: "post", id: 819 });
+    const model = { ...base.model } as typeof base.model;
+    // Three orders that disagree: registered Zoe, Mia, Abe; named Abe, Mia, Zoe; logged in as Mia, Zoe, Abe.
+    const person = (id: number, name: string, slug: string) => ({
+      id,
+      slug,
+      displayName: name,
+      meta: {},
+      roles: ["staff"],
+    });
+    setUserProfiles(
+      model,
+      new Map([
+        [10, person(10, "Zoe Late", "bb-zoe")],
+        [11, person(11, "Mia Middle", "aa-mia")],
+        [12, person(12, "Abe Early", "cc-abe")],
+      ]),
+    );
+    const ctx = { ...base, model } as ConvertCtx;
+    const order = (orderBy: string | undefined, dir: string): string[] => {
+      const q = queryBlock({
+        queryType: "users",
+        queryRole: pick("staff"),
+        queryOrder: st(dir),
+        ...(orderBy === undefined ? {} : { queryOrderBy: st(orderBy) }),
+      });
+      const p = planQuery(q, ctx).plan;
+      if (p.kind !== "users") throw new Error("not a users plan");
+      const { source } = userList(ctx, p, q);
+      const key = (source as { pointer: string }).pointer.replace("#/state/", "");
+      return (collectedState(ctx).get(key) as { title: string }[]).map((r) => r.title);
+    };
+    expect(order("date", "DESC")).toEqual(["Abe Early", "Zoe Late", "Mia Middle"]);
+    expect(order("date", "ASC")).toEqual(["Mia Middle", "Zoe Late", "Abe Early"]);
+    expect(order("nonsense", "DESC")).toEqual(["Abe Early", "Zoe Late", "Mia Middle"]);
+    expect(order(undefined, "ASC")).toEqual(["Mia Middle", "Zoe Late", "Abe Early"]);
+    // the keys it does know
+    expect(order("registered", "DESC")).toEqual(["Abe Early", "Mia Middle", "Zoe Late"]);
+    expect(order("ID", "ASC")).toEqual(["Zoe Late", "Mia Middle", "Abe Early"]);
+    expect(order("display_name", "ASC")).toEqual(["Abe Early", "Mia Middle", "Zoe Late"]);
+    expect(order("user_login", "ASC")).toEqual(["Mia Middle", "Zoe Late", "Abe Early"]);
+  });
+
+  test("a list of several post types gives its items no type of their own: the page's is not theirs", async () => {
+    const seen: ConvertCtx[] = [];
+    registerConverters({
+      "x/probe": (_b, c) => {
+        seen.push(c);
+        return [];
+      },
+    });
+    await convertQuery(
+      { queryPostType: pick("project", "service") },
+      [templateBlock([block("x/probe")])],
+      { entryType: "project" } as Partial<ConvertCtx>,
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ mode: "entry", entryExpr: "$map.item" });
+    expect(seen[0]!.entryType).toBeUndefined();
+  });
+
   test("hands its items an entry context: `$map.item`, entry mode, the loop's post type, no enclosing row, no loop of their own", async () => {
     const seen: ConvertCtx[] = [];
     registerConverters({
@@ -1871,7 +2124,7 @@ describe("a query block", () => {
 
   test("that cannot be a list is its element and an empty template, and is reported as unsupported with where it is", async () => {
     const { nodes, ctx, state } = await convertQuery({
-      queryType: "users",
+      queryType: "comments",
       queryPostType: undefined,
     });
     const root = nodes[0] as JxElement;
@@ -1884,7 +2137,7 @@ describe("a query block", () => {
       {
         severity: "warn",
         where: "post:195",
-        data: { classID: "query-test", feature: "query-users" },
+        data: { classID: "query-test", feature: "query-comments" },
       },
     ]);
   });
@@ -2087,6 +2340,137 @@ describe("a query block", () => {
     ]);
     // the term of the item is `$map.item`, a reference with no `data`
     expect(JSON.stringify(array!.map)).toContain("${$map.item.name ?? ''}");
+  });
+
+  test("in a template part the terms are written out, item by item: a `$ref` would make the component a client render", async () => {
+    const attrs = {
+      queryType: "terms",
+      queryTaxonomies: pick("project_type"),
+      queryPostType: undefined,
+      queryPerPage: st("3"),
+      queryOrderBy: st("count"),
+      queryOrder: st("DESC"),
+    };
+    const link = block(
+      "cwicly/paragraph",
+      { classID: "l", dynamic: "taxonomyquery", dynamicWordPressType: "name" },
+      [],
+      '<p class="l">{termquery=name}</p>',
+    );
+    const { nodes, state } = await convertQuery(
+      attrs,
+      [templateBlock([link])],
+      {},
+      { kind: "part", slug: "footer" },
+    );
+    expect(elementsWhere(nodes, isArray)).toEqual([]);
+    const [template] = elementsWhere(nodes, (e) => "cc-query-template" in (e.attributes ?? {}));
+    const items = template!.children as JxElement[];
+    expect(items).toHaveLength(3);
+    expect(items.map((i) => (i.children as JxElement[])[0]!.textContent)).toEqual([
+      "Log Cabin Staining",
+      expect.any(String),
+      expect.any(String),
+    ]);
+    // nothing of the item still reads the row, and nothing is a reference
+    expect(JSON.stringify(items)).not.toContain("$map");
+    expect(JSON.stringify(nodes)).not.toContain("$ref");
+    // the state entry stays: a count a condition asks about reads it
+    expect(state.get("terms_project_type_q7")).toHaveLength(3);
+    // a page keeps its mapped array
+    const page = await convertQuery(attrs, [templateBlock([link])]);
+    expect(elementsWhere(page.nodes, isArray)).toHaveLength(1);
+  });
+
+  test("a written-out term list prints the row's values in the text around them, one text per item", async () => {
+    const attrs = {
+      queryType: "terms",
+      queryTaxonomies: pick("project_type"),
+      queryPostType: undefined,
+      queryPerPage: st("2"),
+      queryOrderBy: st("count"),
+      queryOrder: st("DESC"),
+    };
+    const link = block(
+      "cwicly/paragraph",
+      { classID: "l", dynamic: "taxonomyquery", dynamicWordPressType: "name" },
+      [],
+      '<p class="l">{termquery=name}</p>',
+    );
+    const { nodes } = await convertQuery(
+      attrs,
+      [templateBlock([{ ...link, attrs: { ...link.attrs, dynamicStaticBefore: "Topic: " } }])],
+      {},
+      { kind: "part", slug: "footer" },
+    );
+    const [template] = elementsWhere(nodes, (e) => "cc-query-template" in (e.attributes ?? {}));
+    expect(
+      (template!.children as JxElement[]).map((i) => (i.children as JxElement[])[0]!.textContent),
+    ).toEqual(["Topic: Log Cabin Staining", expect.stringMatching(/^Topic: \S/)]);
+  });
+});
+
+describe("writtenOut: an item written once per row", () => {
+  const item = (more: Record<string, unknown>): JxElement =>
+    ({ tagName: "div", className: "cc-query-item", ...more }) as JxElement;
+  const rows = [
+    { name: "A & B", url: "/a/", count: 0 },
+    { name: "C", url: "/c/", count: 2 },
+  ];
+
+  test("a binding of the row alone is its value, whole or inside text; a value that is not text keeps its type", () => {
+    const out = writtenOut(
+      item({
+        attributes: { href: "${$map.item.url}", title: "${$map.item.count || false}" },
+        children: ["x ${$map.item.name ?? ''} #${$map.index}"],
+        textContent: "${$map.item.name ?? ''}",
+      }),
+      rows,
+    )!;
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({
+      attributes: { href: "/a/", title: false },
+      children: ["x A & B #0"],
+      textContent: "A & B",
+    });
+    expect(out[1]).toMatchObject({
+      attributes: { href: "/c/", title: 2 },
+      children: ["x C #1"],
+      textContent: "C",
+    });
+    // A binding that is a whole object is not a value to write into a node: it stays as written.
+    const [whole] = writtenOut(item({ attributes: { x: "${$map.item}" } }), rows)!;
+    expect((whole as JxElement).attributes).toEqual({ x: "${$map.item}" });
+  });
+
+  test("a binding that reads state, or that does not run, is left as it was", () => {
+    const [first] = writtenOut(
+      item({
+        attributes: { a: "${state.menu.open}", b: "${$map.item.nope.deeper}" },
+        textContent: "${state.n} of ${$map.item.name}",
+      }),
+      rows,
+    )!;
+    expect(first).toMatchObject({
+      attributes: { a: "${state.menu.open}", b: "${$map.item.nope.deeper}" },
+      textContent: "${state.n} of A & B",
+    });
+  });
+
+  test("an item with a loop or a reference of its own is not written out, and no rows is no children", () => {
+    expect(
+      writtenOut(item({ children: [{ $prototype: "Array", items: { $ref: "#/state/x" } }] }), rows),
+    ).toBeUndefined();
+    expect(writtenOut(item({ $ref: "./x.json" }), rows)).toBeUndefined();
+    expect(writtenOut(item({}), [])).toEqual([]);
+  });
+
+  test("the item is copied: rows do not share nodes", () => {
+    const [a, b] = writtenOut(
+      item({ children: [{ tagName: "p", textContent: "${$map.item.name}" }] }),
+      rows,
+    )!;
+    expect((a as JxElement).children).not.toBe((b as JxElement).children);
   });
 });
 
@@ -3184,9 +3568,9 @@ describe("every data block of both sites", () => {
       instances: 12,
       missing: 0,
       taxonomyterms: 2,
-      unsupported: 9,
+      unsupported: 1,
       static: 0,
-      live: 20,
+      live: 28,
     },
   } as const;
 
@@ -3248,11 +3632,25 @@ describe("every data block of both sites", () => {
             ? hasClass(e.map as JxElement, "cc-query-item")
             : (e.children as string[])[0]!.includes("'cc-query-item'");
         const items = [...arrays, ...inlines].filter((l) => isQueryLoop(l as JxElement)).length;
-        expect(items + statics + unsupported).toBe(queries);
+        // a component's list of terms is written out, one item element per term
+        const writtenOut =
+          sub.kind === "part" || sub.kind === "component"
+            ? elements.filter(
+                (e) =>
+                  e.attributes &&
+                  "cc-query-template" in (e.attributes as object) &&
+                  Array.isArray(e.children) &&
+                  e.children.length > 0 &&
+                  e.children.every(
+                    (c) => typeof c !== "string" && hasClass(c as JxElement, "cc-query-item"),
+                  ),
+              ).length
+            : 0;
+        expect(items + statics + unsupported + writtenOut).toBe(queries);
         expect(arrays.length + inlines.length - items).toBe(termLoops);
         total.static += statics;
         total.unsupported += unsupported;
-        total.live += items;
+        total.live += items + writtenOut;
         total.taxonomyterms += termLoops;
         // a loop's list is a state entry the conversion registered, or a pointer into the entry or the enclosing item
         for (const a of arrays) {
@@ -3592,6 +3990,9 @@ describe("built by Jx", () => {
   test("anabaptistperspectives footer: the eight categories the live page printed, linked, from a plain state list", async () => {
     const site = await loadSite("ap");
     const out = await convertSubject(site, { kind: "part", slug: "footer" });
+    // a part is a component, and a component with a `$ref` in it is not static: the footer's list is written out
+    expect(JSON.stringify(out.nodes)).not.toContain('"$ref"');
+    expect(out.state).toBeDefined();
     const { files } = await entryProject("ap", ["post"]);
     files["pages/index.json"] = pageOf(out) as ProjectFile;
     const built = await buildJxProject(files, { name: "ap-footer" });
@@ -4564,7 +4965,6 @@ describe("what the export holds that the entries do not", () => {
       const { plan } = planOf(queryBlock({ queryType }), ctx);
       return plan.kind === "unsupported" ? plan.why : "";
     };
-    expect(why("users")).toContain("no users");
     expect(why("comments")).toContain("no comments");
     expect(why("products")).toContain("no shop");
     expect(why("galaxies")).toContain("not a query type");
@@ -5254,5 +5654,107 @@ describe("taxonomyterms and repeater: defaults, visibility and what an entry may
       expect(shipsJs(html)).toBe(false);
       expect(html).toContain('class="repeater-x"');
     }
+  });
+});
+
+describe("the author clauses of a posts query", () => {
+  async function plansFor(
+    site: SiteName,
+    subject: Subject,
+    over: Partial<ConvertCtx>,
+    attrs: Record<string, unknown>,
+  ) {
+    const ctx = await makeCtx(site, subject, over);
+    return {
+      ctx,
+      ...planOf(queryBlock({ queryPostType: pick("post"), queryInherit: false, ...attrs }), ctx),
+    };
+  }
+  const authorName = dyn("authorname");
+
+  test("on an author's page the list is that author's: an entry is theirs when its author's address is the page's", async () => {
+    const { plan } = await plansFor(
+      "ap",
+      { kind: "template", slug: "author" },
+      { mode: "entry", entryExpr: "state.author", entryType: "page" },
+      { queryAuthorName: authorName, queryAuthorIn: authorName },
+    );
+    const conds = (plan as PostPlan).conds.filter((c) => c.why === "the author of the page");
+    // The two attributes name the same thing: one clause.
+    expect(conds).toHaveLength(1);
+    expect(conds[0]).toMatchObject({
+      js: "e.data.authorUrl === state.author.data.authorUrl",
+      dynamic: true,
+    });
+    expect((plan as PostPlan).dropped.join(" ")).not.toContain("queryAuthor");
+    const keep = compileConditions(conds) as unknown as (e: EntryLike, state: unknown) => boolean;
+    const state = { author: { data: { authorUrl: "/people/a/" } } };
+    const run = (url: string) => keep({ id: "x", data: { authorUrl: url } }, state);
+    expect([run("/people/a/"), run("/people/b/")]).toEqual([true, false]);
+  });
+
+  test("on a static page of a post it is the post's author; an author with no page of their own is said", async () => {
+    const loaded = await loadSite("ap");
+    const post = [...loaded.model.posts.values()].find(
+      (p) => p.type === "post" && loaded.routes.forAuthor(p.authorId) !== undefined,
+    )!;
+    const { plan, ctx } = await plansFor(
+      "ap",
+      { kind: "post", id: post.id },
+      {},
+      { queryAuthorName: authorName },
+    );
+    const url = ctx.urlForAuthor?.(post.authorId);
+    expect(url).toBeDefined();
+    expect((plan as PostPlan).conds.map((c) => c.js)).toContain(`e.data.authorUrl === '${url}'`);
+    // The posts of that list are that author's own.
+    const listed = evaluatePosts(ctx, plan as PostPlan, { all: true })!;
+    expect(listed.length).toBeGreaterThan(0);
+    for (const p of listed) expect(ctx.urlForAuthor?.(p.authorId)).toBe(url);
+    const nobody = { ...ctx, urlForAuthor: () => undefined } as ConvertCtx;
+    const lost = planOf(
+      queryBlock({ queryPostType: pick("post"), queryInherit: false, queryAuthorName: authorName }),
+      nobody,
+    );
+    expect((lost.plan as PostPlan).dropped.join(" ")).toContain("who has no page of their own");
+  });
+
+  test("authors named by id are their pages' addresses; where there is no page, no entry, and a dynamic source is said", async () => {
+    const loaded = await loadSite("ap");
+    const ids = [...new Set([...loaded.model.posts.values()].map((p) => p.authorId))].slice(0, 2);
+    const { plan, ctx } = await plansFor(
+      "ap",
+      { kind: "template", slug: "single-post" },
+      { mode: "entry", entryType: "post" },
+      { queryAuthor: pick(...ids) },
+    );
+    const urls = ids.map((id) => ctx.urlForAuthor?.(id)).filter(Boolean);
+    expect((plan as PostPlan).conds.map((c) => c.js)).toContain(
+      `[${urls.map((u) => `'${u}'`).join(", ")}].includes(e.data.authorUrl)`,
+    );
+    const dynamic = await plansFor(
+      "ap",
+      { kind: "template", slug: "single-post" },
+      { mode: "entry", entryType: "post" },
+      { queryAuthor: dyn("urlparameter", "who") },
+    );
+    expect((dynamic.plan as PostPlan).dropped.join(" ")).toContain(
+      "authors read from a dynamic source",
+    );
+    const none = await plansFor(
+      "ap",
+      { kind: "template", slug: "archive" },
+      {},
+      { queryAuthorName: authorName },
+    );
+    expect((none.plan as PostPlan).dropped.join(" ")).toContain("the author of the page");
+    // Some other source the plugin has for the name stays what it was: not read.
+    const other = await plansFor(
+      "ap",
+      { kind: "template", slug: "single-post" },
+      { mode: "entry", entryType: "post" },
+      { queryAuthorName: dyn("shortcode", "x") },
+    );
+    expect((other.plan as PostPlan).dropped.join(" ")).toContain("queryAuthorName");
   });
 });

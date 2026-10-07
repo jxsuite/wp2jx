@@ -3,6 +3,7 @@
  * (to hold it to the data): dispatch and fallback, override merging, the final passes, determinism,
  * and a real `jx build` of converted pages checked against the rendered live pages.
  */
+import { setUnregisteredBlockNamespaces } from "../src/wp/block-registry.ts";
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -14,6 +15,7 @@ import {
   converters,
   dedupeRules,
   ensureConverters,
+  hiddenByEditor,
   loadConverterModule,
   registerConverters,
   reportRegistry,
@@ -252,6 +254,58 @@ describe("convertBlocks", () => {
     expect(calls).toEqual(["two", "one:1", "freeform", "one:2"]);
   });
 
+  test("a block the editor hides (metadata.blockVisibility: false) prints nothing, nor does what it holds, and the report says which", async () => {
+    const ctx = await subjectCtx(await siteOf("fineline"), { kind: "post", id: 5246 });
+    const seen: string[] = [];
+    const registry = {
+      "x/box": (b: WpBlock) => (seen.push(`box:${String(b.attrs.n)}`), ["box"]),
+      "x/inner": () => (seen.push("inner"), ["inner"]),
+    };
+    const hidden = block("x/box", {
+      attrs: { n: 1, classID: "columns-c900eab", metadata: { blockVisibility: false } },
+      innerBlocks: [block("x/inner")],
+    });
+    const shown = block("x/box", {
+      attrs: { n: 2, metadata: { name: "Box", blockVisibility: true } },
+    });
+    const out = convertBlocks([hidden, shown, block("x/box", { attrs: { n: 3 } })], ctx, registry);
+    expect(out).toEqual(["box", "box"]);
+    // the hidden block's converter, and its inner blocks', never ran
+    expect(seen).toEqual(["box:2", "box:3"]);
+    expect(ctx.report.entries().filter((e) => e.code === "block.hidden")).toMatchObject([
+      { severity: "info", data: { block: "x/box", classID: "columns-c900eab" } },
+    ]);
+  });
+
+  test("only `false` hides: a viewport setting, an empty metadata and a malformed one do not", () => {
+    const make = (metadata: unknown): WpBlock => block("x/box", { attrs: { metadata } });
+    expect(hiddenByEditor(make({ blockVisibility: false }))).toBe(true);
+    expect(hiddenByEditor(make({ blockVisibility: { viewport: { mobile: false } } }))).toBe(false);
+    expect(hiddenByEditor(make({ blockVisibility: true }))).toBe(false);
+    expect(hiddenByEditor(make({ blockVisibility: "false" }))).toBe(false);
+    expect(hiddenByEditor(make({}))).toBe(false);
+    expect(hiddenByEditor(make(undefined))).toBe(false);
+    expect(hiddenByEditor(make(null))).toBe(false);
+    expect(hiddenByEditor(make([false]))).toBe(false);
+    expect(hiddenByEditor(block("x/box"))).toBe(false);
+  });
+
+  test("the pilot's hidden blocks are gone: the service hero's paragraph, the home page's empty column grid", async () => {
+    const site = await siteOf("fineline");
+    for (const [subject, classID] of [
+      [{ kind: "template", slug: "single-service" }, "paragraph-ca3d4fd"],
+      [{ kind: "post", id: 5246 }, "columns-c900eab"],
+    ] as const) {
+      const out = await convertSubject(site, subject as Subject);
+      expect(JSON.stringify(out.nodes)).not.toContain(classID);
+      expect(
+        out.report
+          .entries()
+          .filter((e) => e.code === "block.hidden" && e.data?.classID === classID),
+      ).toHaveLength(1);
+    }
+  });
+
   test("a registry name that is also an Object.prototype name is not looked up through the prototype", async () => {
     const ctx = await subjectCtx(await siteOf("fineline"), { kind: "post", id: 5246 });
     const report = ctx.report;
@@ -316,6 +370,41 @@ describe("convertBlocks", () => {
       severity: "warn",
       data: { block: "vendor/dynamic", kept: false },
     });
+  });
+
+  test("a block of a namespace no plugin of the site registers prints nothing, as WordPress does, and says so; its saved markup is still kept", async () => {
+    const site = await siteOf("ap");
+    const ctx = await subjectCtx(site, { kind: "post", id: 3 });
+    setUnregisteredBlockNamespaces(ctx.model, new Set(["gone"]));
+    const out = convertBlocks(
+      [
+        block("gone/widget", { attrs: { id: 7 } }),
+        block("vendor/dynamic"),
+        block("gone/saved", { innerHTML: "<p>kept</p>", innerContent: ["<p>kept</p>"] }),
+      ],
+      ctx,
+      {},
+    );
+    // The block of the dead namespace is not a placeholder; a block of a namespace that is still registered is.
+    expect(
+      out.map((n) => (readPlaceholder(n) ? readPlaceholder(n)!.block : JSON.stringify(n))),
+    ).toEqual(["vendor/dynamic", expect.stringContaining("kept")]);
+    expect(ctx.report.entries()).toContainEqual(
+      expect.objectContaining({
+        severity: "info",
+        code: "block.unregistered",
+        data: { block: "gone/widget" },
+      }),
+    );
+    expect(
+      ctx.report
+        .entries()
+        .filter((e) => e.code === "block.unsupported")
+        .map((e) => e.data),
+    ).toEqual([
+      { block: "vendor/dynamic", kept: false },
+      { block: "gone/saved", kept: true },
+    ]);
   });
 
   test("a converter that throws is reported and the block takes the fallback; its siblings are unaffected", async () => {
@@ -738,16 +827,14 @@ describe("convertSubject", () => {
     expect(out.state).toEqual({
       rows: { $prototype: "ContentCollection", contentType: "project" },
     });
-    expect([...out.used.cssFiles]).toEqual([
-      "cc-global-stylesheets.css",
-      "cc-global-classes.css",
-      `cc-post-${PROBE}.css`,
-    ]);
+    // (The post has no styled Cwicly block of its own, so Cwicly wrote it no stylesheet and none is asked for.)
+    expect([...out.used.cssFiles]).toEqual(["cc-global-stylesheets.css", "cc-global-classes.css"]);
     // hoisted rules, duplicates removed, in order
     expect(out.hoisted.map((r) => r.selector)).toEqual(["@keyframes spin", ".x"]);
     expect(list).toBeDefined();
     expect(out.css.classes.size).toBeGreaterThan(10);
-    expect(out.report.entries().some((e) => e.where === `post:${PROBE}`)).toBe(true);
+    // Nothing is said of the stylesheet no one asked for.
+    expect(out.report.entries().some((e) => e.code === "css.missing-file")).toBe(false);
   });
 
   test("a state entry a converter registers is used even when no node points at it yet", async () => {

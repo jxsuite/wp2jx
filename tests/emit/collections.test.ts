@@ -57,12 +57,16 @@ import {
   type CollectionsOutput,
   type CollectionSchema,
 } from "../../src/emit/collections.ts";
+import { usedForms } from "../../src/emit/fluentform.ts";
+import { pilotForms } from "../helpers/fluentform-db.ts";
 import { collectWpClasses } from "../../src/core/block-css.ts";
 import { createReport } from "../../src/report.ts";
 import { acfValues, postTarget } from "../../src/wp/acf.ts";
 import { buildRoutes, createUrlTools } from "../../src/routes.ts";
 import { subjectCtx, type SiteContext } from "../../src/site.ts";
 import { postData } from "../../src/cwicly/tokens.ts";
+import { setUserProfiles } from "../../src/wp/profiles.ts";
+import { AUDIO_PHP } from "../wp/lazyblocks.test.ts";
 import { decodeEntities as decodeEntitiesOf } from "../../src/wp/model.ts";
 
 /** What the paragraph of a list item or cell gives up: its spacing, and the type the theme sets on paragraphs. */
@@ -1457,6 +1461,8 @@ for (const name of SITES) {
         expect(fm.author).toBe(data.author);
         expect(fm.featuredImage).toEqual(data.featuredImage);
         expect(fm.authorUrl).toBe(site.urls.urlForAuthor(post.authorId));
+        // A list of several types asks every entry what it is.
+        expect(fm.postType).toBe(post.type);
         expect(fm.date).toBe(rfc3339(post.date));
         expect(fm.modified).toBe(rfc3339(post.modified));
         expect(fm.date).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
@@ -1503,6 +1509,7 @@ for (const name of SITES) {
                 "featuredImage",
                 "terms",
                 "seo",
+                "postType",
               ].includes(k),
           ),
         ).toBe(true);
@@ -2239,6 +2246,63 @@ describe("what a collection is made of", () => {
       if (original === undefined) delete converters["cwicly/query"];
       else registerConverters({ "cwicly/query": original });
     }
+  });
+
+  test("a Fluent Forms block in a post is drawn as the form's own markup, the way a page draws it, and is no longer left out", async () => {
+    // The fixture database has no forms table; the pilot's forms are committed beside it.
+    const site = { ...(await loadSite("fineline")), forms: await pilotForms() };
+    // With a route type the entries are made against a copy of the site; the forms they draw are still the site's.
+    const out = await buildCollections(site, {
+      now: NOW,
+      routeTypes: { captivate_podcast: { rewriteSlug: "podcast", rewriteWithFront: false } },
+    });
+    // The service "Line Painting" ends with `<!-- wp:fluentfom/guten-block {"formId":"5"} /-->`.
+    const file = out.files.find((f) => f.path === "content/service/line-painting.md")!;
+    expect(file.content).toContain('data-wp2jx="fluentform:5"');
+    expect(file.content).toContain("fluentform_5");
+    expect(file.content).not.toContain("wp2jx-block");
+    const mine = out.report.entries().filter((e) => e.where === "post:5305");
+    expect(mine.map((e) => e.code)).toContain("form.not-submittable");
+    expect(mine.map((e) => e.code)).not.toContain("entry.placeholder-dropped");
+    // The form's stylesheet is the project's: the draw is filed where the assembler looks for it.
+    expect(usedForms(site).map((u) => u.id)).toContain(5);
+    // What a post's block has no form for is still left out and said, as before.
+    expect(
+      reportOf(out, "entry.placeholder-dropped").some((e) =>
+        (e.data!.blocks as string[]).includes("fluentfom/guten-block"),
+      ),
+    ).toBe(false);
+  });
+
+  test("a [fluentform] shortcode in a post is drawn the same way, and a form the site does not have is left out and said", async () => {
+    const base = { ...(await loadSite("fineline")), forms: await pilotForms() };
+    const content = (id: number): string =>
+      `<!-- wp:paragraph -->\n<p>Ask us:</p>\n<!-- /wp:paragraph -->\n\n<!-- wp:shortcode -->\n[fluentform id="${id}"]\n<!-- /wp:shortcode -->`;
+    const draw = async (id: number) => {
+      const site = patched(base, 6833, { content: content(id) });
+      return buildCollections(site, { now: NOW, include: (p) => p.id === 6833 });
+    };
+    const drawn = await draw(5);
+    expect(drawn.files[0]!.content).toContain('data-wp2jx="fluentform:5"');
+    expect(drawn.report.entries().some((e) => e.code === "form.not-submittable")).toBe(true);
+    // The block form of the same thing (`fluentfom/guten-block`, the plugin's own spelling) for a form that is not there.
+    const blockSite = patched(base, 6833, {
+      content:
+        '<!-- wp:paragraph -->\n<p>Ask us:</p>\n<!-- /wp:paragraph -->\n\n<!-- wp:fluentfom/guten-block {"formId":"99999"} /-->',
+    });
+    const blockAbsent = await buildCollections(blockSite, {
+      now: NOW,
+      include: (p) => p.id === 6833,
+    });
+    expect(blockAbsent.report.entries().map((e) => e.code)).toEqual(
+      expect.arrayContaining(["form.missing", "entry.placeholder-dropped"]),
+    );
+    const absent = await draw(99999);
+    // (the excerpt of the front matter keeps the shortcode's text; the body must not)
+    expect(absent.files[0]!.content.split("\n---\n").slice(1).join("")).not.toContain("fluentform");
+    expect(absent.report.entries().map((e) => e.code)).toEqual(
+      expect.arrayContaining(["form.missing", "entry.placeholder-dropped"]),
+    );
   });
 
   test("what the conversions reported is passed on with its location, and the entries' own findings are located and linked", async () => {
@@ -3483,5 +3547,107 @@ describe("the addresses in a style", () => {
     const out = await collectionsOf("fineline");
     const mine = out.files.filter((f) => /style\.backgroundImage="url\(\/media\//.test(f.content));
     expect(mine.length).toBeGreaterThan(0);
+  });
+});
+
+// ── What a post's templates read of a person and of an embedded player ───────────────────────────
+
+describe("ap: the people and the players a post's templates read", () => {
+  /** The site with one author who has a profile, and the two embed blocks of the site defined. */
+  async function withProfileAndBlocks() {
+    const loaded = await loadSite("ap");
+    const authors = new Map<number, number>();
+    for (const post of loaded.model.posts.values()) {
+      if (post.type === "post") authors.set(post.authorId, (authors.get(post.authorId) ?? 0) + 1);
+    }
+    const [authorId] = [...authors].sort((a, b) => b[1] - a[1])[0]!;
+    const user = loaded.model.users.get(authorId)!;
+    const posts = new Map(loaded.model.posts);
+    const postMeta = new Map(loaded.model.postMeta);
+    const lazy = { id: 990001, type: "lazyblocks", status: "publish", title: "Audio" } as WpPost;
+    posts.set(lazy.id, lazy);
+    postMeta.set(lazy.id, {
+      lazyblocks_slug: ["episode-audio-embed"],
+      lazyblocks_code_frontend_html: [AUDIO_PHP],
+    });
+    const model = { ...loaded.model, posts, postMeta } as typeof loaded.model;
+    // (The profiles are kept beside the model object they were read for: a copy needs its own.)
+    setUserProfiles(
+      model,
+      new Map([
+        [
+          authorId,
+          {
+            ...user,
+            meta: {
+              position: "Contributor",
+              _position: "field_62fea1aa7c14c",
+              description: "A biography.",
+              first_name: "Given",
+              last_name: "",
+            },
+            roles: [],
+          },
+        ],
+      ]),
+    );
+    const site = { ...loaded, model } as SiteContext;
+    const out = await buildCollections(site, { now: NOW });
+    return { site, out, authorId };
+  }
+
+  test("the schema of every collection allows the keys the templates read; `captivate` only where entries carry it", async () => {
+    const { out } = await withProfileAndBlocks();
+    for (const def of Object.values(out.collections)) {
+      expect(def.schema.properties).toMatchObject({ postType: { type: "string" } });
+    }
+    for (const [name, def] of Object.entries(out.collections)) {
+      const carries = out.entries.some(
+        (e) => e.collection === name && e.frontmatter.captivate !== undefined,
+      );
+      expect(Object.hasOwn(def.schema.properties, "captivate")).toBe(carries);
+    }
+    expect(out.entries.some((e) => e.frontmatter.captivate !== undefined)).toBe(true);
+  });
+
+  test("an author's names and biography are in the entries they wrote (`authorInfo`), and in nobody else's", async () => {
+    const { site, out, authorId } = await withProfileAndBlocks();
+    let mine = 0;
+    for (const e of out.entries) {
+      if (site.model.posts.get(e.postId)!.authorId === authorId) {
+        // (An empty name is not written.)
+        expect(e.frontmatter.authorInfo).toEqual({
+          description: "A biography.",
+          first_name: "Given",
+        });
+        mine++;
+      } else expect(e.frontmatter.authorInfo).toBeUndefined();
+    }
+    expect(mine).toBeGreaterThan(5);
+    for (const [name, def] of Object.entries(out.collections)) {
+      const carries = out.entries.some(
+        (e) => e.collection === name && e.frontmatter.authorInfo !== undefined,
+      );
+      expect(Object.hasOwn(def.schema.properties, "authorInfo")).toBe(carries);
+    }
+  });
+
+  test("an episode that names a podcast post with a Captivate id carries it, and no other entry does", async () => {
+    const { site, out } = await withProfileAndBlocks();
+    let carried = 0;
+    for (const e of out.entries) {
+      const meta = site.model.postMeta.get(e.postId) ?? {};
+      const linked = Number(meta.captivate_episode?.[0]);
+      const id = site.model.postMeta.get(linked)?.cfm_episode_id?.[0];
+      if (typeof id === "string" && id !== "") {
+        const media = site.model.postMeta.get(linked)?.cfm_episode_media_url?.[0];
+        expect(e.frontmatter.captivate).toEqual({
+          episodeId: id,
+          ...(media ? { downloadUrl: `${String(media)}?download=1` } : {}),
+        });
+        carried++;
+      } else expect(e.frontmatter.captivate).toBeUndefined();
+    }
+    expect(carried).toBeGreaterThan(5);
   });
 });

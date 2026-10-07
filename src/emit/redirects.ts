@@ -1005,7 +1005,7 @@ export function buildRedirects(
     say(
       "info",
       "redirect.supersedes-page",
-      `${rule.source} is an address of the migrated site, but Rank Math sends its visitors to ${rule.destination} before WordPress looks for a page there, so the page was never reached on the source site: the redirect is kept and the page is not written.`,
+      `${rule.source} is an address of the migrated site, but Rank Math sends its visitors to ${rule.destination} before WordPress looks for a page there, so the page was never reached on the source site: the redirect is kept and answers at that address in place of the page (a post stays in its collection, so the lists that show it still do).`,
       rule.where,
       rule.source,
       { source: rule.source, destination: rule.destination },

@@ -4,6 +4,7 @@
  * rows and stylesheets; the only fake things are a stub database for the post-type census and a
  * loopback server for the "live site" stylesheet source.
  */
+import { unregisteredBlockNamespaces } from "../src/wp/block-registry.ts";
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -42,6 +43,7 @@ import {
 import type { BlockConverter, CssSource, WpBlock, WpModel, WpPost } from "../src/types.ts";
 import * as realDb from "../src/wp/db.ts";
 import { walkBlocks } from "../src/wp/blocks.ts";
+import { userProfiles } from "../src/wp/profiles.ts";
 import { loadSite } from "./helpers/ctx.ts";
 import { fixtureCssDir } from "./helpers/fixture-css.ts";
 import { FIXTURES, fixtureDb } from "./helpers/fixture-db.ts";
@@ -238,6 +240,20 @@ describe("tag names", () => {
 // ── Loading ──────────────────────────────────────────────────────────────────────────────────────
 
 describe("loadSiteContext", () => {
+  test("the people the posts name in a user field have a profile entry, the account's names and no more", async () => {
+    const ap = await loadSite("ap");
+    const profiles = userProfiles(ap.model);
+    // The podcast's host (a field of 100 episodes) and a guest of one.
+    expect(profiles.get(226)).toMatchObject({ meta: {}, roles: [] });
+    expect(profiles.get(226)?.displayName).not.toBe("");
+    expect(profiles.get(553)?.slug).not.toBe("");
+    // Only the people a user field names (58 of the fixture's 763 accounts), not the accounts of the whole site.
+    expect(profiles.size).toBeLessThan(100);
+    for (const profile of profiles.values()) {
+      expect(Object.keys(profile).sort()).toEqual(["displayName", "id", "meta", "roles", "slug"]);
+    }
+  });
+
   test("publishedPostTypes: published and private types, less bookkeeping and commerce, plus the structural ones", async () => {
     const rows = [
       "post",
@@ -443,6 +459,53 @@ describe("loadSiteContext", () => {
     expect(without.report.entries().find((e) => e.code === "site.theme-css-missing")).toMatchObject(
       { severity: "info", where: "site" },
     );
+  });
+
+  test("pluginFrom a directory says which block namespaces of the posts no plugin of it registers; a bare checkout, a url or no plugin source says nothing", async () => {
+    const { url, prefix } = await fixtureDb("ap");
+    const root = join(TMP_ROOT, `site-blocks-${process.pid}`);
+    scratch.push(root);
+    mkdirSync(join(root, "wp-content/plugins/give"), { recursive: true });
+    mkdirSync(join(root, "wp-content/plugins/fluentform"), { recursive: true });
+    mkdirSync(join(root, "wp-content/plugins/lazy-blocks"), { recursive: true });
+    writeFileSync(
+      join(root, "wp-content/plugins/give/give.php"),
+      "<?php register_block_type( 'give/donation-form' );",
+    );
+    writeFileSync(
+      join(root, "wp-content/plugins/fluentform/block.js"),
+      "registerBlockType('fluentfom/guten-block',{})",
+    );
+    writeFileSync(
+      join(root, "wp-content/plugins/lazy-blocks/lazy.php"),
+      '<?php register_block_type( "lazyblock/x" );',
+    );
+    const site = await loadSiteContext({
+      db: url,
+      prefix,
+      cssFrom: { dir: fixtureCssDir("ap") },
+      pluginFrom: root,
+    });
+    const gone = unregisteredBlockNamespaces(site.model);
+    // The Drupal import's two namespaces are in the posts and in no file of the plugins; the three that stand are registered.
+    expect(gone.has("drupalblock")).toBe(true);
+    expect(gone.has("drupalmedia")).toBe(true);
+    for (const kept of ["give", "fluentfom", "lazyblock"]) expect(gone.has(kept)).toBe(false);
+    // Cwicly's own blocks are not in this hand-made tree either: the namespace is the plugin's, so it is named here
+    expect(gone.has("cwicly")).toBe(true);
+
+    const bare = join(TMP_ROOT, `site-blocks-bare-${process.pid}`);
+    scratch.push(bare);
+    mkdirSync(bare, { recursive: true });
+    const without = await loadSiteContext({
+      db: url,
+      prefix,
+      cssFrom: { dir: fixtureCssDir("ap") },
+      pluginFrom: bare,
+    });
+    expect(unregisteredBlockNamespaces(without.model).size).toBe(0);
+    const none = await loadSiteContext({ db: url, prefix, cssFrom: { dir: fixtureCssDir("ap") } });
+    expect(unregisteredBlockNamespaces(none.model).size).toBe(0);
   });
 
   test("cssFrom a url reads the live site's stylesheets, after the local folder", async () => {
@@ -965,6 +1028,40 @@ describe("the CSS of a subject", () => {
     expect(entry!.data).toMatchObject({ file: own, remembered: true });
   });
 
+  test("a post with no styled Cwicly block of its own is not asked for a stylesheet, and reports nothing about one", async () => {
+    const ap = await loadSite("ap");
+    const asked: string[] = [];
+    const counting = {
+      get: async (name: string) => {
+        asked.push(name);
+        return null;
+      },
+    };
+    const core = withExtra(ap, {
+      posts: [
+        probePost(990020, {
+          content: "<!-- wp:paragraph --><p>Core blocks only.</p><!-- /wp:paragraph -->",
+        }),
+        probePost(990021, {
+          content:
+            '<!-- wp:cwicly/div {"isStyling":true,"classID":"div-c1"} --><div class="div-c1"></div><!-- /wp:cwicly/div -->',
+        }),
+      ],
+    });
+    const site = { ...core, cssSource: counting } as typeof core;
+    const report = createReport();
+    await reportOwnCss(site, { kind: "post", id: 990020 }, report, "post:990020");
+    await cssIndexFor(site, { kind: "post", id: 990020 });
+    expect(asked).not.toContain("cc-post-990020.css");
+    expect(report.entries()).toEqual([]);
+    // One with a styled block is asked, and a file Cwicly did not write for it is a finding.
+    await reportOwnCss(site, { kind: "post", id: 990021 }, report, "post:990021");
+    expect(asked).toContain("cc-post-990021.css");
+    expect(report.entries().map((e) => [e.code, e.severity])).toEqual([
+      ["css.missing-file", "warn"],
+    ]);
+  });
+
   test("a subject with a stylesheet of its own and nothing wrong in it reports nothing about it", async () => {
     const site = await loadSite("fineline");
     const report = createReport();
@@ -1146,12 +1243,30 @@ describe("the order of a subject's stylesheets is the live head's", () => {
     const live = liveOrder("ap", "essays__the-essence-of-anabaptism-dean-taylor.html");
     // live: globals, the template's file, its parts and components, and the post's file last
     expect(live.at(-1)).toBe("cc-post-727.css");
+    // The live head links the post's file, but Cwicly writes none for a post of core blocks (the site answers
+    // 404 for it): asking for it is a request each for nothing, so a post with no styled block of its own
+    // does not name one.
     const post = cssNamesFor(ap, { kind: "post", id: 727 });
-    expect(post).toEqual(["cc-global-stylesheets.css", "cc-global-classes.css", "cc-post-727.css"]);
+    expect(post).toEqual(["cc-global-stylesheets.css", "cc-global-classes.css"]);
+    // One with a styled Cwicly block does, last.
+    const styled = withExtra(ap, {
+      posts: [
+        probePost(990012, {
+          content:
+            '<!-- wp:cwicly/div {"isStyling":true,"classID":"div-c1"} --><div class="div-c1"></div><!-- /wp:cwicly/div -->',
+        }),
+      ],
+    });
+    expect(cssNamesFor(styled, { kind: "post", id: 990012 })).toEqual([
+      "cc-global-stylesheets.css",
+      "cc-global-classes.css",
+      "cc-post-990012.css",
+    ]);
     const before = (names: string[], a: string, b: string): boolean =>
       names.indexOf(a) < names.indexOf(b);
+    // What the post does name comes in the order the live head has.
     expect(before(live, post[0]!, post[1]!)).toBe(true);
-    expect(before(live, post[1]!, post[2]!)).toBe(true);
+    expect(before(live, post[1]!, "cc-post-727.css")).toBe(true);
 
     const template = cssNamesFor(ap, { kind: "template", slug: "single-post" });
     expect(template.slice(0, 3)).toEqual([
@@ -1172,7 +1287,8 @@ describe("the order of a subject's stylesheets is the live head's", () => {
     const site = withExtra(fine, {
       posts: [
         probePost(990011, {
-          content: `<!-- wp:template-part {"slug":"footer","theme":"cwicly"} /-->`,
+          content:
+            '<!-- wp:template-part {"slug":"footer","theme":"cwicly"} /--><!-- wp:cwicly/div {"isStyling":true,"classID":"div-c1"} --><div class="div-c1"></div><!-- /wp:cwicly/div -->',
         }),
       ],
     });
@@ -1182,6 +1298,19 @@ describe("the order of a subject's stylesheets is the live head's", () => {
       "cc-global-classes.css",
       "cc-tp-cwicly_footer.css",
       "cc-post-990011.css",
+    ]);
+    // With nothing styled of its own, the part's file is all it adds.
+    const plain = withExtra(fine, {
+      posts: [
+        probePost(990013, {
+          content: '<!-- wp:template-part {"slug":"footer","theme":"cwicly"} /-->',
+        }),
+      ],
+    });
+    expect(cssNamesFor(plain, { kind: "post", id: 990013 })).toEqual([
+      "cc-global-stylesheets.css",
+      "cc-global-classes.css",
+      "cc-tp-cwicly_footer.css",
     ]);
   });
 });

@@ -113,6 +113,7 @@ import {
   importedStyleRules,
   loadSiteContext,
   subjectBlocks,
+  type HoistedRule,
   type LoadSiteOptions,
   type SiteContext,
   type Subject,
@@ -130,12 +131,14 @@ import {
 } from "./design-system.ts";
 import { imageCompareStylesheet } from "../core/image-compare.ts";
 import { fluentFormStylesheet, TURNSTILE_SCRIPT, usedForms } from "./fluentform.ts";
+import { geoMapStylesheet, usedGeoMaps } from "./geomap.ts";
 import { buildCompatCss, compatFeaturesForBlocks, type CompatCss } from "./compat-css.ts";
 import { buildComponents, type ComponentsOutput } from "./components.ts";
 import { collectClassStyles } from "./class-styles.ts";
 import { buildCollections, type CollectionsOutput } from "./collections.ts";
 import { CURRENT_PAGE_SCRIPT, menuResolvers, newUsed as newMenusUsed } from "./menus.ts";
 import { buildPages, type PagesOutput } from "./pages.ts";
+import { markNoOptimize, undecodableImage } from "./no-optimize.ts";
 import { buildRedirects, type RedirectBuild, type RedirectTarget } from "./redirects.ts";
 import { buildTemplates, layoutFor, type TemplatesOutput } from "./templates.ts";
 import {
@@ -734,6 +737,15 @@ function placeholderKeys(entry: ReportEntry): string[] {
         : `Fluent Forms form ${name} (drawn, not submittable)`,
     ];
   }
+  const map = entry.data?.map;
+  if (typeof map === "number") {
+    const name = dataText(entry, "title") ?? map;
+    return [
+      entry.code === "map.missing"
+        ? `Interactive Geo Maps map ${name} (not in the database)`
+        : `Interactive Geo Maps map ${name} (an empty stage, no map)`,
+    ];
+  }
   if (shortcode !== undefined) return [`shortcode [${shortcode}]`];
   if (kind === "shortcode") return [`shortcode ${dataText(entry, "name") ?? "(unnamed)"}`];
   if (block !== undefined) return [`block ${block}`];
@@ -796,7 +808,7 @@ const DECISIONS: readonly DecisionSpec[] = [
     id: "placeholders",
     title: "Forms, shortcodes and blocks with no static form",
     question:
-      "Each stands where it was as a visible neutral element, or was left out. Choose a replacement per type (a form service, an embed, a script).",
+      "Each stands where it was as a visible neutral element, or was left out (a block of a plugin the site no longer has prints nothing on the live site, and nothing here). Choose a replacement per type (a form service, an embed, a script).",
     codes: [
       "page.placeholder-neutral",
       "template.placeholder-neutral",
@@ -804,12 +816,16 @@ const DECISIONS: readonly DecisionSpec[] = [
       "placeholder.unresolved",
       "entry.placeholder-dropped",
       "block.unsupported",
+      "block.unregistered",
       "block.shortcode",
       "form.not-submittable",
       "form.element-unsupported",
       "form.missing",
       "form.css-missing",
       "form.load-failed",
+      "map.not-interactive",
+      "map.missing",
+      "map.css-missing",
     ],
     keys: placeholderKeys,
     label: (key, f) => `${key}: ${f.places} place${f.places === 1 ? "" : "s"}`,
@@ -819,8 +835,15 @@ const DECISIONS: readonly DecisionSpec[] = [
     title: "Behaviour that is not ported",
     question:
       "Animations, tabs, sliders, lightboxes and similar scripts are not carried over; the markup falls back to something plain. Decide which ones the new site still needs.",
-    codes: ["interaction.dropped", "interaction.approximated", "link.unsupported"],
-    keys: (e) => dataText(e, "feature", "interaction", "action", "block", "kind") ?? e.where,
+    codes: [
+      "interaction.dropped",
+      "interaction.approximated",
+      "link.unsupported",
+      "template.shortcode-dropped",
+      "page.shortcode-dropped",
+    ],
+    keys: (e) =>
+      dataText(e, "feature", "interaction", "action", "block", "kind", "shortcode") ?? e.where,
     label: (key, f) => `${key}: ${f.places} place${f.places === 1 ? "" : "s"}`,
   },
   {
@@ -867,6 +890,15 @@ const DECISIONS: readonly DecisionSpec[] = [
     weight: (e) => dataNumber(e, "images"),
     combine: "max",
     label: (key, f) => `${key}: ${f.weight} images, WebP only`,
+  },
+  {
+    id: "undecodable",
+    title: "Pictures the image optimiser cannot read",
+    question:
+      "The build cannot resize these (a phone's HEIC saved under a .jpg name, for one): they are served as they are, and most browsers cannot show a HEIC at all. Replace each with a JPEG or PNG in the media library and convert again.",
+    codes: ["media.undecodable"],
+    keys: (e) => dataText(e, "file") ?? e.where,
+    label: (key, f) => `${key}: ${f.places} place${f.places === 1 ? "" : "s"}`,
   },
   {
     id: "media",
@@ -1115,6 +1147,53 @@ export function supersededFiles(
   );
 }
 
+/** A heading an entry writes with a background: `:::h2{className="wp-block-heading ... has-background"}` (or the `###`-less directive form). */
+const ENTRY_BACKGROUND_HEADING = /^:{2,}h[1-6]\{[^}\n]*(?<![\w-])has-background(?![\w-])/m;
+
+/**
+ * The block library's padding for a heading with a background (`.has-background:is(h2):where(.wp-block-heading)`,
+ * 1.25em 2.375em, one class and one element), written once more with `:root` in front for the entries
+ * that hold such a heading. The live page prints the library's stylesheet last, so against a template rule of the
+ * same specificity (`.content-post h2 { padding: 2rem }`) the library wins; Jx writes the project's style before the
+ * page's, so the page's rule won and nine headings of a post kept 32px where the live page has 55px 104px (the text
+ * wrapped differently and the post came out 1,800px short at 1366px). One more class puts the library's rule
+ * above the page's without reaching for `!important`.
+ */
+export function entryHeadingRules(
+  coreStyle: Readonly<Record<string, unknown>> | undefined,
+  entries: readonly { content: string }[],
+): HoistedRule[] {
+  if (coreStyle === undefined || !entries.some((e) => ENTRY_BACKGROUND_HEADING.test(e.content))) {
+    return [];
+  }
+  const rules: HoistedRule[] = [];
+  for (const [selector, value] of Object.entries(coreStyle)) {
+    if (!/^\.has-background:is\(h[1-6]\)/.test(selector) || !isRec(value)) continue;
+    // Only the declarations: a media block of the rule keeps its place in the library's own entry.
+    const declarations = Object.fromEntries(Object.entries(value).filter(([, v]) => !isRec(v)));
+    if (Object.keys(declarations).length === 0) continue;
+    rules.push({
+      selector: selector
+        .split(",")
+        .map((part) => `:root ${part.trim()}`)
+        .join(", "),
+      style: declarations as JxStyle,
+    });
+  }
+  return rules;
+}
+
+/** `pages` without the pages whose address a Rank Math redirect answers (the redirect is written there instead); `pages` is edited in place. */
+export function withoutSupersededPages(
+  supersedes: readonly string[],
+  pages: { files: { path: string }[]; pages: { route: string; file: string }[] },
+): void {
+  const hidden = supersededFiles(supersedes, pages.pages, []);
+  if (hidden.size === 0) return;
+  pages.files = pages.files.filter((f) => !hidden.has(f.path));
+  pages.pages = pages.pages.filter((p) => !hidden.has(p.file));
+}
+
 /** The block that holds every rule of a post at once: a query every width meets, so that it is a conditional block and follows the others. */
 export const EVERY_WIDTH = "@(min-width: 0px)";
 
@@ -1264,6 +1343,24 @@ function coreCssRoot(
   if (pluginFrom === undefined) return undefined;
   if (isUrl(pluginFrom)) return pluginFrom;
   return existsSync(join(pluginFrom, "wp-includes", "blocks")) ? pluginFrom : undefined;
+}
+
+/**
+ * Whether the active theme asks for `wp-embed-responsive` on the body: its `functions.php` calls
+ * `add_theme_support('responsive-embeds')`. Read from the WordPress root the core CSS is read from (a live
+ * site has no source to read, and then an embed keeps the size its markup names).
+ */
+export function themeSupportsResponsiveEmbeds(
+  root: string | undefined,
+  theme: string | undefined,
+): boolean {
+  if (root === undefined || isUrl(root) || theme === undefined || theme === "") return false;
+  try {
+    const code = readFileSync(join(root, "wp-content", "themes", theme, "functions.php"), "utf8");
+    return /\badd_theme_support\(\s*['"]responsive-embeds['"]/.test(code);
+  } catch {
+    return false;
+  }
 }
 
 /** The `siteurl` option of a database: where the live site is, when nothing else says. */
@@ -1707,7 +1804,15 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
   const templates = await stage(
     "templates",
     "converting the templates, parts and the pages of the routes that are not pages",
-    () => buildTemplates(site, { now, siteUrl }),
+    () =>
+      buildTemplates(site, {
+        now,
+        siteUrl,
+        responsiveEmbeds: themeSupportsResponsiveEmbeds(
+          coreCssRoot(opts.wpFrom, pluginFrom),
+          site.model.site.theme,
+        ),
+      }),
     () => failedTemplates(createReport()),
   );
   const pages = await stage(
@@ -1905,13 +2010,11 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
 
   // A page behind a Rank Math redirect was unreachable on the source site (the rule answers first), and
   // the redirect is written at its address: the page is not written, as Jx would write two things there.
-  const hidden = supersededFiles(redirects.supersedes, pages.pages, collections.entries);
-  if (hidden.size > 0) {
-    pages.files = pages.files.filter((f) => !hidden.has(f.path));
-    pages.pages = pages.pages.filter((p) => !hidden.has(p.file));
-    collections.files = collections.files.filter((f) => !hidden.has(f.path));
-    collections.entries = collections.entries.filter((e) => !hidden.has(e.file));
-  }
+  // An entry is different: the lists of its collection still show it on the source site (the blog index
+  // prints the card of a post whose address Rank Math sends elsewhere), so the entry stays in the
+  // collection and only its own page gives way, the redirect's file being written over it by the build.
+  withoutSupersededPages(redirects.supersedes, pages);
+  const superseded = new Set(redirects.supersedes.map(pathKey));
 
   // A redirect from the address of a page this run wrote would make the build write two things at one
   // address. The route table already vets the pages it knows (`redirect.shadowed`); the pages the
@@ -1919,7 +2022,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
   const live = new Set<string>([
     ...pages.pages.map((p) => pathKey(p.route)),
     ...templates.pages.filter((p) => !/[:*]/.test(p.route)).map((p) => pathKey(p.route)),
-    ...collections.entries.map((e) => pathKey(e.route)),
+    ...collections.entries.map((e) => pathKey(e.route)).filter((k) => !superseded.has(k)),
   ]);
   {
     for (const source of Object.keys(redirects.redirects)) {
@@ -2047,6 +2150,22 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
       attributes: { rel: "stylesheet", href: compareSheet.path.replace(/^public/, "") },
     });
   }
+  // The maps' stage: the plugin's stylesheet gives the empty container the size the live page's map has.
+  const mapSheet = await geoMapStylesheet(
+    usedGeoMaps(site),
+    pluginFrom ?? pluginRootOf(site.pluginSource?.origin),
+    own,
+  );
+  if (mapSheet !== undefined) {
+    add(mapSheet.path, mapSheet.content, "geo map");
+    const at = head.findIndex(
+      (entry) => entry.tagName === "link" && entry.attributes?.rel === "stylesheet",
+    );
+    head.splice(at + 1, 0, {
+      tagName: "link",
+      attributes: { rel: "stylesheet", href: mapSheet.path.replace(/^public/, "") },
+    });
+  }
   // The site icon: WordPress prints it as icon links of several sizes cut from one attachment; the
   // browser scales the one file here (and takes it, an SVG included, as the touch icon too).
   const iconId = Number(model.options.get("site_icon") ?? "");
@@ -2087,6 +2206,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
       rules: [
         ...templates.used.hoisted,
         ...collections.used.hoisted,
+        ...entryHeadingRules(core?.style, collections.files),
         ...pages.used.documentRules,
         ...templates.used.documentRules,
         ...components.used.documentRules,
@@ -2162,6 +2282,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
 
   /** What the manifest will hold for media: written by this run, or carried from the last one. */
   const mediaHashes: Record<string, string> = {};
+  const RASTER_NAME = /\.(?:jpe?g|png|webp|avif|tiff?|heic|heif|bmp|ico)$/i;
   const isMediaPath = (path: string): boolean =>
     path.startsWith("public/media/") || path.startsWith("public/fonts/");
 
@@ -2306,6 +2427,27 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
     for (const [path, hash] of Object.entries(old?.files ?? {})) {
       if (isMediaPath(path)) mediaHashes[path] = hash;
     }
+  }
+
+  // A picture the image optimiser cannot decode would stop the whole `jx build`: its references say so.
+  if (mediaOn && opts.dryRun !== true && !writesNothing && sink.read !== undefined) {
+    const unreadable = new Map<string, string>();
+    for (const file of library) {
+      if (!RASTER_NAME.test(file.file)) continue;
+      const bytes = await sink.read(file.destPath);
+      const why = bytes === undefined ? undefined : undecodableImage(bytes);
+      if (why === undefined) continue;
+      unreadable.set(file.publicPath, why);
+      mediaReport.add({
+        severity: "warn",
+        code: "media.undecodable",
+        message: `${file.file} cannot be decoded by Jx's image optimiser: ${why}. Its references carry data-no-optimize so the build goes on, and the picture is served as it is (replace it with a JPEG or PNG for a result in every browser).`,
+        where:
+          file.attachmentIds.length > 0 ? `post:${file.attachmentIds[0]}` : `media:${file.file}`,
+        data: { file: file.file, publicPath: file.publicPath, attachmentIds: file.attachmentIds },
+      });
+    }
+    markNoOptimize(files, new Set(unreadable.keys()));
   }
 
   // ── Write the files ────────────────────────────────────────────────────────────────────────────
