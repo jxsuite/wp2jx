@@ -82,7 +82,7 @@
  * (`jx build: optimising images: 250 so far (now photo.jpg)`).
  *
  * Report codes of this module: `project.stage-failed`, `project.css-missing`, `project.compat-missing`,
- * `project.core-css-skipped`, `project.core-css-failed`, `project.style-merged`,
+ * `project.core-css-skipped`, `project.core-css-failed`, `project.color-variable-collision`, `project.style-merged`,
  * `project.redirect-shadowed`, `project.ref-missing`, `project.json-invalid`, `project.file-collision`,
  * `project.file-invalid`, `project.site-icon-missing`, `project.manifest-unreadable`,
  * `project.stale-kept`, `project.edited-overwritten`, `project.site-changed`,
@@ -135,6 +135,11 @@ import { geoMapStylesheet, usedGeoMaps } from "./geomap.ts";
 import { buildCompatCss, compatFeaturesForBlocks, type CompatCss } from "./compat-css.ts";
 import { buildComponents, type ComponentsOutput } from "./components.ts";
 import { collectClassStyles } from "./class-styles.ts";
+import {
+  colorVariableCollisions,
+  isColorVariableText,
+  renameColorVariables,
+} from "./color-vars.ts";
 import { buildCollections, type CollectionsOutput } from "./collections.ts";
 import { CURRENT_PAGE_SCRIPT, menuResolvers, newUsed as newMenusUsed } from "./menus.ts";
 import { buildPages, type PagesOutput } from "./pages.ts";
@@ -2448,6 +2453,25 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
       });
     }
     markNoOptimize(files, new Set(unreadable.keys()));
+  }
+
+  // ── Palette names ──────────────────────────────────────────────────────────────────────────────
+  // Cwicly's `--cc-color-*` are the project's `--color-*` in every file (`emit/color-vars.ts`).
+  for (const [renamed, from] of colorVariableCollisions(
+    [...site.options.globalStyles.colorRefs.values()].map((ref) => ref.variable),
+  )) {
+    own.add({
+      severity: "warn",
+      code: "project.color-variable-collision",
+      message: `The palette already has a colour named ${renamed}, and ${from} is renamed to it, so the two are one custom property in the project (the one declared later wins). Rename one of them in the site's palette and convert again.`,
+      where: "project.json",
+      data: { renamed, from },
+    });
+  }
+  for (const [path, data] of files) {
+    if (typeof data === "string" && isColorVariableText(path)) {
+      files.set(path, renameColorVariables(data));
+    }
   }
 
   // ── Write the files ────────────────────────────────────────────────────────────────────────────

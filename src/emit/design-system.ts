@@ -50,7 +50,7 @@
  *   author, and a pair of them would be noise. The tests hold the result to the cascade of the
  *   original files for every pair of global classes of both sites.
  * - **Tokens and the body at the top, as Jx reads them.** `:root`'s custom properties become
- *   `style["--cc-color-2"]`, and `body`'s declarations become top-level properties (Jx writes the
+ *   `style["--cc-color-2"]` (written as `--color-2`, `emit/color-vars.ts`), and `body`'s declarations become top-level properties (Jx writes the
  *   first onto `:root` and the second onto `body`), which is where Studio's Project Styles looks for
  *   design tokens and element defaults. Whatever else a `:root` or `body` rule holds stays under its
  *   own key.

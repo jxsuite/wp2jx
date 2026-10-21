@@ -1367,6 +1367,27 @@ describe("fineline: what only that site shows", () => {
 // Narrow runs: a few posts of one type, so each costs about a second.
 const NARROW = ["service"];
 
+describe("the palette's names", () => {
+  test("every file holds Cwicly's --cc-color-* as --color-*, declarations and references alike", async () => {
+    const sink = memorySink();
+    const result = await migrateSite({
+      ...(await optionsFor("fineline", { postTypes: NARROW })),
+      sink,
+    });
+    const text = [...sink.files]
+      .filter(
+        ([path, content]) => typeof content === "string" && !path.startsWith("migration-report"),
+      )
+      .map(([, content]) => content as string);
+    expect(text.filter((content) => content.includes("--cc-color-"))).toEqual([]);
+    const project = JSON.parse(sink.files.get("project.json") as string);
+    expect(project.style["--color-1"]).toMatch(/^#/);
+    expect(project.style["--cc-color-1"]).toBeUndefined();
+    expect(text.some((content) => content.includes("var(--color-1)"))).toBe(true);
+    expect(result.report.filter((x) => x.code === "project.color-variable-collision")).toEqual([]);
+  });
+});
+
 describe("running again", () => {
   test("a second run over the same site is byte-identical, in another directory", async () => {
     const a = memorySink();

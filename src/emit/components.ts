@@ -17,7 +17,7 @@
  * 3. **`state`**: one entry per property, by the key `componentInfos` gave it, holding the value the
  *    plugin prints for an instance that gives none (`get_component_value`'s default branch), in the
  *    shape the property's type has: `text`, `richtext`, `list`, `video`, `id`, `cssText` and `color` are
- *    strings (a palette reference is the `var(--cc-color-N)` it names; one the palette does not have is
+ *    strings (a palette reference is the `var(--cc-color-N)` it names, written as `--color-N`; one the palette does not have is
  *    left out and reported, `component.palette-unresolved`), `number` a number, `toggle` a boolean,
  *    `link` `{href, target?, rel?, title?}`, `image` `{src, alt, width?, height?}` (the attachment's
  *    file in the media plan), `icon` the SVG markup, `class` the class list (the authored classes, then

@@ -99,7 +99,7 @@ Verified against the specs and by running `jx build`. Read the normative specs (
 | Source | Target |
 |---|---|
 | `cwicly_breakpoints_list` | `$media` (`--` base = main breakpoint width; other keys `--<bpkey>` with `(max-width: Wpx)` / `(min-width: Wpx)`) |
-| `cwicly_global_styles` colours/fonts/typography/elements | `project.json` `style` custom properties (`--cc-color-N` kept), tag rules; fonts via `$head` link or `public/fonts` + `@font-face` |
+| `cwicly_global_styles` colours/fonts/typography/elements | `project.json` `style` custom properties (`--cc-color-N` renamed `--color-N`, with every reference and copied stylesheet, `src/emit/color-vars.ts`), tag rules; fonts via `$head` link or `public/fonts` + `@font-face` |
 | `cwicly_global_classes` | `.<classID>` rules in `project.json` `style`, from `cc-global-classes.css` |
 | per-block style attributes | the block's `classID` rules from its `cc-*.css` → the element's `style`, with `classID` first in `className` |
 | `customCSS` / `relativeStyles` | nested keys (`& a`, `& > div:nth-of-type(1)`) in the element's `style` |
