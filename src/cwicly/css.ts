@@ -1772,9 +1772,9 @@ interface Target {
   specificity: string | null;
 }
 
-type Specificity = readonly [number, number, number];
+export type Specificity = readonly [number, number, number];
 
-function specificityOf(selector: selectorParser.Selector): Specificity {
+export function specificityOf(selector: selectorParser.Selector): Specificity {
   let a = 0;
   let b = 0;
   let c = 0;

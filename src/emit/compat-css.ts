@@ -8,7 +8,8 @@
  * structural classes the converted markup keeps (`cc-sct`, `cc-cntr`, `cc-nav…`) are styled by them
  * and by nothing else. They load first on the live site (`CCnorm`, then `CC`), ahead of
  * `cc-global-inline-css`, so the project links this file first in `$head` and every global rule
- * overrides it, as it does there.
+ * overrides it, as it does there. (The assembler then folds it into style rules first in the cascade
+ * and writes its class rules into the elements, `emit/fold-css.ts`: no stylesheet file is shipped.)
  *
  * What was checked, against `tests/fixtures/<site>/html` (the live pages) and the plugin source:
  *

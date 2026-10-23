@@ -1132,22 +1132,22 @@ describe.each(SITES)("%s: the project it writes", (name) => {
     expect(at).toEqual(aliases.filter((alias) => at.includes(alias)));
   });
 
-  test("the plugin's compatibility stylesheet is the first thing in `$head`, ahead of fonts and scripts", async () => {
+  test("no stylesheet is shipped: the head links none of the project's own and holds no <style>, and public/css is empty", async () => {
     await ensure(name);
     const head = projectOf(name).$head as {
       tagName: string;
       attributes?: Record<string, string>;
     }[];
-    if (!HAVE_PLUGIN) return;
-    expect(head[0]).toEqual({
-      tagName: "link",
-      attributes: { rel: "stylesheet", href: "/css/cwicly-base.css" },
-    });
-    const stylesheets = head
-      .map((h, i) => [h, i] as const)
-      .filter(([h]) => h.attributes?.rel === "stylesheet");
-    expect(stylesheets[0]![1]).toBe(0);
-    // Every local sheet it links is in the project.
+    expect(head.filter((h) => h.tagName === "style")).toEqual([]);
+    const own = head.filter(
+      (h) =>
+        h.attributes?.rel === "stylesheet" &&
+        h.attributes.href?.startsWith("/") === true &&
+        !h.attributes.href.startsWith("//"),
+    );
+    expect(own).toEqual([]);
+    expect(existsSync(join(full.get(name)!.dir, "public/css"))).toBe(false);
+    // Every local file it links is in the project.
     for (const h of head) {
       const href = h.attributes?.href ?? h.attributes?.src;
       if (href?.startsWith("/") && !href.startsWith("//")) {
@@ -1341,9 +1341,9 @@ describe("fineline: what only that site shows", () => {
     const twin = Object.keys(hoisted).find((k) => k.startsWith(":root .has-background:is(h1)"));
     expect(twin).toBeDefined();
     expect(hoisted[twin!]).toEqual({ padding: "1.25em 2.375em" });
-    expect(readFileSync(join(full.get("fineline")!.dir, "layouts/base.json"), "utf8")).toContain(
-      "wp-site-blocks wp-embed-responsive",
-    );
+    // `wp-site-blocks` styles nothing and was taken off; the embed class the core rules need stays.
+    const layout = readFileSync(join(full.get("fineline")!.dir, "layouts/base.json"), "utf8");
+    expect(layout).toContain('"className": "wp-embed-responsive"');
   });
 
   test("a redirect whose source is a page this run wrote is dropped and said, and `/search` (the templates' own page) is no redirect", async () => {
@@ -1954,7 +1954,7 @@ describe("what migrateSite refuses, and survives", () => {
     expect(sink.files.has("project.json")).toBe(true);
   });
 
-  test("a core rule no style object can carry (an @import) is a stylesheet of its own, linked right after the compatibility sheet", async () => {
+  test("a core rule's @import is a link in the head, and no core stylesheet is written", async () => {
     const wp = tmp("fakewp");
     mkdirSync(join(wp, "wp-includes/blocks/paragraph"), { recursive: true });
     mkdirSync(join(wp, "wp-includes/css/dist/block-library"), { recursive: true });
@@ -1972,19 +1972,15 @@ describe("what migrateSite refuses, and survives", () => {
       wpFrom: wp,
       sink,
     });
-    const css = sink.files.get(CORE_CSS_PATH) as string;
-    expect(css).toContain('@import url("https://fonts.test/x.css");');
-    expect(css.startsWith("/* ")).toBe(true);
+    expect(sink.files.has(CORE_CSS_PATH)).toBe(false);
     const head = result.project.$head as { attributes?: { href?: string } }[];
-    const at = head.findIndex((h) => h.attributes?.href === "/css/wp-core-blocks.css");
-    expect(at).toBe(HAVE_PLUGIN ? 1 : 0);
-    if (HAVE_PLUGIN) expect(head[0]!.attributes!.href).toBe("/css/cwicly-base.css");
-    // What a style can carry went there instead.
-    expect(Object.keys(result.project.style as object)).toContain(".screen-reader-text");
+    const hrefs = head.map((h) => h.attributes?.href);
+    expect(hrefs).toContain("https://fonts.test/x.css");
+    expect(hrefs.filter((h) => h?.startsWith("/css/") === true)).toEqual([]);
     expect(result.report.find((x) => x.code === "corecss.verbatim")).toBeDefined();
   });
 
-  test("the core block rules are in the project style, and the ones a style cannot hold are a linked stylesheet", async () => {
+  test("the core block rules are in the project style or the elements, and no core stylesheet is written", async () => {
     if (!HAVE_WP) return;
     const sink = memorySink();
     const result = await migrateSite({
@@ -1995,10 +1991,7 @@ describe("what migrateSite refuses, and survives", () => {
     expect(Object.keys(style).some((k) => k.includes("wp-block-"))).toBe(true);
     // Presets are the editor's, not the live site's: none unless asked for.
     expect(Object.keys(style).some((k) => k.startsWith("--wp--preset--"))).toBe(false);
-    if (sink.files.has(CORE_CSS_PATH)) {
-      const head = result.project.$head as { attributes?: { href?: string } }[];
-      expect(head.some((h) => h.attributes?.href === "/css/wp-core-blocks.css")).toBe(true);
-    }
+    expect(sink.files.has(CORE_CSS_PATH)).toBe(false);
   });
 });
 
@@ -2103,7 +2096,7 @@ describe("local fonts, end to end", () => {
     return migrateSite({ site: withLocal, now: NOW, ...extra });
   }
 
-  test("the font files are fetched into public/fonts, and the project's own CSS points at them", async () => {
+  test("the font files are fetched into public/fonts, and the base layout's faces point at them", async () => {
     const sink = memorySink();
     const seen: string[] = [];
     const result = await withFont({
@@ -2121,9 +2114,13 @@ describe("local fonts, end to end", () => {
     expect(seen).toContain(
       "https://finelinepainting.pro/wp-content/uploads/cwicly/local-fonts/local-one/regular.woff",
     );
-    const css = sink.files.get("public/css/cwicly-global.css") as string;
-    expect(css).toContain("url(/fonts/local-one/regular.woff2)");
-    expect(css).not.toContain("s.test");
+    expect(sink.files.has("public/css/cwicly-global.css")).toBe(false);
+    const layout = JSON.parse(sink.files.get("layouts/base.json") as string) as {
+      style: Record<string, unknown>;
+    };
+    const faces = JSON.stringify(layout.style["@font-face"]);
+    expect(faces).toContain("url(/fonts/local-one/regular.woff2)");
+    expect(faces).not.toContain("s.test");
     expect(result.media.failed).toBe(0);
     const manifest = JSON.parse(sink.files.get(MANIFEST_PATH) as string) as {
       files: Record<string, string>;
@@ -2210,7 +2207,7 @@ describe("the forms a page draws", () => {
     return { ...site, forms: await pilotForms() };
   }
 
-  test("their stylesheet is written, linked right after the compatibility sheet, and holds the plugin's rules and the form's own", async () => {
+  test("their stylesheet is folded into the project style with the plugin's rules and the form's own, and no file is written", async () => {
     const plugin = tmp("fluentform-plugin");
     const css = join(plugin, "wp-content", "plugins", "fluentform", "assets", "css");
     mkdirSync(css, { recursive: true });
@@ -2228,18 +2225,13 @@ describe("the forms a page draws", () => {
       now: NOW,
       media: false,
     });
-    const sheet = String(sink.files.get("public/css/fluentform.css"));
-    expect(sheet).toContain(".fluentform .has-conditions{display:none}");
-    expect(sheet).toContain(".ff-default .ff-btn{x:y}");
-    expect(sheet).toContain(".fluentform_wrapper_3.ffs_custom_wrap");
-    expect(sheet).toContain(".fluentform_wrapper_1.ffs_classic_wrap");
+    expect(sink.files.has("public/css/fluentform.css")).toBe(false);
+    // The form is HTML text, so its classes stay and so do the rules for them.
+    const style = JSON.stringify(result.project.style);
+    expect(style).toContain(".fluentform_wrapper_3.ffs_custom_wrap");
+    expect(style).toContain(".fluentform_wrapper_1.ffs_classic_wrap");
     const head = result.project.$head as { attributes?: { href?: string } }[];
-    const hrefs = head.map((h) => h.attributes?.href);
-    const at = hrefs.indexOf("/css/fluentform.css");
-    expect(at).toBeGreaterThan(-1);
-    expect(hrefs.filter((h) => h === "/css/fluentform.css")).toHaveLength(1);
-    const first = head.findIndex((h) => h.attributes?.href?.endsWith(".css"));
-    expect(at).toBe(first + 1);
+    expect(head.some((h) => h.attributes?.href?.endsWith(".css") === true)).toBe(false);
     expect(result.report.some((e) => e.code === "form.not-submittable")).toBe(true);
     // the quote page carries the form, the project lists the file it needs
     expect(String(sink.files.get("pages/quote.json"))).toContain("fluentform_wrapper_3");
@@ -2333,7 +2325,7 @@ describe("the maps a page draws", () => {
     });
   }
 
-  test("the plugin's stylesheet is written once and linked, and the template prints the map's stage", async () => {
+  test("the plugin's stylesheet is folded into the project style, and the template prints the map's stage", async () => {
     const plugin = tmp("geomap-plugin");
     const css = join(
       plugin,
@@ -2355,13 +2347,14 @@ describe("the maps a page draws", () => {
       now: NOW,
       media: false,
     });
-    expect(String(sink.files.get("public/css/geo-map.css"))).toContain(
-      ".map_wrapper .map_aspect_ratio{height:0}",
-    );
+    expect(sink.files.has("public/css/geo-map.css")).toBe(false);
+    expect(
+      (result.project.style as Record<string, unknown>)[".map_wrapper .map_aspect_ratio"],
+    ).toEqual({ height: "0" });
     const hrefs = (result.project.$head as { attributes?: { href?: string } }[]).map(
       (h) => h.attributes?.href,
     );
-    expect(hrefs.filter((h) => h === "/css/geo-map.css")).toHaveLength(1);
+    expect(hrefs).not.toContain("/css/geo-map.css");
     expect(String(sink.files.get("pages/service_area/[slug].json"))).toContain("map_wrapper_3197");
     expect(result.report.some((e) => e.code === "map.not-interactive")).toBe(true);
     expect(result.report.some((e) => e.code === "map.css-missing")).toBe(false);
@@ -2378,7 +2371,7 @@ describe("the maps a page draws", () => {
       media: false,
     });
     expect(result.report.some((e) => e.code === "map.css-missing")).toBe(true);
-    expect(String(sink.files.get("public/css/geo-map.css"))).toContain("height:0");
+    expect(JSON.stringify(result.project.style)).toContain('"height":"0"');
   });
 
   test("a site whose database has no map prints nothing for the shortcode and ships no map stylesheet", async () => {

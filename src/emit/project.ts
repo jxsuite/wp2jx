@@ -135,6 +135,7 @@ import { geoMapStylesheet, usedGeoMaps } from "./geomap.ts";
 import { buildCompatCss, compatFeaturesForBlocks, type CompatCss } from "./compat-css.ts";
 import { buildComponents, type ComponentsOutput } from "./components.ts";
 import { collectClassStyles } from "./class-styles.ts";
+import { foldStylesheets, type FoldSource } from "./fold-css.ts";
 import {
   colorVariableCollisions,
   isColorVariableText,
@@ -1202,6 +1203,9 @@ export function withoutSupersededPages(
 /** The block that holds every rule of a post at once: a query every width meets, so that it is a conditional block and follows the others. */
 export const EVERY_WIDTH = "@(min-width: 0px)";
 
+/** Classes a third-party script finds elements by, which no stylesheet names: never taken off. */
+export const PROTECTED_CLASSES: readonly string[] = ["cf-turnstile", "g-recaptcha", "h-captcha"];
+
 /**
  * `rules` (the rules the posts, templates and documents moved to the project) written after every block
  * of `style`, the design system's conditional blocks included. The live page prints the global classes'
@@ -2227,6 +2231,39 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
       message: `${composed.merged.length} rule${composed.merged.length === 1 ? "" : "s"} of the core block CSS or the hoisted rules share a selector with an earlier entry of the project style and were merged into it (the later declarations win).`,
       where: "project.json",
       data: { selectors: composed.merged.slice(0, 20) },
+    });
+  }
+
+  // ── No stylesheet files: every sheet becomes style rules, class rules move into their elements ──
+  {
+    const role = (name: string): string | undefined =>
+      design?.stylesheets.find((sheet) => sheet.role === name)?.path;
+    const sheet = (path: string | undefined, label: string): FoldSource[] =>
+      path === undefined ? [] : [{ kind: "file", path, label }];
+    composed.style = foldStylesheets({
+      files,
+      head,
+      style: composed.style,
+      order: [
+        ...sheet(role("compat"), "the plugin's base CSS"),
+        ...sheet(formSheet?.path, "the forms' CSS"),
+        ...sheet(compareSheet?.path, "the image compare CSS"),
+        ...sheet(mapSheet?.path, "the maps' CSS"),
+        ...sheet(role("global"), "the global faces and at-rules"),
+        ...sheet(role("custom"), "the site owner's CSS"),
+        { kind: "head-styles" },
+        { kind: "project-style" },
+        ...sheet(CORE_CSS_PATH, "the core block rules"),
+        ...sheet(role("additional"), "WordPress Additional CSS"),
+      ],
+      breakpoints: site.options.breakpoints,
+      media: mediaOf,
+      palette: [...site.options.globalStyles.colorRefs.values()],
+      baseLayout:
+        templates.base === null ? undefined : templates.base.replace(/^\.\//, ""),
+      protect: PROTECTED_CLASSES,
+      report: own,
+      serialize: jsonText,
     });
   }
 

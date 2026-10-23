@@ -1,6 +1,8 @@
 /**
  * A Cwicly site's global look, as the pieces of a Jx project: `project.json`'s `$media`, `style` and
- * `$head`, plus the files that go under `public/`.
+ * `$head`, plus the files that go under `public/`. The stylesheets among those files are an
+ * intermediate: the assembler folds every one into style rules in this order (`emit/fold-css.ts`),
+ * so the project ships none.
  *
  * What the live page loads, in the order it loads it (`tests/fixtures/<site>/html`):
  *
@@ -268,7 +270,7 @@ function rewriteStyleUrls(style: JxStyle, rewrite: (url: string) => string): voi
  * escape is the same character to a browser (inside a string, where it can occur at all) and no
  * longer a template to Jx. Returns how many values it changed.
  */
-function escapeStyleTemplates(style: JxStyle): number {
+export function escapeStyleTemplates(style: JxStyle): number {
   let changed = 0;
   for (const [key, value] of Object.entries(style)) {
     if (typeof value === "string") {
@@ -910,7 +912,7 @@ const longhandsOf = (key: string): ReadonlySet<string> | "all" =>
   key === "all" ? "all" : (SHORTHAND_SETS.get(key) ?? new Set([key]));
 
 /** Whether setting `a` sets everything `b` sets, so a later `a` leaves `b` nothing to say. */
-function covers(a: string, b: string): boolean {
+export function covers(a: string, b: string): boolean {
   const x = longhandsOf(a);
   const y = longhandsOf(b);
   if (x === "all") return !b.startsWith("--");
@@ -919,7 +921,7 @@ function covers(a: string, b: string): boolean {
 }
 
 /** Whether `a` and `b` set any property in common. */
-function overlaps(a: string, b: string): boolean {
+export function overlaps(a: string, b: string): boolean {
   const x = longhandsOf(a);
   const y = longhandsOf(b);
   if (x === "all") return !b.startsWith("--");
