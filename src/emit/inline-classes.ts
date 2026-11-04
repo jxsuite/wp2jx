@@ -608,16 +608,11 @@ export function inlineClasses(input: InlineInput): InlineResult {
     // the element keeps is shared (that is why it is kept), and what the element took in would reach
     // every element that carries it. The block's own first class was its own scope before; once it is
     // gone, or the style holds rules it did not, the scope is a class of this element's own.
-    // Jx numbers the `jx-N` scope it gives a class-less element per document, so a layout's `jx-0` and
-    // the page's `jx-0` are two elements with one class and each other's rules: in a layout, a styled
-    // element that loses its last class keeps a scope of its own instead.
-    const unnumbered = keep.length === 0 && element.path.startsWith("layouts/");
     if (
       styled &&
-      (unnumbered ||
-        (keep.length > 0 &&
-          !keep[0]!.startsWith("jx-") &&
-          (took || keep[0] !== element.classes[0])))
+      keep.length > 0 &&
+      !keep[0]!.startsWith("jx-") &&
+      (took || keep[0] !== element.classes[0])
     ) {
       const hash = createHash("sha256")
         .update(`${element.path}#${element.pointer}`)
