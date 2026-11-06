@@ -139,6 +139,10 @@ const classOf = (element: Hast): string => {
   return Array.isArray(value) ? value.join(" ") : String(value ?? "");
 };
 
+/** A paged page's text as its first page prints it: what it adds past the first page is nothing there (`emit/paging.ts`). */
+const firstPage = (text: string): string =>
+  text.replaceAll(/\$\{state\.\$page\.pagination[^}]*\}/g, "");
+
 /** The project a site's pages build in: trivial layouts (a `<main>` and the slot) and stub components. */
 function projectOf(
   site: SiteContext,
@@ -151,12 +155,35 @@ function projectOf(
   for (const file of out.files) files[file.path] = file.content;
   // A page whose conversion holds a query loop points at a content collection of the project: the
   // project that builds it has one (a single stub entry; the pages' own content is what is judged).
+  // The stub holds what the native lists' literal rules ask for (a term, a field's value), so a list
+  // that lists entries on the site lists the stub here: an empty mapped list would be rendered in
+  // the browser, which is the site's content and not the page's (the converter writes a list that
+  // selects nothing as computed children).
   const types = new Set<string>();
+  const terms = new Map<string, Map<string, Set<string>>>();
+  const fields = new Map<string, Record<string, unknown>>();
+  type Def = {
+    contentType?: string | string[];
+    filter?: { field: string; op: string; value?: unknown }[];
+  };
   for (const file of out.files) {
-    const state = (JSON.parse(file.content) as { state?: Record<string, { contentType?: string }> })
-      .state;
+    const state = (JSON.parse(file.content) as { state?: Record<string, Def> }).state;
     for (const entry of Object.values(state ?? {})) {
-      if (typeof entry?.contentType === "string") types.add(entry.contentType);
+      const listed = entry?.contentType;
+      const named = typeof listed === "string" ? [listed] : Array.isArray(listed) ? listed : [];
+      for (const type of named) {
+        types.add(type);
+        for (const rule of entry.filter ?? []) {
+          const tax = /^terms\.(.+)\.slug$/.exec(rule.field)?.[1];
+          if (rule.op === "contains" && tax !== undefined && typeof rule.value === "string") {
+            const byTax = terms.get(type) ?? new Map<string, Set<string>>();
+            byTax.set(tax, (byTax.get(tax) ?? new Set()).add(rule.value));
+            terms.set(type, byTax);
+          } else if (rule.op === "==" && typeof rule.value !== "object") {
+            fields.set(type, { ...fields.get(type), [rule.field]: rule.value });
+          }
+        }
+      }
     }
   }
   if (types.size > 0) {
@@ -178,8 +205,24 @@ function projectOf(
         ]),
       ),
     };
-    for (const type of types)
-      files[`content/${type}/stub.md`] = "---\ntitle: Stub\nslug: stub\n---\n\nBody.\n";
+    for (const type of types) {
+      const data = {
+        title: "Stub",
+        slug: "stub",
+        ...fields.get(type),
+        ...(terms.has(type)
+          ? {
+              terms: Object.fromEntries(
+                [...terms.get(type)!].map(([tax, slugs]) => [
+                  tax,
+                  [...slugs].map((slug) => ({ slug, name: slug, url: `/${tax}/${slug}/` })),
+                ]),
+              ),
+            }
+          : {}),
+      };
+      files[`content/${type}/stub.md`] = `---\n${JSON.stringify(data)}\n---\n\nBody.\n`;
+    }
   }
   for (const layout of new Set(out.pages.map((page) => page.layout))) {
     if (layout !== null) {
@@ -1114,7 +1157,7 @@ describe.each(["fineline", "ap"] as const)("%s: jx validate and jx build", (name
       const html = built.html(page.route);
       expect(html.match(/<title>/g), page.route).toHaveLength(1);
       expect(decode(/<title>([^<]*)<\/title>/.exec(html)![1]!), page.route).toBe(
-        doc.title!.replaceAll("​", ""),
+        firstPage(doc.title!).replaceAll("​", ""),
       );
       const body = html.slice(html.indexOf("<body>"));
       expect(/^<body>\s*<[a-z0-9-]+[^>]*\stitle=/.test(body), page.route).toBe(false);
@@ -1154,7 +1197,7 @@ describe.each(["fineline", "ap"] as const)("%s: jx validate and jx build", (name
         const key = entry.attributes!.name ?? entry.attributes!.property;
         if (key === undefined) continue;
         expect(tags.get(String(key)), `${page.route} ${String(key)}`).toBe(
-          String(entry.attributes!.content).replaceAll("​", ""),
+          firstPage(String(entry.attributes!.content)).replaceAll("​", ""),
         );
       }
     }
@@ -2287,8 +2330,8 @@ describe("the canonical of a page", () => {
     ).toContain("noindex");
     const built = await buildJxProject(projectOf(edited, out), { name: "pages-noindex" });
     const sitemap = built.read("sitemap.xml");
-    // Jx's own sitemap writes the route without its trailing slash; what matters here is who is listed.
-    expect(sitemap).toContain("/about-us<");
+    // Jx writes the route with its trailing slash, as the site's addresses have it; what matters here is who is listed.
+    expect(sitemap).toContain("/about-us/<");
     expect(sitemap).not.toContain("privacy-policy");
     expect((await validateJxProject(built.dir)).problems).toEqual([]);
   });

@@ -87,6 +87,9 @@ convert options
   --force                    write into a directory that holds files this tool did not write, or the
                              project of another site (the files this run no longer produces are removed)
   --presets                  also ship the WordPress preset styles the live site does not serve
+  --hold, --no-hold          write (or leave out) drafts, posts pending review, scheduled, private and
+                             password-protected entries, held back from the build by the content
+                             types' hold rules (default: whether the installed Jx has hold)
   --prune-css                drop the plugin CSS rules for classes no page carries
   --inline-gaps <mode>       report (default) or innerHTML: how to write paragraphs whose inline siblings
                              the build would separate by a space
@@ -150,6 +153,8 @@ const CONVERT_FLAGS = {
   "allow-errors": { type: "boolean" },
   force: { type: "boolean" },
   presets: { type: "boolean" },
+  hold: { type: "boolean" },
+  "no-hold": { type: "boolean" },
   "prune-css": { type: "boolean" },
   "inline-gaps": { type: "string" },
   "css-cache": { type: "string" },
@@ -377,6 +382,9 @@ export function parseConvertArgs(args: string[], io: CliIo): ConvertArgs | "help
     values["css-cache-absent-ttl"],
     io,
   );
+  if (values.hold === true && values["no-hold"] === true) {
+    throw new UsageError("--hold and --no-hold say opposite things");
+  }
   if (values["no-plugin-css"] === true && values["plugin-from"] !== undefined) {
     throw new UsageError("--no-plugin-css and --plugin-from say opposite things");
   }
@@ -429,6 +437,7 @@ export function parseConvertArgs(args: string[], io: CliIo): ConvertArgs | "help
     ...(dryRun ? { dryRun: true } : {}),
     ...(values["no-media"] === true ? { media: false } : {}),
     ...(values.presets === true ? { presets: true } : {}),
+    ...(values.hold === true ? { hold: true } : values["no-hold"] === true ? { hold: false } : {}),
     ...(values["prune-css"] === true ? { pruneCompat: true } : {}),
     ...(gaps === undefined ? {} : { inlineGaps: gaps }),
     ...(concurrency === undefined ? {} : { concurrency }),

@@ -9,7 +9,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createReport } from "../src/report.ts";
-import { createUrlTools, buildRoutes, pathKey, type RouteOptions } from "../src/routes.ts";
+import {
+  createUrlTools,
+  buildRoutes,
+  pathKey,
+  publishedSlug,
+  type RouteOptions,
+} from "../src/routes.ts";
 import type { MediaPlan } from "../src/media.ts";
 import type { AcfModel, AcfPostType, AcfTaxonomy } from "../src/wp/acf.ts";
 import type { Report, WpModel, WpPost, WpSite, WpTerm, WpUser } from "../src/types.ts";
@@ -2325,5 +2331,89 @@ describe("%hour% is a 24-hour clock in the site's own zone", () => {
     expect(at("2024-03-05T20:30:00.000Z")).toBe("/15-30/t/");
     expect(at("2024-03-05T23:05:00.000Z")).toBe("/18-05/t/");
     expect(at("2024-03-05T05:05:00.000Z")).toBe("/00-05/t/");
+  });
+});
+
+// ── Held entries ─────────────────────────────────────────────────────────────────────────────────
+
+describe("held entries", () => {
+  const posts = [
+    post(1, { slug: "hello" }),
+    post(2, { status: "draft", slug: "", title: "Noun Doctrines &amp; Verb Doctrines" }),
+    post(3, { status: "draft", slug: "", title: "Hello" }),
+    post(4, { status: "future", slug: "coming-soon" }),
+    post(5, { status: "private", slug: "members" }),
+    post(6, { status: "pending", slug: "", title: "" }),
+    post(7, { status: "trash", slug: "gone" }),
+    post(8, { status: "auto-draft", slug: "" }),
+    post(9, { type: "page", status: "draft", slug: "about" }),
+  ];
+
+  test("are none by default: a draft has no address and no entry", () => {
+    const table = buildRoutes(model({ posts }), acf());
+    expect(table.held()).toEqual([]);
+    expect(table.all().map((r) => r.id)).not.toContain(2);
+  });
+
+  test("a draft, a post pending review, a scheduled and a private post are held where they will be once published, and nothing else lists them", () => {
+    const report = createReport();
+    const table = buildRoutes(model({ posts }), acf(), {
+      report,
+      held: ["draft", "pending", "future", "private"],
+    });
+    const held = table.held();
+    expect(held.map((r) => [r.id, r.status, r.jxRoute, r.file])).toEqual([
+      // WordPress makes a slug of the title on publish (entities and punctuation dropped)
+      [
+        2,
+        "draft",
+        "/noun-doctrines-verb-doctrines/",
+        "content/post/noun-doctrines-verb-doctrines.md",
+      ],
+      // and makes it unique among the type's posts (`wp_unique_post_slug`)
+      [3, "draft", "/hello-2/", "content/post/hello-2.md"],
+      [4, "future", "/coming-soon/", "content/post/coming-soon.md"],
+      [5, "private", "/members/", "content/post/members.md"],
+      // no title: its id
+      [6, "pending", "/6/", "content/post/6.md"],
+    ]);
+    // a trashed post, an auto-draft and a page (a page is no content entry) are not held
+    expect(held.map((r) => r.id)).not.toContain(7);
+    // nothing links, redirects or lists a held entry as a page of the site
+    for (const r of held) {
+      expect(table.forPost(Number(r.id))).toBeUndefined();
+      expect(table.byWpPath(r.wpPath)).toBeUndefined();
+      expect(table.all()).not.toContainEqual(expect.objectContaining({ id: r.id }));
+    }
+    expect(table.forPost(1)?.jxRoute).toBe("/hello/");
+  });
+
+  test("a held entry never takes a public one's address", () => {
+    const report = createReport();
+    // a draft whose slug a published page already has: the page wins, and the draft is said
+    const table = buildRoutes(
+      model({
+        posts: [
+          post(1, { type: "page", slug: "news" }),
+          post(2, { status: "draft", slug: "news" }),
+        ],
+      }),
+      acf(),
+      { report, held: ["draft"] },
+    );
+    expect(table.held()).toEqual([]);
+    expect(report.entries().find((e) => e.code === "route.held-collision")).toMatchObject({
+      where: "post:2",
+      severity: "warn",
+    });
+  });
+
+  test("publishedSlug: the post's own slug, else WordPress's of its title, else its id", () => {
+    expect(publishedSlug({ id: 1, slug: "kept", title: "Ignored" })).toBe("kept");
+    expect(publishedSlug({ id: 1, slug: "", title: "Café <b>au</b> Lait — Now!" })).toBe(
+      "cafe-au-lait-now",
+    );
+    expect(publishedSlug({ id: 42, slug: "", title: "" })).toBe("42");
+    expect(publishedSlug({ id: 7, slug: "", title: "???" })).toBe("7");
   });
 });

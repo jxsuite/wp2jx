@@ -107,11 +107,12 @@ import { ensureConverters } from "../convert.ts";
 import { downloadMedia, type DownloadResult, type FetchLike, type MediaFile } from "../media.ts";
 import { createReport, renderReportJson, renderReportMarkdown, summarise } from "../report.ts";
 import type { ReportSummary } from "../report.ts";
-import { pathKey } from "../routes.ts";
+import { HELD_STATUSES, pathKey } from "../routes.ts";
 import {
   allSubjects,
   importedStyleRules,
   loadSiteContext,
+  sliderTag,
   subjectBlocks,
   type HoistedRule,
   type LoadSiteOptions,
@@ -146,6 +147,8 @@ import { CURRENT_PAGE_SCRIPT, menuResolvers, newUsed as newMenusUsed } from "./m
 import { buildPages, type PagesOutput } from "./pages.ts";
 import { markNoOptimize, undecodableImage } from "./no-optimize.ts";
 import { buildRedirects, type RedirectBuild, type RedirectTarget } from "./redirects.ts";
+import { pagedRedirect } from "./paging.ts";
+import { sliderComponent } from "./slider.ts";
 import { buildTemplates, layoutFor, type TemplatesOutput } from "./templates.ts";
 import {
   addIssues,
@@ -289,6 +292,13 @@ export interface MigrateOptions {
   concurrency?: number;
   /** Ship the WordPress preset styles (`--wp--preset--*`, `.has-<slug>-color`), which the live sites do not serve. Default false. */
   presets?: boolean;
+  /**
+   * Write the drafts, the posts pending review, the scheduled, private and password-protected posts
+   * of the content types as entries the build holds back (a content type's `hold`, jxsuite/jx#548;
+   * `CollectionsOptions.hold`). Default: whether the Jx this tool runs with has `hold`
+   * ({@link jxHolds}); without it they are left out, because a Jx without `hold` would publish them.
+   */
+  hold?: boolean;
   /** Drop the compatibility stylesheet's rules for classes no converted markup carries. Default false. */
   pruneCompat?: boolean;
   inlineGaps?: "report" | "innerHTML";
@@ -1433,19 +1443,81 @@ export function fontFile(
 
 // ── package.json ─────────────────────────────────────────────────────────────────────────────────
 
-/** The version of a package installed beside this tool (a project is built with what it was tested with), as a caret range. */
-function installedRange(pkg: string, fallback: string): string {
+/**
+ * The first releases that hold what the emitted projects use: a list of several content types, a
+ * filter on a dotted field and on a reference to the page, and paged routes (`$paths` `paginate`,
+ * jxsuite/jx#535). A project written for less would build its lists wrong.
+ */
+export const JX_MINIMUM = {
+  "@jxsuite/compiler": "8.1.0",
+  "@jxsuite/parser": "4.2.0",
+  "@jxsuite/runtime": "6.0.2",
+} as const;
+
+/** `a` is an older version than `b` (`major.minor.patch`, a pre-release tag ignored). */
+const older = (a: string, b: string): boolean => {
+  const x = a.split(/[.+-]/).slice(0, 3).map(Number);
+  const y = b.split(/[.+-]/).slice(0, 3).map(Number);
+  for (let i = 0; i < 3; i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) < (y[i] ?? 0);
+  return false;
+};
+
+/**
+ * The first releases with a content type's `hold` rules (jxsuite/jx#548, `feat(content)`): a project
+ * whose collections hold entries back asks for them, because a Jx without `hold` reads no rule and
+ * publishes every entry. #548 was unreleased when this was written: these are the minor releases
+ * release-please gives a `feat`, to be checked against the release when it ships.
+ */
+export const JX_HOLD_MINIMUM = {
+  "@jxsuite/compiler": "8.2.0",
+  "@jxsuite/parser": "4.3.0",
+  "@jxsuite/runtime": "6.0.2",
+} as const;
+
+/** The package.json of a package installed beside this tool, read from the nearest `node_modules`. */
+function installedFile(pkg: string, rel: string): string | undefined {
+  for (let dir = import.meta.dir, last = ""; dir !== last; last = dir, dir = dirname(dir)) {
+    const file = join(dir, "node_modules", pkg, rel);
+    if (existsSync(file)) return file;
+  }
+  return undefined;
+}
+
+/**
+ * Whether the Jx this tool runs with holds entries back: its parser's project schema has a content
+ * type's `hold`. A Jx without it accepts the key and ignores it (the schema is open), so the rules
+ * would publish what they name.
+ */
+export function jxHolds(): boolean {
+  const file = installedFile("@jxsuite/parser", "schemas/project.fragment.schema.json");
+  if (file === undefined) return false;
+  try {
+    return /"hold"\s*:/.test(readFileSync(file, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The version of a package installed beside this tool (a project is built with what it was tested
+ * with), as a caret range, and never below the first release that holds what the project uses
+ * ({@link JX_MINIMUM}, and {@link JX_HOLD_MINIMUM} for a project that holds entries back): a checkout
+ * built against an unreleased Jx asks for the release.
+ */
+function installedRange(pkg: keyof typeof JX_MINIMUM, hold = false): string {
+  const minimum = hold ? JX_HOLD_MINIMUM[pkg] : JX_MINIMUM[pkg];
   for (let dir = import.meta.dir, last = ""; dir !== last; last = dir, dir = dirname(dir)) {
     const file = join(dir, "node_modules", pkg, "package.json");
     if (!existsSync(file)) continue;
     try {
       const version = (JSON.parse(readFileSync(file, "utf8")) as { version?: unknown }).version;
-      if (typeof version === "string" && /^\d+\.\d+\.\d+/.test(version)) return `^${version}`;
+      if (typeof version === "string" && /^\d+\.\d+\.\d+/.test(version))
+        return `^${older(version, minimum) ? minimum : version}`;
     } catch {
-      // A package.json that does not read is no version: the fallback stands.
+      // A package.json that does not read is no version: the minimum stands.
     }
   }
-  return fallback;
+  return `^${minimum}`;
 }
 
 /** An npm package name for a site: lower case letters, digits and hyphens. */
@@ -1461,9 +1533,13 @@ const packageName = (siteName: string): string =>
  * it). The versions are the ones this tool was run with. It is written once and never again: a
  * `package.json` is where a person adds what the site needs next.
  */
-export function projectPackageJson(siteName: string, hasCollections: boolean): string {
+export function projectPackageJson(
+  siteName: string,
+  hasCollections: boolean,
+  hold = false,
+): string {
   const dependencies = hasCollections
-    ? { "@jxsuite/parser": installedRange("@jxsuite/parser", "^1.8.2") }
+    ? { "@jxsuite/parser": installedRange("@jxsuite/parser", hold) }
     : undefined;
   return jsonText({
     name: packageName(siteName),
@@ -1473,8 +1549,8 @@ export function projectPackageJson(siteName: string, hasCollections: boolean): s
     scripts: { build: "jx build", dev: "jx dev", validate: "jx validate" },
     ...(dependencies === undefined ? {} : { dependencies }),
     devDependencies: {
-      "@jxsuite/compiler": installedRange("@jxsuite/compiler", "^4.0.2"),
-      "@jxsuite/runtime": installedRange("@jxsuite/runtime", "^4.0.2"),
+      "@jxsuite/compiler": installedRange("@jxsuite/compiler", hold),
+      "@jxsuite/runtime": installedRange("@jxsuite/runtime", hold),
     },
   });
 }
@@ -1724,6 +1800,17 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
   const writesNothing = opts.sink === undefined && opts.out === undefined;
 
   // ── Load ───────────────────────────────────────────────────────────────────────────────────────
+  // Entries a build holds back, only for a Jx that holds them (one without `hold` would publish them).
+  const holds = jxHolds();
+  const hold = opts.hold ?? holds;
+  if (hold && !holds) {
+    own.add({
+      severity: "warn",
+      code: "project.hold-unsupported",
+      message: `Unpublished entries are written to be held back, and the Jx this tool runs with has no \`hold\`: a build with it would publish them. The project's package.json asks for @jxsuite/parser ${JX_HOLD_MINIMUM["@jxsuite/parser"]} and @jxsuite/compiler ${JX_HOLD_MINIMUM["@jxsuite/compiler"]} at least.`,
+      where: "project.json",
+    });
+  }
   let site: SiteContext;
   /** Where the plugin's files come from, for the core block CSS to follow. */
   let pluginFrom = opts.pluginFrom === false ? undefined : opts.pluginFrom;
@@ -1754,6 +1841,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
         ...(pluginFrom === undefined ? {} : { pluginFrom }),
         ...(opts.componentPrefix === undefined ? {} : { componentPrefix: opts.componentPrefix }),
         ...(opts.routeTypes === undefined ? {} : { routeTypes: opts.routeTypes }),
+        ...(hold ? { held: HELD_STATUSES } : {}),
         ...(opts.report === undefined ? {} : { report: opts.report }),
         ...(opts.postTypes === undefined
           ? {}
@@ -1844,6 +1932,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
         classStyles: collectClassStyles([...components.files, ...templates.files, ...pages.files]),
         now,
         ...(opts.inlineGaps === undefined ? {} : { inlineGaps: opts.inlineGaps }),
+        ...(hold ? { hold } : {}),
       }),
     () => failedCollections(createReport()),
   );
@@ -2047,6 +2136,17 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
     }
   }
 
+  // WordPress's addresses of the pages after the first of a paged listing (`/essays/page/2/`) are the
+  // paged route's (`/essays/2/`): one wildcard rule per paged page, unless a rule of the site's own
+  // already answers there.
+  for (const page of [...pages.pages, ...templates.pages]) {
+    if (page.paged !== true) continue;
+    const { from, to } = pagedRedirect(page.route);
+    if (Object.hasOwn(redirects.redirects, from)) continue;
+    redirects.redirects[from] = to;
+    redirects.summary.wildcard++;
+  }
+
   // ── The files ──────────────────────────────────────────────────────────────────────────────────
   const files = new Map<string, string | Uint8Array>();
   const add = (path: string, content: string | Uint8Array, origin: string): void => {
@@ -2086,6 +2186,14 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
   for (const f of pages.files) add(f.path, f.content, "pages");
   for (const f of collections.files) add(f.path, f.content, "collections");
   if (design !== undefined) for (const f of design.files) add(f.path, f.content, "design system");
+  // The slider a query template became, once, where a document uses it (`emit/slider.ts`).
+  {
+    const tag = sliderTag(site);
+    const uses = `"tagName": ${JSON.stringify(tag)}`;
+    if ([...files.values()].some((c) => typeof c === "string" && c.includes(uses))) {
+      add(`components/${tag}.json`, jsonText(sliderComponent(tag)), "slider");
+    }
+  }
 
   // ── project.json ───────────────────────────────────────────────────────────────────────────────
   const head: JxHeadEntry[] = design === undefined ? [] : clone(design.head);
@@ -2259,8 +2367,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
       breakpoints: site.options.breakpoints,
       media: mediaOf,
       palette: [...site.options.globalStyles.colorRefs.values()],
-      baseLayout:
-        templates.base === null ? undefined : templates.base.replace(/^\.\//, ""),
+      baseLayout: templates.base === null ? undefined : templates.base.replace(/^\.\//, ""),
       protect: PROTECTED_CLASSES,
       report: own,
       serialize: jsonText,
@@ -2309,7 +2416,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
    */
   const seeds = new Map<string, string>([
     [".gitignore", GITIGNORE],
-    ["package.json", projectPackageJson(siteName, Object.keys(content).length > 0)],
+    ["package.json", projectPackageJson(siteName, Object.keys(content).length > 0, hold)],
   ]);
 
   checkReferences(files, own);

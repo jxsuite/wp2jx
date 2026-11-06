@@ -64,6 +64,9 @@ import {
   type MigrateOptions,
   type MigrationResult,
   type ProjectSink,
+  JX_HOLD_MINIMUM,
+  JX_MINIMUM,
+  jxHolds,
 } from "../../src/emit/project.ts";
 import { pilotForms } from "../helpers/fluentform-db.ts";
 import { CURRENT_PAGE_SCRIPT } from "../../src/emit/menus.ts";
@@ -2646,8 +2649,36 @@ describe("the live site as the default source", () => {
 // ── package.json ─────────────────────────────────────────────────────────────────────────────────
 
 describe("the project's package.json", () => {
-  const installed = (pkg: string): string =>
-    `^${(JSON.parse(readFileSync(join(import.meta.dir, "../../node_modules", pkg, "package.json"), "utf8")) as { version: string }).version}`;
+  /** The version installed beside the tool, never below the first release that holds what a project uses. */
+  const installed = (pkg: keyof typeof JX_MINIMUM): string => {
+    const version = (
+      JSON.parse(
+        readFileSync(join(import.meta.dir, "../../node_modules", pkg, "package.json"), "utf8"),
+      ) as { version: string }
+    ).version;
+    const minimum = JX_MINIMUM[pkg];
+    const [a, b] = [version, minimum].map((v) => v.split(".").map(Number));
+    const older = a!.findIndex((n, i) => n !== b![i]);
+    return `^${older >= 0 && a![older]! < b![older]! ? minimum : version}`;
+  };
+
+  test("the versions asked for are never below the first release with paged routes and the richer collections", () => {
+    expect(JX_MINIMUM).toEqual({
+      "@jxsuite/compiler": "8.1.0",
+      "@jxsuite/parser": "4.2.0",
+      "@jxsuite/runtime": "6.0.2",
+    });
+    const pkg = JSON.parse(projectPackageJson("x", true));
+    for (const [name, range] of [
+      ...Object.entries(pkg.dependencies as Record<string, string>),
+      ...Object.entries(pkg.devDependencies as Record<string, string>),
+    ]) {
+      const min = JX_MINIMUM[name as keyof typeof JX_MINIMUM].split(".").map(Number);
+      const got = range.slice(1).split(".").map(Number);
+      const i = got.findIndex((n, k) => n !== min[k]);
+      expect(i < 0 || got[i]! > min[i]!).toBe(true);
+    }
+  });
 
   test("the jx scripts, the compiler and runtime to build with, and the parser when there are collections", () => {
     const pkg = JSON.parse(projectPackageJson("Anabaptist Perspectives", true));
@@ -2682,7 +2713,10 @@ describe("the project's package.json", () => {
     const first = await migrateSite(opts);
     expect(first.files.written).toContain("package.json");
     const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-    expect(pkg.dependencies["@jxsuite/parser"]).toBe(installed("@jxsuite/parser"));
+    // a migration with the installed Jx holds entries back where it can, and then asks for a Jx that does
+    expect(pkg.dependencies["@jxsuite/parser"]).toBe(
+      jxHolds() ? `^${JX_HOLD_MINIMUM["@jxsuite/parser"]}` : installed("@jxsuite/parser"),
+    );
     pkg.dependencies.lodash = "^4.0.0";
     writeFileSync(join(dir, "package.json"), `${JSON.stringify(pkg, null, 2)}\n`);
     const second = await migrateSite(opts);
