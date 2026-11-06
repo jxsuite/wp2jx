@@ -11,6 +11,7 @@ import {
   buildCollections,
   type CollectionsOutput,
 } from "../../src/emit/collections.ts";
+import { readFileSync } from "node:fs";
 import { JX_HOLD_MINIMUM, jxHolds, projectPackageJson } from "../../src/emit/project.ts";
 import { HELD_STATUSES, buildRoutes, createUrlTools } from "../../src/routes.ts";
 import type { SiteContext } from "../../src/site.ts";
@@ -185,8 +186,12 @@ describe("the Jx a project with held entries asks for", () => {
     expect(pkg.devDependencies["@jxsuite/compiler"]).toBe(
       `^${JX_HOLD_MINIMUM["@jxsuite/compiler"]}`,
     );
-    // one that holds nothing asks for what it uses
+    expect(pkg.devDependencies["@jxsuite/runtime"]).toBe(`^${JX_HOLD_MINIMUM["@jxsuite/runtime"]}`);
+    // one that holds nothing asks for the release installed here
     const plain = JSON.parse(projectPackageJson("x", true));
-    expect(plain.dependencies["@jxsuite/parser"]).not.toBe(pkg.dependencies["@jxsuite/parser"]);
+    const installed = JSON.parse(
+      readFileSync(`${import.meta.dir}/../../node_modules/@jxsuite/parser/package.json`, "utf8"),
+    ).version;
+    expect(plain.dependencies["@jxsuite/parser"]).toBe(`^${installed}`);
   });
 });
