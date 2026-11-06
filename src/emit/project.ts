@@ -1465,13 +1465,12 @@ const older = (a: string, b: string): boolean => {
 /**
  * The first releases with a content type's `hold` rules (jxsuite/jx#548, `feat(content)`): a project
  * whose collections hold entries back asks for them, because a Jx without `hold` reads no rule and
- * publishes every entry. #548 was unreleased when this was written: these are the minor releases
- * release-please gives a `feat`, to be checked against the release when it ships.
+ * publishes every entry. The compiler that has it asks for runtime 6.1.
  */
 export const JX_HOLD_MINIMUM = {
   "@jxsuite/compiler": "8.2.0",
   "@jxsuite/parser": "4.3.0",
-  "@jxsuite/runtime": "6.0.2",
+  "@jxsuite/runtime": "6.1.0",
 } as const;
 
 /** The package.json of a package installed beside this tool, read from the nearest `node_modules`. */
