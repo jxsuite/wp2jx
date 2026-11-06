@@ -55,6 +55,7 @@ import {
   type TemplateRequest,
   type TemplatesOutput,
 } from "../../src/emit/templates.ts";
+import { pagedFile, pagedTitle } from "../../src/emit/paging.ts";
 import { convertSubject, type Converted } from "../../src/convert.ts";
 import { texturize } from "../../src/cwicly/tokens.ts";
 import { walkElements } from "../../src/placeholders.ts";
@@ -167,8 +168,22 @@ const slotsIn = (nodes: readonly JxNode[]): number =>
 const parse = (content: string): Record<string, unknown> =>
   JSON.parse(content) as Record<string, unknown>;
 
+/** A page's file as the route table names it, for a page that is paged (`pages/essays/[...page].json` is `pages/essays.json`). */
+const unpaged = (file: string): string =>
+  file === "pages/[...page].json"
+    ? "pages/index.json"
+    : file.replace(/\/\[\.\.\.page\]\.json$/, ".json");
+
+/** A title without what a paged page adds past its first page (`emit/paging.ts`, `pagedTitle`). */
+const bareTitle = (title: unknown): string => {
+  const t = String(title);
+  return t.endsWith(pagedTitle("")) ? t.slice(0, -pagedTitle("").length) : t;
+};
+
+/** A file by the path the route table names it: a paged page is found at its catch-all (`emit/paging.ts`). */
 const fileOf = (out: TemplatesOutput, path: string): string => {
-  const found = out.files.find((f) => f.path === path);
+  const found =
+    out.files.find((f) => f.path === path) ?? out.files.find((f) => f.path === pagedFile(path));
   if (!found) throw new Error(`no file ${path} in the output`);
   return found.content;
 };
@@ -1794,6 +1809,18 @@ describe("layoutFor", () => {
 // ── Pages ────────────────────────────────────────────────────────────────────────────────────────
 
 /** The page each route family is, and the template that renders it (the live pages' own, as observed above). */
+/** The pages written as paged routes (`emit/paging.ts`). */
+const PAGED: Record<SiteName, string[]> = {
+  fineline: ["pages/project_type/[slug]/[...page].json", "pages/projects/[...page].json"],
+  ap: [
+    "pages/category/[slug]/[...page].json",
+    "pages/essays/[...page].json",
+    "pages/essays/season/[slug]/[...page].json",
+    "pages/essays/series/[slug]/[...page].json",
+    "pages/tag/[slug]/[...page].json",
+  ],
+};
+
 const PAGES: Record<SiteName, Record<string, { kind: PageKind; template: string }>> = {
   fineline: {
     "pages/404.json": { kind: "404", template: "404" },
@@ -1868,15 +1895,25 @@ describe("the pages of the routes that are not pages", () => {
       test("one page per route family: the dynamic pages of the route table, the posts index, the archives, the 404 and the search", () => {
         const o = out(name);
         expect(
-          Object.fromEntries(o.pages.map((p) => [p.file, { kind: p.kind, template: p.template }])),
+          Object.fromEntries(
+            o.pages.map((p) => [unpaged(p.file), { kind: p.kind, template: p.template }]),
+          ),
         ).toEqual(PAGES[name]);
+        // the listings whose query is paged on the live site and is a collection are paged routes
+        expect(
+          o.pages
+            .filter((p) => p.paged)
+            .map((p) => p.file)
+            .sort(),
+        ).toEqual(PAGED[name]);
+        for (const p of o.pages) expect(p.file.endsWith("[...page].json")).toBe(p.paged === true);
         const dynamic = s()
           .routes.dynamicPages()
           .map((d) => d.file);
         for (const file of dynamic) expect(PAGES[name][file]).toBeDefined();
         for (const route of s().routes.all()) {
           if (route.kind === "posts-page" || route.kind === "post-archive") {
-            expect(o.pages.find((p) => p.file === route.file)?.route).toBe(route.jxRoute);
+            expect(o.pages.find((p) => unpaged(p.file) === route.file)?.route).toBe(route.jxRoute);
           }
         }
         expect(o.notFound).toBe("pages/404.json");
@@ -1961,7 +1998,9 @@ describe("the pages of the routes that are not pages", () => {
           .routes.dynamicPages()
           .filter((d) => d.kind === "terms")) {
           const doc = docOf(o, dp.file);
-          expect(doc.$paths).toEqual(dp.paths);
+          // a paged term page pages its list once per term: the route table's `$paths` are its `each`
+          const paths = doc.$paths as { each?: unknown };
+          expect(paths.each ?? paths).toEqual(dp.paths);
           const collection = (doc.state as Record<string, Record<string, string>>).term!
             .contentType!;
           expect(o.collections[collection]).toEqual({
@@ -2043,14 +2082,8 @@ describe("the pages of the routes that are not pages", () => {
         expect(docOf(o, "pages/search.json").title).toBe(
           `Search - ${s().model.site.name.replaceAll("&amp;", "&")}`,
         );
-        const e = o.report.entries().find((x) => x.code === "template.404-location")!;
-        expect(e.severity).toBe("warn");
-        expect(e.data).toEqual({
-          file: "pages/404.json",
-          built: "404/index.html",
-          hostsWant: "404.html",
-        });
-        expect(e.message).toContain("404.html");
+        // the build writes it to 404.html, the file a static host serves for a missing address
+        expect(o.report.entries().some((x) => x.code === "template.404-location")).toBe(false);
       });
 
       test("the posts index and the archives take Rank Math's title, as the committed live page prints it", () => {
@@ -2062,7 +2095,7 @@ describe("the pages of the routes that are not pages", () => {
         );
         const liveTitle = /<title>([^<]*)<\/title>/.exec(live)![1]!;
         // The committed page and the database are one snapshot: the title is the same character for character.
-        expect(String(docOf(o, posts.file).title)).toBe(liveTitle.replaceAll("&amp;", "&"));
+        expect(bareTitle(docOf(o, posts.file).title)).toBe(liveTitle.replaceAll("&amp;", "&"));
       });
 
       test("every title of a live page that is not a fixture is the title the data holds", () => {
@@ -2081,7 +2114,7 @@ describe("the pages of the routes that are not pages", () => {
         for (const row of LIVE_TITLES.filter(
           (t) => t.site === name && !t.term && t.page !== "pages/404.json",
         )) {
-          expect(docOf(o, row.page).title).toBe(titleOf(name, row.title));
+          expect(bareTitle(docOf(o, row.page).title)).toBe(titleOf(name, row.title));
         }
       });
 
@@ -3241,7 +3274,7 @@ describe("what a template can get wrong", () => {
     const report = createReport();
     const o = await buildTemplates(site("fineline"), { report, only: ["404"] });
     expect(o.report).toBe(report);
-    expect(report.entries().some((e) => e.code === "template.404-location")).toBe(true);
+    expect(report.entries().length).toBeGreaterThan(0);
   });
 
   test("the address the site will be served at is in the canonical and the image of an entry page", async () => {
@@ -3515,7 +3548,7 @@ describe("the built site", () => {
             ]).toEqual([route.jxRoute, true]);
           }
         }
-        expect(built(name).exists("404/index.html")).toBe(true);
+        expect(built(name).exists("404.html")).toBe(true);
         expect(built(name).exists("search/index.html")).toBe(true);
         expect(o.notFound).toBe("pages/404.json");
       });
@@ -3876,7 +3909,8 @@ describe("the first heading of a built archive page is the live one", () => {
   }
 
   test("fineline: the 404 page says what the live one says, and has the search form the template had", () => {
-    const doc = htmlOf("fineline", "/404/");
+    // the build writes the 404 to 404.html, the file a static host serves for a missing address
+    const doc = parseHtml(built("fineline").read("404.html"));
     expect(findAll(doc, (e) => e.tagName === "h1").flatMap(textsOf)[0]).toBe(
       "Grrr… can’t find that!",
     );
@@ -3892,9 +3926,9 @@ describe("the first heading of a built archive page is the live one", () => {
           .read("sitemap.xml")
           .matchAll(/<loc>([^<]*)<\/loc>/g),
       ].map((m) => m[1]!.replace(/^https?:\/\/[^/]+/, ""));
-      expect(locs.includes("/404")).toBe(false);
-      expect(locs.includes("/search")).toBe(false);
-      expect(locs.includes(name === "ap" ? "/essays" : "/blog")).toBe(true);
+      expect(locs.includes("/404/")).toBe(false);
+      expect(locs.includes("/search/")).toBe(false);
+      expect(locs.includes(name === "ap" ? "/essays/" : "/blog/")).toBe(true);
       expect(locs.length).toBeGreaterThan(50);
     }
   });
@@ -4166,7 +4200,7 @@ describe("fallback pages build", () => {
     });
     const project = await buildJxProject(files, { name: "templates-fallback", timeoutMs: 280_000 });
     expect((await validateJxProject(project.dir)).problems).toEqual([]);
-    const doc = parseHtml(project.html("/404/"));
+    const doc = parseHtml(project.read("404.html"));
     expect(findAll(doc, (e) => e.tagName === "main").length).toBe(1);
     expect(findAll(doc, (e) => e.tagName === "h1").flatMap(textsOf)).toEqual(["Page not found"]);
     // An entry: its title and its body, in the fallback layout.
@@ -4275,11 +4309,12 @@ describe("rules that cannot stay on an element", () => {
     expect(nested).toContain("& .cc-mdl[popover]");
   });
 
-  test("rules that have no component or page to live in are for the project: the keyframes and the tag rule of the data converter", () => {
+  test("rules that have no component or page to live in are for the project: the keyframes and the rules of the data converter", () => {
     const rules = out("ap").used.hoisted.map((r) => r.selector);
     expect(rules).toContain("@keyframes fade-in");
     expect(rules).toContain("@keyframes background-blur");
-    expect(rules).toContain("wp-query-pagination");
+    // the "Load more" device of the author page's list, which is not paged (its rules read the author)
+    expect(rules.some((r) => r.startsWith("#cc-more-cwicly__author_"))).toBe(true);
   });
 });
 
@@ -4751,7 +4786,8 @@ function danglingState(doc: Record<string, unknown>): string[] {
   const found = new Set<string>();
   for (const m of text.matchAll(/(?<![\w$.])state\.([A-Za-z_][\w]*)/g)) found.add(m[1]!);
   for (const m of text.matchAll(/#\/state\/([^/"]+)/g)) found.add(m[1]!);
-  return [...found].filter((key) => !declared.has(key)).sort();
+  // `$page` is the build's own (`$page.pagination` of a paged page), declared by no page
+  return [...found].filter((key) => !declared.has(key) && !key.startsWith("$")).sort();
 }
 
 describe("withoutResults takes with the results list what reads its state", () => {
@@ -5327,9 +5363,14 @@ describe("the term and author data of a site with no template", () => {
 describe("listings say what Jx does not have", () => {
   test("every listing page reports its missing pagination, and the report names the addresses that are lost", () => {
     for (const name of SITES) {
-      const listings = out(name).pages.filter((p) =>
-        ["posts", "archive", "term", "author", "search"].includes(p.kind),
+      // a paged listing pages its list instead (`paging.paged`)
+      const listings = out(name).pages.filter(
+        (p) => ["posts", "archive", "term", "author", "search"].includes(p.kind) && !p.paged,
       );
+      const paged = out(name)
+        .report.entries()
+        .filter((e) => e.code === "paging.paged");
+      expect(paged.length).toBe(out(name).pages.filter((p) => p.paged).length);
       const said = out(name)
         .report.entries()
         .filter((e) => e.code === "template.pagination");

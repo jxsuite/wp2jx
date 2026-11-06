@@ -2269,7 +2269,10 @@ describe("review: what the component cannot carry says so", () => {
     ]);
     const out = await buildComponents(site, { only: [ref] });
     const doc = docOf(out, "wp-rv-qry");
+    // its one project type is a rule a collection says, and still no collection: the build resolves
+    // none in a component's own state, and the list would be empty for every instance
     expect(JSON.stringify(doc)).not.toContain("const has =");
+    expect(JSON.stringify(doc)).not.toContain("ContentCollection");
     expect(doc.state).toBeUndefined();
     expect(codes(out.report)).not.toContain("component.binding-misplaced");
     expect(codes(out.report)).not.toContain("component.state-missing");

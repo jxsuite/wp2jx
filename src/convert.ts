@@ -42,6 +42,7 @@ import {
 import { finishNodes } from "./jx-util.ts";
 import { isUnregisteredBlock } from "./wp/block-registry.ts";
 import { lazyBlock } from "./cwicly/blocks/lazyblocks.ts";
+import type { PagingClaim } from "./cwicly/blocks/data.ts";
 import {
   INTERNAL_MARKERS,
   collectPlaceholders,
@@ -588,7 +589,8 @@ function stateRefs(value: unknown, into: Set<string>): void {
   for (const [key, inner] of Object.entries(value)) {
     if (key === "$ref" && typeof inner === "string") {
       const state = stateKeyOf(inner);
-      if (state !== undefined) into.add(state);
+      // `$page` is the build's own (a page's route and pagination), not an entry a page declares.
+      if (state !== undefined && !state.startsWith("$")) into.add(state);
     } else {
       stateRefs(inner, into);
     }
@@ -637,6 +639,12 @@ export interface Converted {
   };
   /** The page-level state entries converters registered through `ctx.defineState`, by key. */
   state: Record<string, unknown>;
+  /**
+   * The list the page is built in pages of (`SubjectOptions.pageable`): its state entry and page size.
+   * The nodes hold a pager bound to `$page.pagination`, so the page MUST be written as a paged route
+   * (`emit/paging.ts`).
+   */
+  paging?: PagingClaim;
   /** What this conversion could not carry over. */
   report: Report;
   /** The subject's own CSS index (see site.ts). */
@@ -665,7 +673,10 @@ export async function convertSubject(
   opts: SubjectOptions = {},
 ): Promise<Converted> {
   reportRegistry(site.report, await ensureConverters());
-  const session = await subjectSession(site, subject, overridesOf(opts));
+  const session = await subjectSession(site, subject, overridesOf(opts), {
+    ...(opts.pageable === undefined ? {} : { pageable: opts.pageable }),
+    ...(opts.termArchive === undefined ? {} : { termArchive: opts.termArchive }),
+  });
   const { ctx } = session;
   // What is wrong in the subject's own stylesheet is the conversion's finding, not the context's: a
   // context built only to read a block (a test's, an emitter's) starts with an empty report.
@@ -753,6 +764,7 @@ export async function convertSubject(
       states,
     },
     state: Object.fromEntries(session.state),
+    ...(session.paging === undefined ? {} : { paging: session.paging }),
     report: ctx.report,
     css: ctx.css,
   };

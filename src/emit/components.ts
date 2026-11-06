@@ -909,7 +909,7 @@ function dropElements(nodes: readonly JxNode[], drop: (element: JxElement) => bo
     } else if (isRec(children) && isRec(children.map)) {
       const [kept] = dropElements([children.map as JxNode], drop);
       if (kept === undefined) delete next.children;
-      else next.children = { ...children, map: kept };
+      else next.children = { ...(children as Rec), map: kept };
     }
     out.push(next as JxElement);
   }

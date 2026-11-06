@@ -132,6 +132,19 @@ export interface Route {
   aliases?: string[];
 }
 
+/**
+ * The statuses of a post that is not public yet or not to everyone, and that a project can hold
+ * back from its build: a draft, a post pending review, a scheduled post, a private one. A post in
+ * the trash, an auto-draft (the editor's empty placeholder) and a revision are none of these.
+ */
+export const HELD_STATUSES: readonly string[] = ["draft", "pending", "future", "private"];
+
+/** An entry route of a post that is not public, with the post's status. */
+export interface HeldRoute extends Route {
+  kind: "entry";
+  status: string;
+}
+
 /** The page file that renders a family of dynamic routes, and the `$paths` that generates them. */
 export interface DynamicPage {
   /** `pages/project/[slug].json`. */
@@ -161,6 +174,13 @@ export interface RouteTable {
   forArchive(key: string): Route | undefined;
   forAuthor(id: number): Route | undefined;
   dynamicPages(): readonly DynamicPage[];
+  /**
+   * The entries that are not public on the source site (a draft, a post pending review, a scheduled
+   * or a private one: `RouteOptions.held`), each where it will be once published. They are not in
+   * {@link all} nor found by any lookup, so nothing links, redirects or lists them as a page of the
+   * site; the collections emitter writes them as entries the build holds back.
+   */
+  held(): readonly HeldRoute[];
   /** Whether WordPress ended its URLs with a slash (the permalink structure does). */
   readonly trailingSlash: boolean;
 }
@@ -175,6 +195,12 @@ export interface RouteOptions {
   attachments?: boolean | undefined;
   /** Post statuses that have a public page. Default `["publish"]`. */
   statuses?: readonly string[] | undefined;
+  /**
+   * Post statuses of content entries that are routed as HELD ({@link RouteTable.held}): written as
+   * entries a project holds back from its build (`hold`, jxsuite/jx#548), listed apart from the
+   * public routes. Default: none.
+   */
+  held?: readonly string[] | undefined;
   /**
    * Post types registered in code, which ACF knows nothing about: the rewrite of each. Anything not
    * listed here and not an ACF type is reported and left out.
@@ -1597,6 +1623,7 @@ function makeTable(
     forArchive: (key) => archives.get(key),
     forAuthor: (id) => authors.get(id),
     dynamicPages: () => dynamic,
+    held: () => [],
     trailingSlash: plan.trailing,
   };
 }
@@ -1796,6 +1823,7 @@ export function buildRoutes(model: WpModel, acf: AcfModel, opts: RouteOptions = 
   const { winners, lost } = resolveCandidates(plan, candidates);
   const dynamic = buildDynamicPages(winners);
   const content = makeTable(plan, winners, dynamic, lost);
+  const held = heldRoutes(plan, content);
 
   // Attachment pages need the others' addresses (their parents, and Rank Math's fallback address).
   const address = siteAddress(model);
@@ -1809,7 +1837,7 @@ export function buildRoutes(model: WpModel, acf: AcfModel, opts: RouteOptions = 
     },
     attachments,
   );
-  if (attachments.length === 0) return content;
+  if (attachments.length === 0) return { ...content, held: () => held };
   const kept = [...winners];
   const claimed = new Map<string, Route>(winners.map((c) => [wpKey(c.route.wpPath), c.route]));
   const lostAttachments: Lost[] = [...lost];
@@ -1832,7 +1860,96 @@ export function buildRoutes(model: WpModel, acf: AcfModel, opts: RouteOptions = 
     claimed.set(key, att.route);
     kept.push(att);
   }
-  return makeTable(plan, kept, dynamic, lostAttachments);
+  return { ...makeTable(plan, kept, dynamic, lostAttachments), held: () => held };
+}
+
+/**
+ * The slug WordPress gives a post that has none when it is published (`wp_insert_post` runs the
+ * title through `sanitize_title`; a post with no title gets its id): accents folded, entities and
+ * tags dropped, lower case, anything but letters, digits and hyphens a hyphen.
+ */
+export function publishedSlug(post: Pick<WpPost, "id" | "slug" | "title">): string {
+  if (post.slug !== "") return post.slug;
+  const slug = post.title
+    .replace(/<[^>]*>/g, "")
+    .replace(/&[#\w]+;/g, "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s_-]/g, "")
+    .replace(/[\s_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug === "" ? String(post.id) : slug;
+}
+
+/**
+ * The routes of the entries that are not public (`RouteOptions.held`): each post where its permalink
+ * will be once published, computed as a public one's is. A post with no slug yet gets the one
+ * WordPress would give it ({@link publishedSlug}), and a slug a post of the same type already has
+ * gets WordPress's `-2`, `-3` (`wp_unique_post_slug`), so a held entry never takes a public entry's
+ * file. One that still meets another's file or address is left out, and said.
+ */
+function heldRoutes(plan: Plan, table: RouteTable): HeldRoute[] {
+  const statuses = new Set(plan.options.held ?? []);
+  if (statuses.size === 0) return [];
+  const taken = new Map<string, Set<string>>();
+  const slugsOf = (type: string): Set<string> => {
+    let set = taken.get(type);
+    if (!set) {
+      set = new Set(
+        [...plan.model.posts.values()]
+          .filter((p) => p.type === type && plan.statuses.has(p.status) && p.slug !== "")
+          .map((p) => p.slug),
+      );
+      taken.set(type, set);
+    }
+    return set;
+  };
+  const posts = new Map<number, WpPost>();
+  const ordered = [...plan.model.posts.values()]
+    .filter((p) => statuses.has(p.status))
+    .sort((a, b) => a.id - b.id);
+  for (const post of ordered) {
+    const own = slugsOf(post.type);
+    const base = publishedSlug(post);
+    let slug = base;
+    for (let n = 2; own.has(slug); n++) slug = `${base}-${n}`;
+    own.add(slug);
+    posts.set(post.id, slug === post.slug ? post : { ...post, slug });
+  }
+  const heldPlan: Plan = {
+    ...plan,
+    model: { ...plan.model, posts },
+    statuses,
+  };
+  const found: Candidate[] = [];
+  collectEntries(heldPlan, found, {
+    byTypeStatus: new Map(),
+    unregistered: new Map(),
+    inactive: new Map(),
+    private: new Map(),
+  });
+  const files = new Set(table.all().map((r) => r.file));
+  const out: HeldRoute[] = [];
+  for (const cand of found.sort(compareCandidates)) {
+    const route = cand.route;
+    const post = posts.get(Number(route.id));
+    if (route.kind !== "entry" || post === undefined) continue;
+    const owner = table.byWpPath(route.wpPath);
+    if (files.has(route.file) || owner !== undefined) {
+      plan.report?.add({
+        severity: "warn",
+        code: "route.held-collision",
+        message: `The ${post.status} ${post.type} would be at ${route.jxRoute}, which ${owner ? `the ${owner.kind} ${whereOf(owner)} has` : "another entry's file is"}; it is not written as a held entry.`,
+        where: `post:${post.id}`,
+        data: { status: post.status, file: route.file },
+      });
+      continue;
+    }
+    files.add(route.file);
+    out.push({ ...route, kind: "entry", status: post.status });
+  }
+  return out;
 }
 
 // ── URL tools ────────────────────────────────────────────────────────────────────────────────────
