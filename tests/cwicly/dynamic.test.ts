@@ -6,6 +6,7 @@
  * every text and image block of both sites both ways (the saved markup through `tokens.ts`, the
  * attributes through `dynamic.ts`) and compare what each prints. The live pages stand behind both.
  */
+import { withFormulas } from "../helpers/formulas.ts";
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse, parseFragment } from "parse5";
@@ -82,7 +83,7 @@ function evalTemplate(template: string, state: unknown, map: unknown = undefined
     s: unknown,
     m: unknown,
   ) => string;
-  return fn(state, map);
+  return fn(withFormulas(state), map);
 }
 
 const shown = (markup: string): string =>
@@ -482,7 +483,7 @@ describe("blockText", () => {
     // The fallback is static text, which WordPress prints through wptexturize.
     // A value of `0` is empty to Cwicly (`if ($field)`), so it falls back too.
     expect(spec?.value).toBe(
-      `\${(((t) => t == '0' ? '' : t ?? '')(state.entry.data.${key})) || 'Don’t Wait, Take Action Now!'}`,
+      `\${state.orBlank(state.entry.data.${key}) || 'Don’t Wait, Take Action Now!'}`,
     );
     expect(evalTemplate(spec?.value ?? "", { entry: { data: { [key]: "0" } } })).toBe(
       "Don’t Wait, Take Action Now!",
@@ -695,7 +696,7 @@ describe("blockContent", () => {
     });
     // A binding next to an element whose boundary would show a gap keeps the text raw.
     const gap = blockContent(block("cwicly/heading", { content: "<b>x</b>{title}" }), entry);
-    expect(gap).toEqual({ innerHTML: expect.stringContaining("<b>x</b>${String(") });
+    expect(gap).toEqual({ innerHTML: "<b>x</b>${state.escapeHtml(state.entry.data.title)}" });
   });
 });
 
@@ -809,10 +810,10 @@ describe("blockImage", () => {
     );
     const spec = blockImage(img, ctx);
     expect(spec).toEqual({
-      src: "${(state.entry.data.featuredImage?.src ?? '') || ''}",
+      src: "${state.entry.data.featuredImage?.src || ''}",
       alt: "${state.entry.data.featuredImage?.alt ?? ''}",
-      width: "${(state.entry.data.featuredImage?.width ?? '') || false}",
-      height: "${(state.entry.data.featuredImage?.height ?? '') || false}",
+      width: "${state.entry.data.featuredImage?.width || false}",
+      height: "${state.entry.data.featuredImage?.height || false}",
       bound: true,
     });
     const have = {
@@ -879,7 +880,7 @@ describe("blockImage", () => {
       }),
       ctx,
     );
-    expect(spec?.src).toBe(`\${(state.entry.data.featuredImage?.src ?? '') || '${src}'}`);
+    expect(spec?.src).toBe(`\${state.entry.data.featuredImage?.src || '${src}'}`);
     expect(evalTemplate(spec?.src ?? "", { entry: { data: {} } })).toBe(src);
   });
 
@@ -897,7 +898,7 @@ describe("blockImage", () => {
     const spec = blockImage(single, ctx);
     const old = loaded.media.mediaFor(2163)?.alt as string;
     expect(old).toBeTruthy();
-    expect(spec?.alt).toBe(`\${(state.entry.data.featuredImage?.alt ?? '') || ${jsLiteral(old)}}`);
+    expect(spec?.alt).toBe(`\${state.entry.data.featuredImage?.alt || ${jsLiteral(old)}}`);
     expect(
       evalTemplate(spec?.alt ?? "", { entry: { data: { featuredImage: { alt: "Own alt" } } } }),
     ).toBe("Own alt");

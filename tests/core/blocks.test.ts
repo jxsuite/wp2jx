@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { withFormulas } from "../helpers/formulas.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { serializeJxMarkdown } from "@jxsuite/parser/serialize";
@@ -162,6 +163,8 @@ const plainText = (n: P5): string =>
       : n.tagName === "br"
         ? " "
         : (n.childNodes ?? []).map(plainText).join("");
+/** Elements whose text the Markdown reader gives back inside a paragraph. */
+const PARAGRAPH_HOSTS = new Set(["li", "td", "th"]);
 /** A content element's own text: what is in it that is not in a content element below it. */
 function ownText(n: P5): string {
   let out = "";
@@ -169,8 +172,9 @@ function ownText(n: P5): string {
     if (c.nodeName === "#text") out += c.value;
     else if (c.tagName === "br") out += " ";
     else if (c.tagName === undefined) continue;
-    // A Markdown list item holds its text in a paragraph: it is the item's own text.
-    else if (n.tagName === "li" && c.tagName === "p") out += `${ownText(c)} `;
+    // A Markdown list item holds its text in a paragraph, and so does the cell of a table written as
+    // directives (one with no header row, since @jxsuite/parser 4): it is the item's or cell's own text.
+    else if (PARAGRAPH_HOSTS.has(n.tagName) && c.tagName === "p") out += `${ownText(c)} `;
     else if (CONTENT.has(c.tagName)) continue;
     else if (hasContentBelow(c)) out += ownText(c);
     else out += plainText(c);
@@ -216,7 +220,7 @@ export function signatures(root: P5, origins: readonly string[]): string[] {
     if (
       n.tagName !== undefined &&
       CONTENT.has(n.tagName) &&
-      !(n.tagName === "p" && n.parentNode?.tagName === "li")
+      !(n.tagName === "p" && PARAGRAPH_HOSTS.has(n.parentNode?.tagName))
     ) {
       const links: string[] = [];
       const collect = (x: P5): void => {
@@ -1971,7 +1975,7 @@ describe("dynamic blocks: an entry template binds to the entry", () => {
     );
     expect(r.html).toContain(`src="\${state.entry.data.featuredImage?.src ?? ''}"`);
     expect(r.html).toContain(
-      `<time datetime="\${state.entry.data.date ?? ''}">\${state.entry.data.date ? new Date(state.entry.data.date).toLocaleDateString('en-US'`,
+      `<time datetime="\${state.entry.data.date ?? ''}">\${state.formatDate(state.entry.data.date, {"year":"numeric"`,
     );
     expect(r.html).toContain(`\${state.entry.data.excerpt ?? ''}`);
     expect(r.html).toContain(`state.entry.data.terms?.["post_tag"]`);
@@ -2011,7 +2015,7 @@ describe("dynamic blocks: an entry template binds to the entry", () => {
   test("the site's date format and time zone are the default", async () => {
     const r = await entry(`<!-- wp:post-date /-->`);
     expect(r.html).toContain(
-      `toLocaleDateString('en-US', {"year":"numeric","month":"long","day":"numeric","timeZone":"America/New_York"})`,
+      `\${state.formatDate(state.entry.data.date, {"year":"numeric","month":"long","day":"numeric","timeZone":"America/New_York"})}`,
     );
   });
 
@@ -2036,7 +2040,7 @@ describe("dynamic blocks: an entry template binds to the entry", () => {
   test("the body of an entry is hidden when the entry has none, as WordPress prints no box for an empty one", async () => {
     const r = await entry(`<!-- wp:post-content /-->`);
     const div = firstEl(r.nodes);
-    expect(div.attributes).toEqual({ hidden: "${!((state.entry.$children?.length ?? 0) > 0)}" });
+    expect(div.attributes).toEqual({ hidden: "${!state.entry.$children?.length}" });
     expect(div.style).toEqual({ "&[hidden]": { display: "none !important" } });
     expect(div.children as unknown).toBe("${state.entry.$children}");
   });
@@ -2150,7 +2154,9 @@ describe("footnotes", () => {
       `<sup class="fn" data-fn="${id}"><a id="${id}-link" href="#${id}">1</a></sup>`,
     );
     expect(back).toContain(`<ol class="wp-block-footnotes"><li id="${id}">`);
-    expect(back).toContain(`<a href="#${id}-link">↩︎</a>`);
+    // The serializer writes a link with an attribute a Markdown link has no place for as a directive
+    // (@jxsuite/parser 4), so the back link is still named for a screen reader.
+    expect(back).toContain(`<a href="#${id}-link" aria-label="Jump to footnote reference 1">↩︎</a>`);
     expect(squash(back.replace(/<[^>]+>/g, ""))).toContain(
       "This phrase is taken from The Divine Conspiracy by Dallas Willard.",
     );
@@ -3097,7 +3103,7 @@ describe("Markdown entries: what the serializer cannot write is put right or rep
 function evalBinding(template: string, state: Record<string, unknown>): string {
   const m = /^\$\{([\s\S]*)\}$/.exec(template);
   if (!m) throw new Error(`not one template: ${template}`);
-  return String(new Function("state", `return (${m[1]})`)(state));
+  return String(new Function("state", `return (${m[1]})`)(withFormulas(state)));
 }
 
 /** An entry-mode context whose options say something else than the site's. */

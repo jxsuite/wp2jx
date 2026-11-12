@@ -174,6 +174,7 @@ import {
   type Ref,
 } from "../tokens.ts";
 import { blockVisibility, type Visibility } from "../conditions.ts";
+import { formulaFunctions } from "../../formulas.ts";
 import { joinClass } from "../../jx-util.ts";
 import { walkElements } from "../../placeholders.ts";
 import { sliderProps } from "../../emit/slider.ts";
@@ -2216,22 +2217,49 @@ const hasLoopRefs = (value: unknown): boolean =>
     ? value.some(hasLoopRefs)
     : "$prototype" in value || "$ref" in value || Object.values(value).some(hasLoopRefs));
 
-/** The value of a binding that reads the row alone, or `undefined` when it reads anything else (a name the build knows and this does not) or fails. */
-function rowValue(expr: string, row: unknown, index: number): { value: unknown } | undefined {
+/**
+ * The `state` a binding of a row may read here: the converter's formulas, and nothing of a page. A
+ * read of anything else throws, so the binding is left for the build, which has the page's state.
+ * `language` is the locale the pages are in, which `formatDate` writes a date in.
+ */
+const rowState = (language: string): object =>
+  new Proxy(formulaFunctions({ $page: { locale: language } }), {
+    get(formulas, key, receiver): unknown {
+      // Its own names only: `state.constructor` is the page's to answer, not `Object`'s.
+      if (!Object.hasOwn(formulas, key)) throw new ReferenceError("not a formula");
+      return Reflect.get(formulas, key, receiver);
+    },
+  });
+
+/** One row of a list whose rows are known: the row, where it stands, and the `state` its bindings may read. */
+interface Row {
+  item: unknown;
+  index: number;
+  state: object;
+}
+
+/**
+ * The value of a binding that reads the row alone (through a formula or not), or `undefined` when it
+ * reads anything else (a name the build knows and this does not) or fails.
+ */
+function rowValue(expr: string, row: Row): { value: unknown } | undefined {
   try {
-    return { value: new Function("$map", `return (${expr});`)({ item: row, index }) };
+    return {
+      value: new Function("$map", "state", `return (${expr});`)(
+        { item: row.item, index: row.index },
+        row.state,
+      ),
+    };
   } catch {
     return undefined;
   }
 }
 
 /** A string of the item for one row: each binding of the row replaced by its value, any other left as it is. */
-function rowString(text: string, row: unknown, index: number): unknown {
+function rowString(text: string, row: Row): unknown {
   if (!text.includes("${")) return text;
   const parts = bindingParts(text);
-  const values = parts.map((p) =>
-    p.expr === undefined ? undefined : rowValue(p.expr, row, index),
-  );
+  const values = parts.map((p) => (p.expr === undefined ? undefined : rowValue(p.expr, row)));
   const only = parts[0]!;
   if (parts.length === 1 && only.expr !== undefined) {
     const v = values[0];
@@ -2248,21 +2276,27 @@ function rowString(text: string, row: unknown, index: number): unknown {
     .join("");
 }
 
-function rowNode(value: unknown, row: unknown, index: number): unknown {
-  if (typeof value === "string") return rowString(value, row, index);
-  if (Array.isArray(value)) return value.map((v) => rowNode(v, row, index));
+function rowNode(value: unknown, row: Row): unknown {
+  if (typeof value === "string") return rowString(value, row);
+  if (Array.isArray(value)) return value.map((v) => rowNode(v, row));
   if (value !== null && typeof value === "object")
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rowNode(v, row, index)]));
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rowNode(v, row)]));
   return value;
 }
 
 /**
  * The item once per row, with the row's values written in: the children of a list whose rows are known
  * and that must not be a `$ref` (a component's), or `undefined` when the item holds a loop of its own.
+ * `language` is the site's, for a date a formula writes.
  */
-export function writtenOut(item: JxElement, rows: readonly unknown[]): JxNode[] | undefined {
+export function writtenOut(
+  item: JxElement,
+  rows: readonly unknown[],
+  language = "en-US",
+): JxNode[] | undefined {
   if (hasLoopRefs(item)) return undefined;
-  return rows.map((row, index) => rowNode(item, row, index) as JxNode);
+  const state = rowState(language);
+  return rows.map((row, index) => rowNode(item, { item: row, index, state }) as JxNode);
 }
 
 /** The children of a loop's element: the mapped array over a pointer, or the computed children that write each item of an expression's list. */
@@ -3025,7 +3059,7 @@ const queryTemplate: BlockConverter = (block, ctx) =>
         const built = item(ctx.convert(inner, itemContext(loop)));
         sayHidden(ctx, block, loop.source, built);
         const items =
-          (loop.rows !== undefined && writtenOut(built, loop.rows)) ||
+          (loop.rows !== undefined && writtenOut(built, loop.rows, ctx.model.site.language)) ||
           loopChildren(loop.source, built);
         return {
           tag: "div",

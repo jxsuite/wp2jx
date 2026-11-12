@@ -6,6 +6,7 @@
  * ways: for a static page the answer is known (the block is `omit`ted or has no condition left), for an
  * entry template it is a binding, and for what no static site can say it is dropped and reported.
  */
+import { withFormulas } from "../helpers/formulas.ts";
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse } from "parse5";
@@ -75,7 +76,7 @@ function evalTemplate(template: string, state: unknown): string {
     s: unknown,
     m: unknown,
   ) => string;
-  return fn(state, undefined);
+  return fn(withFormulas(state), undefined);
 }
 
 /** Whether the block is hidden for the data, by evaluating the binding as the build would. */
@@ -128,7 +129,7 @@ describe("an ACF field empty or not", () => {
     const name = info?.field.name as string;
     const v = blockVisibility(section, ctx);
     expect(v).toEqual({
-      hidden: `\${!(((v) => !!v && v != '0' && !(Array.isArray(v) && !v.length))(state.entry.data.${name}))}`,
+      hidden: `\${!state.notEmpty(state.entry.data.${name})}`,
       hiddenStyle: HIDDEN_STYLE,
       dropped: [],
     });

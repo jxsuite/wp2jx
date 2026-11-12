@@ -24,6 +24,7 @@ import { loadavg } from "node:os";
 import { join } from "node:path";
 import { cssPropertyName } from "@jxsuite/runtime/css";
 import { validateDocument } from "@jxsuite/schema";
+import type { JsonValue } from "@jxsuite/schema/types";
 import {
   CSS_ARTIFACT,
   cssRules,
@@ -967,7 +968,9 @@ for (const site of FIXTURE_SITES) {
       expect(report.entries().filter((entry) => entry.severity === "error")).toEqual([]);
 
       const validated = performance.now();
-      const verdict = await validateDocument({ tagName: "div", children: nodes });
+      // The validator takes JSON, so it is handed the document as a page file would hold it.
+      const written: JsonValue = JSON.parse(JSON.stringify({ tagName: "div", children: nodes }));
+      const verdict = await validateDocument(written);
       f.ms["validate"] = performance.now() - validated;
       expect(verdict.errors ?? []).toEqual([]);
       expect(verdict.valid).toBe(true);

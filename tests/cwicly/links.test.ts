@@ -5,6 +5,7 @@
  * its saved markup (where the editor wrote the same destination as a token, resolved by tokens.ts), and
  * the two must agree. The live pages stand behind both.
  */
+import { withFormulas } from "../helpers/formulas.ts";
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse, parseFragment } from "parse5";
@@ -69,7 +70,7 @@ function evalTemplate(template: string, state: unknown, map: unknown = undefined
     s: unknown,
     m: unknown,
   ) => string;
-  return fn(state, map);
+  return fn(withFormulas(state), map);
 }
 
 const walkN = (n: N, f: (n: N) => void): void => {

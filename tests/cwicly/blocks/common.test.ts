@@ -7,6 +7,7 @@
  * modal opener, a hook with no element) are hand-made blocks, named as such. What decides how the
  * result behaves in a page is checked by building it with Jx.
  */
+import { withFormulas } from "../../helpers/formulas.ts";
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { parseFragment } from "parse5";
 import { allSubjects, loadSite, makeCtx, subjectBlocks } from "../../helpers/ctx.ts";
@@ -864,7 +865,7 @@ describe("assemble: visibility", () => {
     const env = prepare(b, ctx)!;
     expect(env.visibility.hidden).toBeDefined();
     const node = el(assemble(env, { children: [] }).nodes[0]);
-    expect(String(node.attributes?.hidden)).toStartWith("${!(");
+    expect(String(node.attributes?.hidden)).toBe("${!state.notEmpty(state.entry.data.about)}");
     expect(node.style).toMatchObject({ "&[hidden]": { display: "none !important" } });
   });
 
@@ -1686,7 +1687,7 @@ describe("paragraphValue", () => {
   /** What the binding prints for a value, as the build evaluates it. */
   const printed = (binding: string, state: unknown): unknown =>
     new Function("state", `return \`${binding.replace(/^\$\{/, "${").replaceAll("`", "\\`")}\`;`)(
-      state,
+      withFormulas(state),
     );
 
   test("a paragraph's last closing tag is left to the box that holds it", () => {

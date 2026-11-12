@@ -11,7 +11,8 @@
  * 2. **The design system** (`emit/design-system.ts`) over the site's global CSS, **the compatibility
  *    stylesheet** (the plugin's own CSS and the theme's `style.css`, linked first in `$head`), and the
  *    **core block CSS** of exactly the WordPress classes the converted markup carries.
- * 3. **`project.json`**: `name`, `url`, `defaults {layout, lang}`, `$media`, `style`, `$head`, `content`,
+ * 3. **`project.json`**: `name`, `url`, `defaults {layout, lang}`, `$media`, `state` (the named formulas
+ *    the documents call, `src/formulas.ts`), `style`, `$head`, `content`,
  *    `redirects`, `extensions`, `images` (only for a site with more than {@link HEAVY_IMAGE_COUNT}
  *    images, or when the caller gives one) and `build`.
  * 4. **Media** (`media.ts`): the files the converted content actually asked for, and the local fonts.
@@ -119,7 +120,17 @@ import {
   type SiteContext,
   type Subject,
 } from "../site.ts";
+import { evaluateExpression } from "@jxsuite/runtime/expression";
 import type { JxHeadEntry } from "@jxsuite/schema/types";
+import {
+  ALL_FORMULAS,
+  FORMULAS,
+  formulaState,
+  formulasUsed,
+  lowerFormulasIn,
+  type FormulaEntry,
+  type FormulaName,
+} from "../formulas.ts";
 import type { JxStyle, Report, ReportEntry, Severity, Sink, WpBlock } from "../types.ts";
 import { walkBlocks } from "../wp/blocks.ts";
 import { openDb } from "../wp/db.ts";
@@ -299,6 +310,15 @@ export interface MigrateOptions {
    * ({@link jxHolds}); without it they are left out, because a Jx without `hold` would publish them.
    */
   hold?: boolean;
+  /**
+   * Write a value that is read from a path and formatted as a call of a named formula
+   * (`${state.formatDate(state.entry.data.date, {…})}`, `src/formulas.ts`), which Jx Studio opens as a
+   * field with a format, and put the formulas in `project.json`'s `state`. `false` writes every one as
+   * the JavaScript it stands for; `true` writes every one as a call, whatever Jx is installed.
+   * Default: the formulas the Jx this tool runs with evaluates at build while the page stays free of
+   * JavaScript ({@link jxFormulas}), and JavaScript for the rest (`project.formulas-lowered`).
+   */
+  formulas?: boolean;
   /** Drop the compatibility stylesheet's rules for classes no converted markup carries. Default false. */
   pruneCompat?: boolean;
   inlineGaps?: "report" | "innerHTML";
@@ -1497,6 +1517,117 @@ export function jxHolds(): boolean {
   }
 }
 
+/** A call of each formula that its definition must be able to answer at build, with what it answers. */
+const FORMULA_PROBES: Readonly<Record<FormulaName, [Record<string, unknown>, unknown]>> = {
+  formatDate: [
+    { value: "2024-02-15T17:30:00Z", options: { year: "numeric", timeZone: "UTC" } },
+    "2024",
+  ],
+  notEmpty: [{ value: [] }, false],
+  orBlank: [{ value: "0" }, ""],
+  escapeHtml: [{ text: "<" }, "&lt;"],
+};
+
+let formulasKnown: ReadonlySet<FormulaName> | undefined;
+
+/**
+ * The formulas (`src/formulas.ts`) the Jx this tool runs with lets a static page call: two things
+ * have to hold, and both are asked of the installed packages, not of a version number.
+ *
+ * 1. **The build drops a formula nothing reads any more.** A formula lives in `project.json`'s `state`,
+ *    which every page inherits. A compiler that keeps it on a page whose calls it has all evaluated
+ *    makes that page a client page (`app.js`, the runtime), and with it every page of the site,
+ *    whether it calls a formula or not. The compiler that drops it says so in its site build
+ *    (`isPureNamedFormula`).
+ * 2. **The build can evaluate the formula.** Its definition is run once here by the interpreter the
+ *    build uses, with no `window`, as the build runs it. A formula that calls a global the
+ *    interpreter looks up on `window` (`notEmpty` calls `Array.isArray`) throws there, and its
+ *    binding would be left for the browser.
+ *
+ * A formula that is not in the answer is written as the JavaScript it stands for, so the project
+ * builds the same pages either way.
+ */
+export function jxFormulas(): ReadonlySet<FormulaName> {
+  if (formulasKnown !== undefined) return formulasKnown;
+  const able = new Set<FormulaName>();
+  const build = installedFile("@jxsuite/compiler", "src/site/site-build.ts");
+  let drops = false;
+  try {
+    drops = build !== undefined && readFileSync(build, "utf8").includes("isPureNamedFormula");
+  } catch {
+    // A site build that does not read is one that is not known to drop a formula.
+  }
+  if (drops) {
+    for (const name of ALL_FORMULAS) {
+      const [args, expected] = FORMULA_PROBES[name];
+      try {
+        const got: unknown = evaluateExpression(
+          FORMULAS[name].$expression as Parameters<typeof evaluateExpression>[0],
+          {},
+          null,
+          { args } as NonNullable<Parameters<typeof evaluateExpression>[3]>,
+        );
+        if (got === expected) able.add(name);
+      } catch {
+        // The interpreter cannot answer: the formula stays JavaScript.
+      }
+    }
+  }
+  formulasKnown = able;
+  return able;
+}
+
+/**
+ * The documents of a project with their formulas settled, and the `state` `project.json` holds for
+ * them. A call of a formula in `supported` stays a call wherever the project's `state` is the
+ * document's own (a page, a layout); every other call is written as the JavaScript it stands for
+ * ({@link lowerFormulasIn}): any call in a component, whose `state` is its own and holds no formula of
+ * the project, and a call of a formula the build cannot be trusted with. `documents` maps a path to
+ * its JSON text; only the ones that changed are returned. `language` is the project's `lang`, which a
+ * date written out in a component is formatted in (a component's state has no page to ask).
+ */
+export function settleFormulas(
+  documents: Iterable<readonly [string, string]>,
+  supported: ReadonlySet<FormulaName>,
+  language?: string,
+): {
+  changed: Map<string, string>;
+  state: Record<string, FormulaEntry> | undefined;
+  lowered: FormulaName[];
+} {
+  const changed = new Map<string, string>();
+  const kept: string[] = [];
+  const lowered = new Set<FormulaName>();
+  for (const [path, text] of documents) {
+    if (!path.endsWith(".json")) continue;
+    const used = formulasUsed([text]);
+    if (used.length === 0) continue;
+    const names = new Set(
+      path.startsWith("components/") ? used : used.filter((name) => !supported.has(name)),
+    );
+    if (names.size === 0) {
+      kept.push(text);
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // Not a document: nothing in it is a binding.
+      continue;
+    }
+    for (const name of names) lowered.add(name);
+    const next = jsonText(lowerFormulasIn(parsed, names, language));
+    changed.set(path, next);
+    kept.push(next);
+  }
+  return {
+    changed,
+    state: formulaState(kept),
+    lowered: [...ALL_FORMULAS].filter((name) => lowered.has(name)),
+  };
+}
+
 /**
  * The version of a package installed beside this tool (a project is built with what it was tested
  * with), as a caret range, and never below the first release that holds what the project uses
@@ -2194,6 +2325,30 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
     }
   }
 
+  // The formulas the documents call (`src/formulas.ts`): the ones the build can be trusted with stay
+  // calls and go into project.json's `state`, once each; the rest are written out as JavaScript.
+  const formulas = settleFormulas(
+    [...files].filter((f): f is [string, string] => typeof f[1] === "string"),
+    opts.formulas === undefined ? jxFormulas() : opts.formulas ? ALL_FORMULAS : new Set(),
+    model.site.language,
+  );
+  for (const [path, text] of formulas.changed) files.set(path, text);
+  {
+    const held = new Set<FormulaName>(
+      opts.formulas === undefined ? [...ALL_FORMULAS].filter((n) => !jxFormulas().has(n)) : [],
+    );
+    const missing = formulas.lowered.filter((name) => held.has(name));
+    if (missing.length > 0) {
+      own.add({
+        severity: "info",
+        code: "project.formulas-lowered",
+        message: `The bindings that format a value (${missing.map((n) => `state.${n}`).join(", ")}) are written as JavaScript expressions, not as calls of named formulas, because the Jx this tool runs with would not build them into static pages: it either keeps a formula of project.json's \`state\` on every page (which makes every page load the client runtime) or cannot evaluate the formula at build. The pages are the same; in Jx Studio these bindings open as custom expressions instead of fields with a format. Convert again with a newer Jx, or with --formulas to write the calls anyway.`,
+        where: "project.json",
+        data: { formulas: missing },
+      });
+    }
+  }
+
   // ── project.json ───────────────────────────────────────────────────────────────────────────────
   const head: JxHeadEntry[] = design === undefined ? [] : clone(design.head);
   // The `@import`s of the pages', templates' and components' own stylesheets (a block that picks a
@@ -2401,6 +2556,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
     ...(Object.keys(defaults).length > 0 ? { defaults } : {}),
     $media: design?.media ?? site.options.media,
     ...(Object.keys(content).length > 0 ? { extensions: ["@jxsuite/parser"], content } : {}),
+    ...(formulas.state === undefined ? {} : { state: formulas.state }),
     style: composed.style,
     ...(head.length > 0 ? { $head: head } : {}),
     ...(Object.keys(redirects.redirects).length > 0 ? { redirects: redirects.redirects } : {}),

@@ -9,6 +9,7 @@
  * (`jx build` of a project made from the converted nodes and the entries of the model).
  */
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { FORMULAS } from "../../../src/formulas.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "parse5";
@@ -3718,7 +3719,10 @@ describe("every data block of both sites", () => {
         for (const e of inlines) {
           const expr = (e.children as string[])[0]!;
           for (const m of expr.matchAll(/\bstate\.([A-Za-z_]\w*)/g)) {
-            expect(m[1]! in out.state || ["entry", "term"].includes(m[1]!)).toBe(true);
+            // (or a formula of the project's, which `project.json` holds for every page)
+            expect(
+              m[1]! in out.state || ["entry", "term"].includes(m[1]!) || m[1]! in FORMULAS,
+            ).toBe(true);
           }
           expect(expr).not.toContain("$map");
         }

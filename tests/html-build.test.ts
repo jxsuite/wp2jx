@@ -989,19 +989,23 @@ describe("a literal ${ survives the build", () => {
   const body = (html: string): string =>
     html.slice(html.indexOf("<body>"), html.indexOf("</body>"));
 
-  test("Jx has no escape for one in text or an attribute, which is why html.ts needs innerHTML", async () => {
+  test("Jx has an escape for one in an element's textContent and nowhere else, which is why html.ts needs innerHTML", async () => {
     const tries: JxNode[] = [
       { tagName: "p", textContent: "a ${b} c" },
       { tagName: "p", textContent: "a \\${b} c" },
       { tagName: "p", textContent: "a &#36;{b} c" },
       { tagName: "p", attributes: { title: "a ${'x'} c" }, textContent: "evaluated" },
       { tagName: "p", attributes: { title: "a &#36;{b} c" }, textContent: "entity" },
+      { tagName: "p", children: ["a \\${b} c ", { tagName: "em", textContent: "child" }] },
     ];
     const site = await buildJxProject(page(...tries));
     const html = body(site.html("/"));
     // Evaluated or left for the client (and then evaluated again, in the browser, as undefined).
     expect(html).toContain(`<p data-bind :text-content="_t0"></p>`);
-    expect(html).toContain(`<p data-bind :text-content="_t1"></p>`);
+    // A backslash before it is honoured in `textContent` (@jxsuite/compiler 8; before it this was a
+    // second binding left for the client), and printed with the text when the text is a child.
+    expect(html).toContain("<p>a &#36;{b} c</p>");
+    expect(html).toMatch(/<p>a \\\$\{b\} c\s+<em>child<\/em><\/p>/);
     // The entity is escaped a second time and shown as text.
     expect(html).toContain("<p>a &amp;#36;{b} c</p>");
     expect(html).toContain(`<p title="a x c">evaluated</p>`);
