@@ -3,6 +3,7 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { camelToKebab, cssPropertyName } from "@jxsuite/runtime/css";
 import { validateDocument } from "@jxsuite/schema";
+import type { JsonValue } from "@jxsuite/schema/types";
 import { parse as parseBlocks } from "@wordpress/block-serialization-default-parser";
 import postcss from "postcss";
 import {
@@ -338,7 +339,9 @@ describe("shape of every parsed style, over the whole corpus", () => {
       for (const style of merged.other.values()) children.push({ tagName: "div", style });
     }
     expect(children.length).toBeGreaterThan(1500);
-    const verdict = await validateDocument({ tagName: "div", children });
+    // The validator takes JSON, so it is handed the document as a page file would hold it.
+    const written: JsonValue = JSON.parse(JSON.stringify({ tagName: "div", children }));
+    const verdict = await validateDocument(written);
     expect(verdict.valid).toBe(false);
     const errors = (verdict.errors ?? []) as { instancePath: string }[];
     expect(errors.length).toBeGreaterThan(0);

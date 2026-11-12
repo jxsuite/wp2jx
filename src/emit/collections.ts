@@ -116,8 +116,10 @@
  *   caption, a table cell, a `div`. The paragraph is made here, so the tree written is the tree read.
  * - **The first row of a Markdown table is a header row, a cell has no spans, attributes or blocks.**
  *   A table that is not exactly that (no `thead`, a class, a span) is written as directives, which carry
- *   all of it; so is a list with a class on it or on an item (a Markdown item inside a directive reads
- *   back as a list in a list), an image with attributes a Markdown image has no place for (width,
+ *   all of it (the serializer of `@jxsuite/parser` 4 decides the same for a table; {@link tableIsNative}
+ *   says which it will be, because a cell written as a directive reads back with a paragraph); so is
+ *   a list with a class on it or on an item (a Markdown item inside a directive reads back as a list
+ *   in a list), an image with attributes a Markdown image has no place for (width,
  *   height, a class), a link with no address, and a block inside a link (the serializer writes the
  *   content of a link, emphasis, paragraph or heading as one line, whatever it is).
  * - **An inline element alone in a container that is a directive** (the image in a `figure`) is a
@@ -432,7 +434,13 @@ export const emptyNotes = (): BodyNotes => ({
   addressSpaces: 0,
 });
 
-/** The Jx build evaluates `${…}` in every text of an entry, however it is spelled; a zero-width space between the two characters ends that. */
+/**
+ * The Jx build evaluates `${…}` in an entry's data, attributes, classes and component properties,
+ * however it is spelled; a zero-width space between the two characters ends that. The reader makes the
+ * text of a body inert itself (`@jxsuite/parser` 4, `inert.ts`), by putting a `span` around a text
+ * that has siblings, which the build then separates from them with a space: the body's text is
+ * spelled the same way as the rest, and no element is made.
+ */
 export const degradeTemplate = (text: string): string => text.replaceAll("${", "$\u200b{");
 
 /**

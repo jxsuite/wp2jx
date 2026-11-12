@@ -11,6 +11,7 @@
  *
  * Report codes: `lazyblock.recipe` (info, once per block name: which recipe the PHP was taken for).
  */
+import { notOf } from "../../formulas.ts";
 import { htmlToNodes } from "../../html.ts";
 import { targetOf } from "../../core/static.ts";
 import type { ConvertCtx, JxElement, JxNode, WpBlock } from "../../types.ts";
@@ -166,7 +167,7 @@ export function lazyBlock(block: WpBlock, ctx: ConvertCtx): JxNode[] | undefined
     fillNodes(nodes, values, present !== undefined && "expr" in present ? present.expr : undefined);
     for (const node of nodes) {
       if (typeof node !== "string" && present !== undefined && "expr" in present) {
-        node.attributes = { ...node.attributes, hidden: `\${!(${present.expr})}` };
+        node.attributes = { ...node.attributes, hidden: `\${${notOf(present.expr)}}` };
         node.style = { ...node.style, ...HIDDEN_STYLE };
       }
       children.push(node);

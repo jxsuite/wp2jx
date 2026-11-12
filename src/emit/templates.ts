@@ -1298,7 +1298,7 @@ export function slotContent(nodes: readonly JxNode[]): { nodes: JxNode[]; found:
 }
 
 /** `core/post-content` hides its box when the entry has no body (`state.entry.$children` empty). */
-const EMPTY_BODY = /^\$\{!\(\(state\.entry\.\$children\?\.length \?\? 0\) > 0\)\}$/;
+const EMPTY_BODY = /^\$\{!state\.entry\.\$children\?\.length\}$/;
 
 /**
  * A layout's slot is filled by the page, which has a body of its own: the entry that hiding reads

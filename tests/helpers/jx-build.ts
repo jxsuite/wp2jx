@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { jxFormulas, settleFormulas } from "../../src/emit/project.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
 export const JX_BIN = join(ROOT, "node_modules/.bin/jx");
@@ -36,6 +37,11 @@ export interface BuildOptions {
   args?: string[];
   /** Write the project but do not build it (for `validateJxProject`). */
   build?: boolean;
+  /**
+   * `false` writes the files as given: a call of a named formula stays a call, whatever the
+   * installed Jx makes of it. Default: the calls are settled as the migration settles them.
+   */
+  settle?: boolean;
   /** Return a failed build instead of throwing; `code` and `stderr` say what happened. */
   allowFailure?: boolean;
   /** Kill the build after this long. Default 60 s. */
@@ -105,10 +111,40 @@ const toBytes = (content: ProjectFile): string | Uint8Array =>
     ? content
     : JSON.stringify(content, null, 2);
 
+/**
+ * The files with their formulas settled the way the migration settles them (`settleFormulas`,
+ * `src/emit/project.ts`): what a converter wrote as a call of a named formula stays a call where the
+ * installed Jx builds it into a static page, with the formula in `project.json`'s `state`, and is the
+ * JavaScript it stands for anywhere else. A test that builds a converter's output builds what a
+ * migrated project holds, whichever Jx is installed.
+ */
+function settled(files: Record<string, ProjectFile>): Record<string, ProjectFile> {
+  const texts = Object.entries(files).flatMap(([path, content]): [string, string][] =>
+    content instanceof Uint8Array ? [] : [[path, toBytes(content) as string]],
+  );
+  const given = files["project.json"];
+  const lang = (
+    (typeof given === "string" ? JSON.parse(given) : given) as
+      | { defaults?: { lang?: string } }
+      | undefined
+  )?.defaults?.lang;
+  const { changed, state } = settleFormulas(texts, jxFormulas(), lang);
+  if (changed.size === 0 && state === undefined) return files;
+  const out: Record<string, ProjectFile> = { ...files, ...Object.fromEntries(changed) };
+  if (state !== undefined) {
+    const project = out["project.json"];
+    const config = (typeof project === "string" ? JSON.parse(project) : project) as {
+      state?: Record<string, unknown>;
+    };
+    out["project.json"] = { ...config, state: { ...state, ...config.state } };
+  }
+  return out;
+}
+
 /** Write a project's files into a new directory under `.dev/tmp/` and return its path. */
 export function writeJxProject(
   files: Record<string, ProjectFile>,
-  options: { name?: string } = {},
+  options: { name?: string; settle?: boolean } = {},
 ): string {
   mkdirSync(TMP_ROOT, { recursive: true });
   const dir = mkdtempSync(join(TMP_ROOT, `${options.name ?? "p"}-`));
@@ -117,10 +153,11 @@ export function writeJxProject(
     hooked = true;
     process.once("exit", cleanupJxProjects);
   }
-  const all: Record<string, ProjectFile> = {
+  const given: Record<string, ProjectFile> = {
     "project.json": { name: "wp2jx-test", url: "https://example.com" },
     ...files,
   };
+  const all = options.settle === false ? given : settled(given);
   for (const [path, content] of Object.entries(all)) {
     const target = resolve(dir, path);
     if (target !== dir && !target.startsWith(dir + sep))
@@ -170,7 +207,10 @@ export async function buildJxProject(
   files: Record<string, ProjectFile>,
   options: BuildOptions = {},
 ): Promise<BuiltProject> {
-  const dir = writeJxProject(files, options.name === undefined ? {} : { name: options.name });
+  const dir = writeJxProject(files, {
+    ...(options.name === undefined ? {} : { name: options.name }),
+    ...(options.settle === undefined ? {} : { settle: options.settle }),
+  });
   const dist = join(dir, "dist");
   const run: JxRun =
     options.build === false

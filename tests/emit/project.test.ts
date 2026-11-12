@@ -7,6 +7,7 @@
  * The units (paths, sinks, secrets, the merged report, the style order, the owner's decisions) are
  * checked on their own first, with hand-made inputs where a fixture has no case for them.
  */
+import { ALL_FORMULAS, FORMULAS, formulasUsed, lowerFormulasIn } from "../../src/formulas.ts";
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   existsSync,
@@ -66,6 +67,7 @@ import {
   type ProjectSink,
   JX_HOLD_MINIMUM,
   JX_MINIMUM,
+  jxFormulas,
   jxHolds,
 } from "../../src/emit/project.ts";
 import { pilotForms } from "../helpers/fluentform-db.ts";
@@ -1388,6 +1390,80 @@ describe("the palette's names", () => {
     expect(project.style["--cc-color-1"]).toBeUndefined();
     expect(text.some((content) => content.includes("var(--color-1)"))).toBe(true);
     expect(result.report.filter((x) => x.code === "project.color-variable-collision")).toEqual([]);
+  });
+});
+
+describe("named formulas", () => {
+  const CALL = /state\.(formatDate|notEmpty|orBlank|escapeHtml)\(/;
+  const run = async (
+    formulas?: boolean,
+  ): Promise<{
+    files: Map<string, string>;
+    codes: string[];
+    state: Record<string, unknown> | undefined;
+  }> => {
+    const sink = memorySink();
+    const result = await migrateSite({
+      ...(await optionsFor("fineline", { postTypes: NARROW })),
+      sink,
+      ...(formulas === undefined ? {} : { formulas }),
+    });
+    const files = new Map(
+      [...sink.files].filter(
+        (f): f is [string, string] =>
+          typeof f[1] === "string" &&
+          f[0].endsWith(".json") &&
+          !f[0].startsWith("migration-report") &&
+          f[0] !== MANIFEST_PATH,
+      ),
+    );
+    const project = JSON.parse(files.get("project.json") as string) as {
+      state?: Record<string, unknown>;
+    };
+    return { files, codes: result.report.map((x) => x.code), state: project.state };
+  };
+  const documents = (files: Map<string, string>): [string, string][] =>
+    [...files].filter(([path]) => path !== "project.json");
+
+  test("the calls the pages and layouts make are in project.json's state, once each; a component's are written out; and nothing else differs", async () => {
+    const on = await run(true);
+    const off = await run(false);
+    const auto = await run();
+    // Asked for: every call of a page or a layout stays, and the project holds exactly those formulas.
+    const kept = documents(on.files).filter(([path]) => !path.startsWith("components/"));
+    const used = formulasUsed(kept.map(([, text]) => text));
+    expect(used.length).toBeGreaterThan(0);
+    expect(Object.keys(on.state ?? {})).toEqual(used);
+    for (const name of used) expect(on.state?.[name]).toEqual(FORMULAS[name]);
+    expect(on.codes).not.toContain("project.formulas-lowered");
+    // A component's state is its own: no call is left in one, whatever was asked.
+    for (const run of [on, off, auto]) {
+      for (const [path, text] of documents(run.files)) {
+        if (path.startsWith("components/")) expect([path, CALL.test(text)]).toEqual([path, false]);
+      }
+    }
+    // Refused: no call anywhere, no state, and nothing to say about it.
+    expect(off.state).toBeUndefined();
+    for (const [path, text] of documents(off.files)) {
+      expect([path, CALL.test(text)]).toEqual([path, false]);
+    }
+    expect(off.codes).not.toContain("project.formulas-lowered");
+    // By default: the formulas the installed Jx builds into a static page, and a line in the
+    // report when one a page calls is not among them.
+    const trusted = used.filter((name) => jxFormulas().has(name));
+    expect(Object.keys(auto.state ?? {})).toEqual(trusted);
+    expect(auto.codes.includes("project.formulas-lowered")).toBe(trusted.length < used.length);
+    // The three projects are the same documents: with every call written out they are equal.
+    expect([...on.files.keys()]).toEqual([...off.files.keys()]);
+    for (const [path, text] of documents(on.files)) {
+      const lowered = lowerFormulasIn(JSON.parse(text) as unknown, ALL_FORMULAS);
+      expect([path, lowered]).toEqual([path, JSON.parse(off.files.get(path) as string) as unknown]);
+      const mixed = lowerFormulasIn(
+        JSON.parse(auto.files.get(path) as string) as unknown,
+        ALL_FORMULAS,
+      );
+      expect([path, mixed]).toEqual([path, lowered]);
+    }
   });
 });
 

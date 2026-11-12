@@ -291,6 +291,20 @@ describe("parseConvertArgs", () => {
     }
   });
 
+  test("--formulas and --no-formulas say how a formatted value is written; neither leaves it to the installed Jx", () => {
+    const base = ["--db", "sqlite:/x.sqlite", "--out", "o", "--css-from", FL_CSS];
+    const parse = (...extra: string[]) => {
+      const parsed = parseConvertArgs([...base, ...extra], capture({}, "/work").io);
+      if (parsed === "help") throw new Error("not help");
+      return parsed.options;
+    };
+    expect(parse("--formulas").formulas).toBe(true);
+    expect(parse("--no-formulas").formulas).toBe(false);
+    expect(parse()).not.toHaveProperty("formulas");
+    expect(() => parse("--formulas", "--no-formulas")).toThrow("say opposite things");
+    expect(HELP).toContain("--formulas, --no-formulas");
+  });
+
   test("--css-cache-absent-ttl is hours of belief in a remembered 404, 0 for none, and needs the cache it applies to", () => {
     const base = ["--db", "sqlite:/x.sqlite", "--out", "o", "--css-from", "https://live.test"];
     const parse = (...extra: string[]) => {

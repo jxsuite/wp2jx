@@ -17,6 +17,7 @@
  *    built and must say the same thing;
  * 5. the Markdown target, and building and validating everything.
  */
+import { withFormulas } from "../../helpers/formulas.ts";
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse } from "parse5";
@@ -1251,7 +1252,7 @@ describe("image", () => {
       entryType: "project",
     });
     const img = el(nodes[0]);
-    expect(String(attrsOf(img).src)).toMatch(/^\$\{\(.*\) \|\| ''\}$/);
+    expect(String(attrsOf(img).src)).toBe("${state.entry.data.featuredImage?.src || ''}");
     expect(String(attrsOf(img).alt)).toContain("state.entry.data");
   });
 
@@ -1346,7 +1347,7 @@ const exprOf = (binding: unknown): string => {
 };
 
 const evaluate = (expr: string, state: unknown): unknown =>
-  (new Function("state", `return (${expr});`) as (s: unknown) => unknown)(state);
+  (new Function("state", `return (${expr});`) as (s: unknown) => unknown)(withFormulas(state));
 
 describe("video", () => {
   test("a YouTube video is the iframe the page printed in its cc-iframe-container, inside the cc-vid box", async () => {

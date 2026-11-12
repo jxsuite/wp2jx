@@ -8,6 +8,7 @@
  * - the build: everything written is validated and built with the installed `jx`, and the header and
  *   footer of the built pages are held against the live ones.
  */
+import { FORMULAS } from "../../src/formulas.ts";
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { posix } from "node:path";
@@ -2451,7 +2452,7 @@ describe("slotContent", () => {
   });
 
   test("the slot is not hidden for an empty entry: the page that fills it has a body of its own", () => {
-    const hiding = "${!((state.entry.$children?.length ?? 0) > 0)}";
+    const hiding = "${!state.entry.$children?.length}";
     const box = () =>
       el("div", {
         className: "box",
@@ -2681,9 +2682,7 @@ describe("the breadcrumb", () => {
   test("a crumb that is an expression is escaped by its expression, and a literal dollar-brace in text cannot be read as a binding", () => {
     const nav = breadcrumbNode([{ expr: "state.entry.data.title ?? ''" }, { text: "${danger}" }]);
     const html = String(((nav.children as JxElement[])[0] as JxElement).innerHTML);
-    expect(html).toContain(
-      "<span class=\"last\">${String((state.entry.data.title ?? '') ?? '').replace(",
-    );
+    expect(html).toContain('<span class="last">${state.escapeHtml(state.entry.data.title)}</span>');
     expect(html).toContain("&#36;{danger}");
     expect(html).not.toContain("${danger}");
   });
@@ -4786,8 +4785,11 @@ function danglingState(doc: Record<string, unknown>): string[] {
   const found = new Set<string>();
   for (const m of text.matchAll(/(?<![\w$.])state\.([A-Za-z_][\w]*)/g)) found.add(m[1]!);
   for (const m of text.matchAll(/#\/state\/([^/"]+)/g)) found.add(m[1]!);
-  // `$page` is the build's own (`$page.pagination` of a paged page), declared by no page
-  return [...found].filter((key) => !declared.has(key) && !key.startsWith("$")).sort();
+  // `$page` is the build's own (`$page.pagination` of a paged page), declared by no page, and a
+  // formula is the project's (`project.json`'s `state`, which every page inherits)
+  return [...found]
+    .filter((key) => !declared.has(key) && !key.startsWith("$") && !(key in FORMULAS))
+    .sort();
 }
 
 describe("withoutResults takes with the results list what reads its state", () => {

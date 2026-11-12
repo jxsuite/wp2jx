@@ -25,7 +25,7 @@ import postcss from "postcss";
 import type { AtRule, Container, Declaration, Rule } from "postcss";
 import selectorParser from "postcss-selector-parser";
 import { projectStyles } from "../../src/cwicly/css.ts";
-import type { Breakpoint, CssIndex } from "../../src/types.ts";
+import type { Breakpoint, CssIndex, JxStyle } from "../../src/types.ts";
 
 /** selector → context (`""` or `@media (max-width: 992px)`, nested contexts joined by ` | `) → property → value. */
 export type CanonicalRules = Record<string, Record<string, Record<string, string>>>;
@@ -551,7 +551,7 @@ export function renderCascade(index: CssIndex, breakpoints: readonly Breakpoint[
  * Statement and declaration at-rules have no project-style spelling here and are left out.
  */
 export function renderProjectStyle(index: CssIndex, breakpoints: readonly Breakpoint[]): string {
-  const style: Record<string, unknown> = {};
+  const style: JxStyle = {};
   for (const [name, entry] of index.classes) style[classSelector(name)] = entry.style;
   for (const [selector, other] of index.other) style[selector] = other;
   return buildSiteStyleCSS(style, mediaQueriesFor(breakpoints), (value) => value);

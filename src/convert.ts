@@ -732,7 +732,7 @@ export async function convertSubject(
       ctx,
       "error",
       "convert.marker-leaked",
-      `The internal marker <${marker}> is still in the converted nodes (${count}); the inner block it stood for is missing.`,
+      `The internal marker <${marker}> is still in the converted nodes (${count}); what it stood for (an inner block, a list's pager) is missing.`,
       {
         marker,
         count,

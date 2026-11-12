@@ -17,6 +17,7 @@ import Ajv2020 from "ajv/dist/2020";
 import addFormats from "ajv-formats";
 import { parse } from "parse5";
 import { transpileJxMarkdown } from "@jxsuite/parser";
+import { buildProjectExtensionRegistry } from "@jxsuite/compiler/format-host";
 import { loadContentSection } from "@jxsuite/parser/content-loader";
 import { Markdown } from "@jxsuite/parser/markdown";
 import { serializeJxMarkdown } from "@jxsuite/parser/serialize";
@@ -522,9 +523,17 @@ describe("what the serializer and reader do to a body, and what the module does 
     expect(a.md).toContain("| A ");
     expect(a.fit.notes.tables).toBe(0);
 
-    // Without the module the first row of a table with no header becomes one and a span is gone.
-    expect(raw([noHeader]).diff.length).toBeGreaterThan(0);
-    expect(JSON.stringify(raw([span]).back)).not.toContain("colspan");
+    // The serializer writes such a table as directives itself (@jxsuite/parser 4; before it, the first
+    // row of a table with no header became one and a span was gone). What the module still does is
+    // know it: the text of each cell reads back as a paragraph, which the tree it was written from lacks.
+    for (const t of [noHeader, span]) {
+      const control = raw([t]);
+      expect(control.md).toContain(":::table");
+      expect(control.diff.length).toBeGreaterThan(0);
+      expect(JSON.stringify(control.back)).toContain('{"tagName":"p","textContent":');
+    }
+    expect(JSON.stringify(raw([noHeader]).back)).not.toContain("thead");
+    expect(JSON.stringify(raw([span]).back)).toContain('"colspan":"2"');
 
     for (const t of [noHeader, span, classed, uneven, blocky]) {
       const mine = roundTrip([t]);
@@ -669,11 +678,16 @@ describe("what the serializer and reader do to a body, and what the module does 
     expect(native.diff).toEqual([]);
     expect(native.fit.notes.alone).toBe(0);
     expect(native.fit.notes.wrapped).toEqual({ li: 1, root: 1 });
-    // Without the module the figure's image comes back inside a paragraph.
-    const control = raw([{ tagName: "figure", children: [img] }]);
-    expect(
-      (control.back[0] as { children: { tagName: string }[] }).children.map((c) => c.tagName),
-    ).toEqual(["p"]);
+    // The serializer writes an image alone in a figure as a directive itself (@jxsuite/parser 4).
+    // Every other inline element alone there still comes back inside a paragraph without the module.
+    const tagsIn = (nodes: N[]): string[] =>
+      (nodes[0] as { children: { tagName: string }[] }).children.map((c) => c.tagName);
+    expect(tagsIn(raw([{ tagName: "figure", children: [img] }]).back)).toEqual(["img"]);
+    expect(tagsIn(raw([{ tagName: "figure", children: [link(img)] }]).back)).toEqual(["p"]);
+    expect(tagsIn(raw([{ tagName: "figure", children: [t("strong", "s")] }]).back)).toEqual(["p"]);
+    const strong = roundTrip([{ tagName: "figure", children: [t("strong", "s")] }]);
+    expect(strong.diff).toEqual([]);
+    expect(tagsIn(strong.back)).toEqual(["strong"]);
   });
 
   test("a component instance: className and id are attributes for the reader, its style moves to a rule of its class, its properties are strings", () => {
@@ -1245,9 +1259,10 @@ describe("the Jx build of synthetic bodies, against the same bodies written with
     expect(await articleHtml("colons")).not.toMatch(/<\d/);
   });
 
-  test("a literal dollar-brace prints literally; written as it is, the build evaluates it", async () => {
+  test("a literal dollar-brace prints literally, and so it does written as it is: the reader makes the text of a body inert", async () => {
     expect(await articleText("template")).toBe("costs $\u200b{state.entry.data.slug} here");
-    expect(await articleText("raw-template")).toBe("costs raw-template here");
+    // @jxsuite/parser 4 (`inert.ts`); before it the build evaluated this to "costs raw-template here".
+    expect(await articleText("raw-template")).toBe("costs ${state.entry.data.slug} here");
   });
 
   test("the gap the build writes between inline siblings is the one inlineGaps counts; innerHTML paragraphs have none", async () => {
@@ -1293,8 +1308,10 @@ describe("the Jx build of synthetic bodies, against the same bodies written with
     expect(html).toMatch(
       /<img[^>]*src="\/media\/a\.jpg"[^>]*width="40"[^>]*height="30"|<img[^>]*width="40"[^>]*src="\/media\/a\.jpg"/,
     );
+    // Without the module the span is on the page too (@jxsuite/parser 4 writes the table as
+    // directives itself); the list is still a list in a list.
     const control = await articleHtml("raw-structure");
-    expect(control).not.toContain("colspan");
+    expect(control).toMatch(/<td colspan="2">/);
     expect(control).toContain('<ul class="wp-list"><ul>');
   });
 });
@@ -1346,19 +1363,8 @@ const reportOf = (out: CollectionsOutput, code: string) =>
 async function loadWithJx(site: SiteContext, out: CollectionsOutput) {
   const { writeJxProject } = await import("../helpers/jx-build.ts");
   const dir = writeJxProject(projectFiles(site, out), { name: "loader" });
-  const format = {
-    name: "Markdown",
-    remote: false,
-    capabilities: { discover: true },
-    call: (capability: string, ...args: unknown[]): unknown =>
-      capability === "discover"
-        ? Markdown.discover(...(args as [string, { baseDir?: string }]))
-        : Markdown.load(...(args as [string, never])),
-  };
-  const registry = {
-    byName: (n: string) => (n === "Markdown" ? format : undefined),
-    byExtension: () => format,
-  };
+  const project = { extensions: ["@jxsuite/parser"], content: out.collections };
+  const registry = await buildProjectExtensionRegistry(dir, project as never);
   const warnings: string[] = [];
   const warn = console.warn;
   console.warn = (...a: unknown[]): void => void warnings.push(a.join(" "));
@@ -1366,10 +1372,8 @@ async function loadWithJx(site: SiteContext, out: CollectionsOutput) {
     const loaded = await loadContentSection(
       out.collections as never,
       dir,
-      registry as never,
-      {
-        content: out.collections,
-      } as never,
+      registry.formats,
+      project as never,
     );
     return { loaded, warnings };
   } finally {
@@ -3235,7 +3239,7 @@ describe("what the module depends on in the parser and in the pipeline around it
         ),
       ) as { version: string }
     ).version;
-    expect(version).toMatch(/^1\./);
+    expect(version).toMatch(/^4\./);
   });
 
   test("a body element that has a mapped list for its children is left out of the entry, and said", async () => {
