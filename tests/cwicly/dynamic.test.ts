@@ -27,7 +27,14 @@ import {
   galleryIds,
   galleryMarkup,
 } from "../../src/cwicly/dynamic.ts";
-import { findTokens, postData, resolveTokens, termData } from "../../src/cwicly/tokens.ts";
+import {
+  derivedFieldsOf,
+  derivedValues,
+  findTokens,
+  postData,
+  resolveTokens,
+  termData,
+} from "../../src/cwicly/tokens.ts";
 
 setDefaultTimeout(120_000);
 
@@ -439,9 +446,13 @@ describe("blockText", () => {
     const bound = blockText(para, entry);
     expect(bound?.kind).toBe("html");
     expect(bound?.value).toContain("… Read More");
-    expect(
-      evalTemplate(bound?.value ?? "", { entry: { data: { excerpt: "<p>One two three</p>" } } }),
-    ).toBe("One two three… Read More");
+    // The cut is a field the collections module writes beside the excerpt (`excerpt75`).
+    expect(bound?.value).toContain("state.entry.data.excerpt75");
+    const data = { excerpt: "<p>One two three</p>" };
+    const written = { ...data, ...derivedValues(derivedFieldsOf(entry.model, "entry"), data) };
+    expect(evalTemplate(bound?.value ?? "", { entry: { data: written } })).toBe(
+      "One two three… Read More",
+    );
   });
 
   test("a term archive's title with the text in front", async () => {

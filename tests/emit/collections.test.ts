@@ -53,6 +53,7 @@ import {
   tableIsNative,
   treeDiff,
   verifyFile,
+  withDerivedFields,
   writeBody,
   type CollectionsOptions,
   type CollectionsOutput,
@@ -65,7 +66,13 @@ import { createReport } from "../../src/report.ts";
 import { acfValues, postTarget } from "../../src/wp/acf.ts";
 import { buildRoutes, createUrlTools } from "../../src/routes.ts";
 import { subjectCtx, type SiteContext } from "../../src/site.ts";
-import { postData } from "../../src/cwicly/tokens.ts";
+import {
+  deriveField,
+  excerptField,
+  limitExcerpt,
+  personTextField,
+  postData,
+} from "../../src/cwicly/tokens.ts";
 import { setUserProfiles } from "../../src/wp/profiles.ts";
 import { AUDIO_PHP } from "../wp/lazyblocks.test.ts";
 import { decodeEntities as decodeEntitiesOf } from "../../src/wp/model.ts";
@@ -3231,6 +3238,7 @@ describe("what the module depends on in the parser and in the pipeline around it
     const [off] = (await Markdown.load(file, {} as never)) as unknown as { $children: N[] }[];
     expect(JSON.stringify(off!.$children)).not.toContain('"tagName":"div"');
     // The version this was verified against: a new major is a reason to read specs/parser.md again.
+    // 5.0.0 changed only the Studio modes in Markdown.class.json (Preview was removed from Studio).
     const version = (
       JSON.parse(
         readFileSync(
@@ -3239,7 +3247,7 @@ describe("what the module depends on in the parser and in the pipeline around it
         ),
       ) as { version: string }
     ).version;
-    expect(version).toMatch(/^4\./);
+    expect(version).toMatch(/^5\./);
   });
 
   test("a body element that has a mapped list for its children is left out of the entry, and said", async () => {
@@ -3653,5 +3661,103 @@ describe("ap: the people and the players a post's templates read", () => {
       } else expect(e.frontmatter.captivate).toBeUndefined();
     }
     expect(carried).toBeGreaterThan(5);
+  });
+});
+
+describe("fields derived from another field", () => {
+  test("an entry carries the derived fields the documents read, computed from what it stores, and its collection's schema names them", async () => {
+    const site = await loadSite("ap");
+    // A model of its own: the derivations the documents of a conversion read are kept per model.
+    const model = { ...site.model };
+    const bio = (name: string): string => `${name} &amp; the &quot;Way&quot;\n\nSecond`;
+    setUserProfiles(
+      model,
+      new Map(
+        [201, 226].map((id) => [
+          id,
+          {
+            id,
+            slug: site.model.users.get(id)?.slug ?? `u${id}`,
+            displayName: site.model.users.get(id)?.displayName ?? `U${id}`,
+            meta: { bio: bio(String(id)) },
+            roles: [],
+          },
+        ]),
+      ),
+    );
+    const own: SiteContext = { ...site, model };
+    // An essay whose excerpt is longer than the cut, and an episode with a guest and a host.
+    const ids = [731, 11212];
+    const include = (p: WpPost): boolean => ids.includes(p.id);
+    const before = await buildCollections(own, { now: NOW, include });
+    expect(before.entries).toHaveLength(2);
+    for (const e of before.entries) expect(e.frontmatter.excerpt250).toBeUndefined();
+    expect(JSON.stringify(before.entries.map((e) => e.frontmatter))).not.toContain("bioText");
+
+    // What the documents converted before the entries asked for.
+    deriveField(own, "entry", excerptField(250));
+    deriveField(own, "person", personTextField("bio"));
+    const out = await buildCollections(own, { now: NOW, include });
+    const essay = out.entries.find((e) => e.postId === 731)!;
+    const excerpt = String(essay.frontmatter.excerpt);
+    expect(new TextEncoder().encode(excerpt).length).toBeGreaterThan(250);
+    expect(essay.frontmatter.excerpt250).toBe(limitExcerpt(excerpt, 250));
+    expect(new TextEncoder().encode(String(essay.frontmatter.excerpt250)).length).toBeLessThan(251);
+    const episode = out.entries.find((e) => e.postId === 11212)!.frontmatter as Record<
+      string,
+      unknown
+    >;
+    const guest = (episode.guest as Record<string, unknown>[])[0]!;
+    const host = episode.host as Record<string, unknown>;
+    expect(guest.bio).toBe("<p>201 &amp; the &quot;Way&quot;</p>\n<p>Second</p>\n");
+    expect(guest.bioText).toBe('<p>201 & the "Way"</p>\n<p>Second</p>\n');
+    expect(host.bioText).toBe('<p>226 & the "Way"</p>\n<p>Second</p>\n');
+    // The schema names the field, for Studio's form, and the loader takes the entries.
+    expect(out.collections.post!.schema.properties.excerpt250).toEqual({
+      type: "string",
+      description: excerptField(250).description,
+    });
+    expect(out.collections.episode!.schema.properties.excerpt250?.type).toBe("string");
+    const { warnings } = await loadWithJx(own, out);
+    expect(warnings).toEqual([]);
+
+    // A list of the entries reads the field at build, in a static page that ships no JavaScript.
+    const files = projectFiles(own, out);
+    files["pages/list.json"] = {
+      title: "list",
+      state: {
+        all: { $prototype: "ContentCollection", contentType: "post", timing: "compiler" },
+      },
+      children: [
+        {
+          tagName: "main",
+          children: {
+            $prototype: "Array",
+            items: { $ref: "#/state/all" },
+            map: { tagName: "p", innerHTML: "${$map.item.data.excerpt250 ?? ''}" },
+          },
+        },
+      ],
+    };
+    const project = await buildJxProject(files, { name: "derived" });
+    expect(project.code).toBe(0);
+    const html = project.html("/list/");
+    expect(html).toContain(`<p>${String(essay.frontmatter.excerpt250)}</p>`);
+    expect(html).not.toContain("data-bind");
+    expect(project.exists("app.js")).toBe(false);
+  });
+
+  test("a derived field leaves a key the data already has, and is not written for an empty value", () => {
+    const model = {};
+    deriveField({ model } as never, "entry", excerptField(10));
+    const data: Record<string, unknown> = { excerpt: "Pay ${now} and later" };
+    withDerivedFields({ model, acf: { groups: [] } } as never, data);
+    expect(data.excerpt10).toBe("Pay");
+    const taken: Record<string, unknown> = { excerpt: "One two three four", excerpt10: "mine" };
+    withDerivedFields({ model, acf: { groups: [] } } as never, taken);
+    expect(taken.excerpt10).toBe("mine");
+    const empty: Record<string, unknown> = { excerpt: "" };
+    withDerivedFields({ model, acf: { groups: [] } } as never, empty);
+    expect(Object.hasOwn(empty, "excerpt10")).toBe(false);
   });
 });
