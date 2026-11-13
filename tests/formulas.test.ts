@@ -24,7 +24,10 @@ import {
   jsonArg,
   lowerFormulas,
   lowerFormulasIn,
+  notOf,
+  orFallback,
   pipeOf,
+  tagString,
   type FormulaName,
 } from "../src/formulas.ts";
 import { htmlEscapeExpr } from "../src/jx-util.ts";
@@ -32,12 +35,13 @@ import {
   dateExpr,
   dateTag,
   formatDate,
+  jsString,
   notEmptyExpr,
   orElse,
   phpEmpty,
   postData,
 } from "../src/cwicly/tokens.ts";
-import { jxFormulas, settleFormulas } from "../src/emit/project.ts";
+import { jxComponentFormulas, jxFormulas, settleFormulas } from "../src/emit/project.ts";
 import type { ConvertCtx } from "../src/types.ts";
 import { loadSite, makeCtx } from "./helpers/ctx.ts";
 import { withFormulas } from "./helpers/formulas.ts";
@@ -172,6 +176,83 @@ describe("a path, and a value read through a formula", () => {
     expect(pipeOf("(state.a) ?? ''")).toBeUndefined();
   });
 });
+
+/** Jx's structured dynamic tag (`@jxsuite/schema/dynamic-tag`), where the installed Jx has one. */
+const TAG = await import("@jxsuite/schema/dynamic-tag").catch(() => undefined);
+
+describe.skipIf(TAG === undefined)(
+  "what the converter writes, as Jx's dynamic tag reads it",
+  () => {
+    const tag = TAG as NonNullable<typeof TAG>;
+    /** The tag read from `expr`, and that printing it gives `expr` back byte for byte. */
+    const read = (expr: string) => {
+      const parsed = tag.parseDynamicTag(expr);
+      expect([expr, parsed === null ? null : tag.printDynamicTag(parsed)]).toEqual([expr, expr]);
+      return parsed as NonNullable<typeof parsed>;
+    };
+    const TEXTS = [
+      "",
+      "none",
+      'It\'s "quoted"',
+      "a \\ b",
+      "line\nbreak\r",
+      "tab\there",
+      `brace {x} $y \`z\` ${LS}${PS}`,
+      "café 🎉",
+      String.fromCharCode(1),
+    ];
+
+    test("a formula call, nested or with JSON arguments, is a tag that prints back as written", () => {
+      const date = formulaCall("formatDate", "$map.item.data.date", {
+        year: "numeric",
+        label: "{a} $b `c`",
+      });
+      const parsed = read(date);
+      expect(parsed.pipe).toMatchObject({ type: "call", name: "formatDate" });
+      read(formulaCall("escapeHtml", formulaCall("orBlank", "state.entry.data['a b']")));
+      read(`!${formulaCall("notEmpty", "state.entry.data.about")}`);
+    });
+
+    test("a fallback is a single-quoted literal of the text, as Studio writes one, and reads back as that text", () => {
+      for (const text of TEXTS) {
+        const expr = orFallback("state.entry.data.x", jsString(text));
+        expect(expr).toBe(`state.entry.data.x || ${tagString(text)}`);
+        const parsed = read(expr);
+        expect([text, parsed.fallback?.operator, parsed.fallback?.value.value]).toEqual([
+          text,
+          "||",
+          text,
+        ]);
+        // The same text the converter's own string literal spells, but for a control character,
+        // which no JSON string holds raw.
+        if (![...text].some((c) => c < " " && c !== "\n" && c !== "\r")) {
+          expect(tagString(text)).toBe(jsString(text));
+        }
+        // And the same value to JavaScript, which is what the build evaluates.
+        expect(new Function(`return ${tagString(text)};`)()).toBe(text);
+      }
+      expect(tagString("tab\there")).toBe("'tab\\there'");
+      expect(read(orFallback("state.a ?? ''", "false")).fallback?.value.value).toBe(false);
+      read(orFallback(formulaCall("orBlank", "state.entry.data.cta"), jsString("Read more")));
+    });
+
+    test("a fallback that is not one literal is kept as given, and is a custom expression", () => {
+      // `a || b || c || ''`: the grammar takes one fallback, and the meaning is the chain's.
+      const chain = orFallback("state.term.data.seo?.title", "state.term.data.title || ''");
+      expect(chain).toBe("state.term.data.seo?.title || state.term.data.title || ''");
+      expect(tag.parseDynamicTag(chain)).toBeNull();
+      // A string literal with an escape JSON has no spelling for is not respelled.
+      expect(orFallback("state.a", "'\\x41'")).toBe("state.a || '\\x41'");
+      expect(orFallback("state.a", "'a' + 'b'")).toBe("state.a || 'a' + 'b'");
+    });
+
+    test("a negation is `!` on the pipe, which reads as 'is empty'", () => {
+      expect(read(notOf("state.entry.data.x ?? ''")).negations).toBe(1);
+      expect(read(notOf(formulaCall("notEmpty", "$map.item.data.premium"))).negations).toBe(1);
+      expect(tag.parseDynamicTag(notOf("state.a ? 1 : 2"))).toBeNull();
+    });
+  },
+);
 
 describe("a call as it is written", () => {
   test("is `state.<name>(<path>, <JSON>)`, the form Jx Studio prints", () => {
@@ -309,7 +390,8 @@ describe("the definition project.json carries says what the JavaScript says", ()
   test("a formula the installed Jx is trusted with is one its interpreter answers with no window, as a build has none", () => {
     expect((globalThis as { window?: unknown }).window).toBeUndefined();
     for (const name of jxFormulas()) {
-      expect(() => interpreted(name, "x")).not.toThrow();
+      // A date that is one: `x` is no date, and Intl throws on it with or without a window.
+      expect(() => interpreted(name, name === "formatDate" ? "2024-02-15" : "x")).not.toThrow();
     }
   });
 });
@@ -610,11 +692,13 @@ describe("a call written out as JavaScript", () => {
     expect(formulaJs("formatDate", "x'); alert(1); ('")).toBe(FORMULA_JS.formatDate);
     expect(formulaJs("formatDate", "")).toBe(FORMULA_JS.formatDate);
     expect(formulaJs("escapeHtml", "en-GB")).toBe(FORMULA_JS.escapeHtml);
-    // settleFormulas passes the language on to a component's calls.
+    // settleFormulas passes the language on to a component's calls, and writes a date out there
+    // even where a component can call the project's formulas: the formula would format in en-US.
     const settled = settleFormulas(
       [["components/x-date.json", JSON.stringify({ tagName: "x-date", textContent: template })]],
       every,
       "en-GB",
+      true,
     );
     const written = JSON.parse(settled.changed.get("components/x-date.json") as string) as {
       textContent: string;
@@ -657,7 +741,7 @@ describe("a call written out as JavaScript", () => {
     }
   });
 
-  test("settling a project: a component's calls are always written out, a page's only for a formula the build is not trusted with, and project.json holds the rest", () => {
+  test("settling a project for a Jx whose components cannot call a project formula: a component's calls are always written out, a page's only for a formula the build is not trusted with, and project.json holds the rest", () => {
     const page = JSON.stringify({
       children: [
         {
@@ -678,24 +762,113 @@ describe("a call written out as JavaScript", () => {
       ["pages/plain.json", JSON.stringify({ children: [{ tagName: "p", textContent: "hi" }] })],
     ];
     // Every formula trusted: the page keeps its calls and the project holds exactly those two.
-    const all = settleFormulas(documents, every);
+    const all = settleFormulas(documents, every, undefined, false);
     expect([...all.changed.keys()]).toEqual(["components/x-card.json"]);
     expect(all.changed.get("components/x-card.json")).not.toContain("state.escapeHtml(");
     expect(Object.keys(all.state ?? {})).toEqual(["formatDate", "notEmpty"]);
     expect(all.lowered).toEqual(["escapeHtml"]);
     // One trusted: the other is written out in the page, and the project holds the one.
-    const some = settleFormulas(documents, new Set<FormulaName>(["formatDate"]));
+    const some = settleFormulas(documents, new Set<FormulaName>(["formatDate"]), undefined, false);
     expect([...some.changed.keys()].sort()).toEqual(["components/x-card.json", "pages/index.json"]);
     expect(some.changed.get("pages/index.json")).toContain("state.formatDate(");
     expect(some.changed.get("pages/index.json")).not.toContain("state.notEmpty(");
     expect(Object.keys(some.state ?? {})).toEqual(["formatDate"]);
     // None trusted: no call is left anywhere, and project.json gets no state.
-    const none = settleFormulas(documents, new Set());
+    const none = settleFormulas(documents, new Set(), undefined, false);
     expect(none.state).toBeUndefined();
     for (const text of none.changed.values()) {
       expect(text).not.toMatch(/state\.(formatDate|notEmpty|orBlank|escapeHtml)\(/);
       expect(() => JSON.parse(text) as unknown).not.toThrow();
     }
     expect(none.lowered).toEqual(["formatDate", "notEmpty", "escapeHtml"]);
+  });
+
+  describe("settling a project for a Jx whose components call the project's formulas (jxsuite/jx#642)", () => {
+    const card = (extra: Record<string, unknown> = {}): string =>
+      JSON.stringify({
+        tagName: "x-card",
+        ...extra,
+        children: [
+          { tagName: "i", innerHTML: "${state.escapeHtml(state.label)}" },
+          {
+            tagName: "time",
+            textContent: '${state.formatDate(state.when, {"dateStyle":"long"})}',
+          },
+          { tagName: "b", attributes: { hidden: "${!state.notEmpty(state.label)}" } },
+        ],
+      });
+    const page = JSON.stringify({
+      children: [{ tagName: "p", textContent: "${state.orBlank(state.entry.data.x) || 'none'}" }],
+    });
+
+    test("a component keeps its calls as a page does, and project.json holds every formula either calls", () => {
+      const documents: [string, string][] = [
+        ["components/x-card.json", card()],
+        ["pages/index.json", page],
+      ];
+      for (const language of [undefined, "en-US", "en_US"]) {
+        const settled = settleFormulas(documents, every, language, true);
+        expect([language, [...settled.changed.keys()]]).toEqual([language, []]);
+        expect(Object.keys(settled.state ?? {})).toEqual([
+          "formatDate",
+          "notEmpty",
+          "orBlank",
+          "escapeHtml",
+        ]);
+        expect(settled.lowered).toEqual([]);
+      }
+      // A formula the build is not trusted with is written out in a component as in a page, and
+      // the project holds only what is still called.
+      const some = settleFormulas(documents, new Set<FormulaName>(["escapeHtml"]), "en-US", true);
+      const written = some.changed.get("components/x-card.json") as string;
+      expect(written).toContain("state.escapeHtml(state.label)");
+      expect(written).not.toMatch(/state\.(formatDate|notEmpty)\(/);
+      expect(Object.keys(some.state ?? {})).toEqual(["escapeHtml"]);
+      expect(some.lowered).toEqual(["formatDate", "notEmpty", "orBlank"]);
+    });
+
+    test("a date in a component is written out where the project's language is not Jx's default, which is what a formula formats in there", () => {
+      const settled = settleFormulas([["components/x-card.json", card()]], every, "en-GB", true);
+      const written = settled.changed.get("components/x-card.json") as string;
+      expect(written).not.toContain("state.formatDate(");
+      expect(written).toContain("'en-GB'");
+      expect(written).toContain("state.escapeHtml(state.label)");
+      expect(written).toContain("state.notEmpty(state.label)");
+      expect(Object.keys(settled.state ?? {})).toEqual(["notEmpty", "escapeHtml"]);
+      expect(settled.lowered).toEqual(["formatDate"]);
+    });
+
+    test("a component whose own state has an entry of a formula's name has that call written out: its own entry is what the call would reach", () => {
+      const own = card({ state: { label: "", escapeHtml: "a prop of the same name" } });
+      const settled = settleFormulas([["components/x-card.json", own]], every, "en-US", true);
+      const written = JSON.parse(settled.changed.get("components/x-card.json") as string) as {
+        state: Record<string, unknown>;
+        children: { innerHTML?: string }[];
+      };
+      expect(written.state).toEqual({ label: "", escapeHtml: "a prop of the same name" });
+      expect(written.children[0]?.innerHTML).toBe(`\${(${FORMULA_JS.escapeHtml})(state.label)}`);
+      expect(JSON.stringify(written)).toContain("state.formatDate(");
+      expect(settled.lowered).toEqual(["escapeHtml"]);
+      // The project's formula is still there for what calls it.
+      expect(Object.keys(settled.state ?? {})).toEqual(["formatDate", "notEmpty"]);
+    });
+
+    test("a component that does not read as JSON is left alone, as before", () => {
+      const settled = settleFormulas(
+        [["components/x-card.json", "{ state.escapeHtml(state.label)"]],
+        every,
+        "en-US",
+        true,
+      );
+      expect(settled.changed.size).toBe(0);
+      expect(settled.state).toBeUndefined();
+    });
+
+    test("the default asks the installed Jx (jxComponentFormulas), which the build tests hold to the build", () => {
+      const documents: [string, string][] = [["components/x-card.json", card()]];
+      expect(settleFormulas(documents, every, "en-US")).toEqual(
+        settleFormulas(documents, every, "en-US", jxComponentFormulas()),
+      );
+    });
   });
 });

@@ -13,7 +13,9 @@
  * each, and only the ones a document of the project calls ({@link formulasUsed}). The project is the
  * right home: the build evaluates the call, nothing is left that reads the formula, and Jx drops an
  * inherited project entry a page no longer reads, so the page still ships no JavaScript. The same
- * entry in a page's own `state` would make the page a client page.
+ * entry in a page's own `state` would make the page a client page. A Jx with jxsuite/jx#642 gives
+ * every component of the project the same formulas (they are pure and read nothing of the project),
+ * so a component calls them as a page does.
  */
 
 /** A named formula as `project.json`'s `state` holds it. */
@@ -245,10 +247,76 @@ export function pipeOf(expr: string): string | undefined {
  * `<value> || <fallback>`: the value, or the fallback when there is none. A value read from a path
  * takes no parentheses and no `?? ''` before `||` (a missing value is falsy either way), and without
  * them the binding is a field with a fallback, which Studio reads; any other expression keeps its
- * parentheses. `fallback` is JavaScript source (`false`, a quoted string).
+ * parentheses. `fallback` is JavaScript source (`false`, a quoted string); a single-quoted string is
+ * written as {@link tagString} spells the same text, which is the literal Jx's dynamic tag reads.
+ * Anything else (`b || c || ''`, a chain of fallbacks) is left as given, and the binding is then a
+ * custom expression to Studio: its grammar takes one literal fallback.
  */
 export function orFallback(expr: string, fallback: string): string {
-  return `${pipeOf(expr) ?? `(${expr})`} || ${fallback}`;
+  const text = singleQuotedText(fallback);
+  return `${pipeOf(expr) ?? `(${expr})`} || ${text === undefined ? fallback : tagString(text)}`;
+}
+
+/**
+ * A text as the single-quoted literal Jx Studio writes for a fallback it is typed into
+ * (`fallbackLiteral` in its dynamic tags): what `JSON.stringify` writes between the quotes, with a
+ * double quote bare and a single quote escaped, so a tag Studio reads and writes back is the text
+ * it was read from. Only JSON's escapes and `\'` are used, which is what the tag reader takes in a
+ * single-quoted string; a control character other than a line break is one (`\t`), not the raw
+ * character, which no JSON string may hold. A brace, `$`, a backtick and the line separators are
+ * `\uXXXX` besides (rule 13, as {@link jsonArg}): JSON escapes too, so the reader still reads the
+ * literal, and a build that counts braces without reading strings still finds the end of the `${…}`.
+ */
+export function tagString(text: string): string {
+  const inner = JSON.stringify(text)
+    .slice(1, -1)
+    .replaceAll('\\"', '"')
+    .replaceAll("'", "\\'")
+    .replaceAll(UNSAFE_IN_STRING, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return `'${inner}'`;
+}
+
+/** What a single escape character stands for in a string literal, for the ones the tag reader takes. */
+const ESCAPED: Readonly<Record<string, string>> = {
+  "'": "'",
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+};
+
+/**
+ * The text of a single-quoted JavaScript string literal that uses only escapes JSON has (and `\'`),
+ * or `undefined` for anything else, which is then left as it is written.
+ */
+function singleQuotedText(source: string): string | undefined {
+  if (source.length < 2 || !source.startsWith("'") || !source.endsWith("'")) return undefined;
+  let out = "";
+  for (let i = 1; i < source.length - 1; i++) {
+    const c = source[i] as string;
+    if (c === "'") return undefined;
+    if (c !== "\\") {
+      out += c;
+      continue;
+    }
+    const e = source[++i];
+    if (e === undefined || i === source.length - 1) return undefined;
+    if (e === "u") {
+      const hex = source.slice(i + 1, i + 5);
+      if (!/^[0-9a-fA-F]{4}$/.test(hex)) return undefined;
+      out += String.fromCharCode(parseInt(hex, 16));
+      i += 4;
+    } else {
+      const v = ESCAPED[e];
+      if (v === undefined) return undefined;
+      out += v;
+    }
+  }
+  return out;
 }
 
 /**
@@ -323,7 +391,9 @@ export const FORMULA_JS: Readonly<Record<FormulaName, string>> = {
  * {@link FORMULA_JS} for a project whose pages are in `language`. Only `formatDate` differs: where
  * the state it is written into has no page (a component's state is its own), it formats in the
  * project's language, which is the locale every page of the project has, instead of `en-US`. Without
- * that a date in a component of an `en-GB` site would print as an American one.
+ * that a date in a component of an `en-GB` site would print as an American one, which is also what
+ * the formula itself prints in a component (it has no `$page.locale` to read there), so such a date
+ * stays written out where a component could call the formula (`settleFormulas`).
  */
 export function formulaJs(name: FormulaName, language: string = DEFAULT_LOCALE): string {
   const locale = language.trim().replace("_", "-");
@@ -350,9 +420,11 @@ export function formulaFunctions(state: object = {}): Record<FormulaName, Formul
  * The text with every call of the formulas in `names` written as its JavaScript instead:
  * `state.escapeHtml(state.label)` becomes `((t) => …)(state.label)`. The value is the same; the
  * binding is code again and no longer a field with a format. This is for the places a formula cannot
- * be called from: a component (its `state` is its own, and the project's formulas are not in it), and
- * a Jx that does not yet evaluate the formula at build or keep a page that calls one free of
- * JavaScript. `language` is the project's ({@link formulaJs}).
+ * be called from, or would mean something else in: a component of a Jx that gives a component none of
+ * the project's formulas (before jxsuite/jx#642), a component whose own `state` has an entry of the
+ * formula's name, a date in a component of a site whose language is not Jx's default, and a Jx that
+ * does not yet evaluate the formula at build or keep a page that calls one free of JavaScript.
+ * `language` is the project's ({@link formulaJs}).
  */
 export function lowerFormulas(
   text: string,

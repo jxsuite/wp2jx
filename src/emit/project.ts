@@ -125,6 +125,8 @@ import type { JxHeadEntry } from "@jxsuite/schema/types";
 import {
   ALL_FORMULAS,
   FORMULAS,
+  FORMULA_JS,
+  formulaJs,
   formulaState,
   formulasUsed,
   lowerFormulasIn,
@@ -314,9 +316,13 @@ export interface MigrateOptions {
    * Write a value that is read from a path and formatted as a call of a named formula
    * (`${state.formatDate(state.entry.data.date, {…})}`, `src/formulas.ts`), which Jx Studio opens as a
    * field with a format, and put the formulas in `project.json`'s `state`. `false` writes every one as
-   * the JavaScript it stands for; `true` writes every one as a call, whatever Jx is installed.
-   * Default: the formulas the Jx this tool runs with evaluates at build while the page stays free of
-   * JavaScript ({@link jxFormulas}), and JavaScript for the rest (`project.formulas-lowered`).
+   * the JavaScript it stands for; `true` writes every one in a page or a layout as a call, whatever Jx
+   * is installed (a call the build cannot evaluate still renders in the browser). Default: the
+   * formulas the Jx this tool runs with evaluates at build while the page stays free of JavaScript
+   * ({@link jxFormulas}), and JavaScript for the rest (`project.formulas-lowered`). Whatever is asked,
+   * a call in a component stays a call only where that Jx gives a component the project's formulas
+   * ({@link jxComponentFormulas}), since without them it renders nothing anywhere, and only where its
+   * meaning does not change there (`settleFormulas`).
    */
   formulas?: boolean;
   /** Drop the compatibility stylesheet's rules for classes no converted markup carries. Default false. */
@@ -1577,19 +1583,78 @@ export function jxFormulas(): ReadonlySet<FormulaName> {
   return able;
 }
 
+let componentFormulasKnown: boolean | undefined;
+
+/** A file of an installed package as text, or `""` when it is not there or does not read. */
+function installedText(pkg: string, rel: string): string {
+  const file = installedFile(pkg, rel);
+  if (file === undefined) return "";
+  try {
+    return readFileSync(file, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Whether the Jx this tool runs with lets a component call a formula of `project.json`'s `state`
+ * (jxsuite/jx#642, compiler 8.7.0 with runtime 7.0.0). Before it a component's scope was its own
+ * `state` and nothing else, so a call in one found no formula and the element built empty. Two
+ * packages have to know, and both are read, not their version numbers:
+ *
+ * - the site build prerenders every component from its definition with the project's closed pure
+ *   formulas merged under its own `state` (`inheritProjectFormulas` in `src/site/site-build.ts`);
+ * - the runtime gives a component rendered in the browser the same formulas
+ *   (`inheritableFormulas` in `src/expression.ts`), which is what a live component reads.
+ *
+ * Neither name is in compiler 8.6.0 or runtime 6.3.0: the change that added both is the one that
+ * lifted the rule.
+ */
+export function jxComponentFormulas(): boolean {
+  if (componentFormulasKnown !== undefined) return componentFormulasKnown;
+  componentFormulasKnown =
+    installedText("@jxsuite/compiler", "src/site/site-build.ts").includes(
+      "inheritProjectFormulas(",
+    ) &&
+    installedText("@jxsuite/runtime", "src/expression.ts").includes(
+      "export function inheritableFormulas(",
+    );
+  return componentFormulasKnown;
+}
+
+/**
+ * Whether a call of `name` in a component means what the formula means in a page. Two things part
+ * them, both from Jx's rule for what a component inherits (props-and-scope, "Project formulas"):
+ *
+ * - **The component's own names win.** A `state` entry (a prop) of the same name is what the call
+ *   reaches, not the project's formula.
+ * - **A component has no page.** `formatDate` fills its locale from `$page.locale`, which a
+ *   component's scope never holds, so there it formats in Jx's default (`en-US`). Written out, the
+ *   call formats in the project's language instead ({@link formulaJs}), so the call is kept only
+ *   where the two are the same text: the project's language is the default, or no language at all.
+ */
+function componentCalls(name: FormulaName, doc: unknown, language: string | undefined): boolean {
+  const own = (doc as { state?: unknown } | null)?.state;
+  if (own !== null && typeof own === "object" && Object.hasOwn(own, name)) return false;
+  return name !== "formatDate" || formulaJs(name, language) === FORMULA_JS[name];
+}
+
 /**
  * The documents of a project with their formulas settled, and the `state` `project.json` holds for
- * them. A call of a formula in `supported` stays a call wherever the project's `state` is the
- * document's own (a page, a layout); every other call is written as the JavaScript it stands for
- * ({@link lowerFormulasIn}): any call in a component, whose `state` is its own and holds no formula of
- * the project, and a call of a formula the build cannot be trusted with. `documents` maps a path to
- * its JSON text; only the ones that changed are returned. `language` is the project's `lang`, which a
- * date written out in a component is formatted in (a component's state has no page to ask).
+ * them. A call of a formula in `supported` stays a call in a page and a layout, which inherit the
+ * project's `state`, and in a component when `components` says the Jx gives a component the
+ * project's formulas ({@link jxComponentFormulas}) and the call means the same there
+ * ({@link componentCalls}). Every other call is written as the JavaScript it stands for
+ * ({@link lowerFormulasIn}). `documents` maps a path to its JSON text; only the ones that changed
+ * are returned. `language` is the project's `lang`, which a date written out in a component is
+ * formatted in (a component's state has no page to ask). `project.json`'s `state` then holds every
+ * formula a page, a layout or a component still calls.
  */
 export function settleFormulas(
   documents: Iterable<readonly [string, string]>,
   supported: ReadonlySet<FormulaName>,
   language?: string,
+  components: boolean = jxComponentFormulas(),
 ): {
   changed: Map<string, string>;
   state: Record<string, FormulaEntry> | undefined;
@@ -1602,19 +1667,34 @@ export function settleFormulas(
     if (!path.endsWith(".json")) continue;
     const used = formulasUsed([text]);
     if (used.length === 0) continue;
+    const component = path.startsWith("components/");
+    let parsed: unknown;
+    if (component) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        // Not a document: nothing in it is a binding.
+        continue;
+      }
+    }
     const names = new Set(
-      path.startsWith("components/") ? used : used.filter((name) => !supported.has(name)),
+      used.filter(
+        (name) =>
+          !supported.has(name) ||
+          (component && !(components && componentCalls(name, parsed, language))),
+      ),
     );
     if (names.size === 0) {
       kept.push(text);
       continue;
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      // Not a document: nothing in it is a binding.
-      continue;
+    if (!component) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        // Not a document: nothing in it is a binding.
+        continue;
+      }
     }
     for (const name of names) lowered.add(name);
     const next = jsonText(lowerFormulasIn(parsed, names, language));
@@ -2327,10 +2407,15 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
 
   // The formulas the documents call (`src/formulas.ts`): the ones the build can be trusted with stay
   // calls and go into project.json's `state`, once each; the rest are written out as JavaScript.
+  // Asked for (`formulas: true`), a page's calls stay whatever Jx is installed: a Jx that cannot
+  // build one into a static page still renders it in the browser. A component's stay only where the
+  // Jx gives a component the project's formulas, because before that a call in one finds nothing,
+  // at build or in the browser, and the element is empty.
   const formulas = settleFormulas(
     [...files].filter((f): f is [string, string] => typeof f[1] === "string"),
     opts.formulas === undefined ? jxFormulas() : opts.formulas ? ALL_FORMULAS : new Set(),
     model.site.language,
+    opts.formulas !== false && jxComponentFormulas(),
   );
   for (const [path, text] of formulas.changed) files.set(path, text);
   {

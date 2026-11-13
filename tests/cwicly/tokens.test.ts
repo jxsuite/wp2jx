@@ -27,9 +27,16 @@ import type { ConvertCtx, WpBlock, WpPost } from "../../src/types.ts";
 import type { AcfField } from "../../src/wp/acf.ts";
 import { blockImage } from "../../src/cwicly/dynamic.ts";
 import {
+  acfNameTaken,
+  basicReferencesExpr,
   cwiclyFormat,
   dateExpr,
+  decodeBasicReferences,
+  derivedFieldsOf,
+  derivedValues,
   escapeHtml,
+  excerptCutExpr,
+  excerptField,
   excerptOf,
   exprV,
   fieldText,
@@ -45,6 +52,8 @@ import {
   optPath,
   parseToken,
   userFields,
+  userRef,
+  personTextField,
   POST_CONTENT_TAG,
   postData,
   printsAcfRaw,
@@ -144,6 +153,13 @@ const entryScope = (
 ): { entry: { data: Record<string, unknown>; $children: unknown[]; id: string } } => ({
   entry: { data, $children: [], id: "x" },
 });
+
+/** An entry as the collections module writes it: with the fields the bindings resolved so far derive from its data. */
+const writtenScope = (
+  ctx: ConvertCtx,
+  data: Record<string, unknown>,
+): ReturnType<typeof entryScope> =>
+  entryScope({ ...data, ...derivedValues(derivedFieldsOf(ctx.model, "entry"), data) });
 
 describe("jsString", () => {
   test("nothing in a literal can unbalance a template: braces, a dollar and a backtick are escapes, a backslash is doubled", () => {
@@ -1292,15 +1308,18 @@ describe("an entry template", () => {
       { kind: "template", slug: "single-post" },
       { mode: "entry", entryType: "post" },
     );
-    const state = entryScope({
+    const data = {
       title: "T",
       date: "2020-12-20T06:49:00.000Z",
       modified: "2024-03-12T19:10:36.000Z",
       excerpt: "<p>One “two” three four five six seven</p>",
       terms: { category: [{ slug: "a", name: "A & B", url: "/category/a/" }], post_tag: [] },
-    });
-    const say = (token: string, where: "text" | "html" = "text"): string =>
-      evalTemplate(resolveTokens(token, ctx, undefined, { where }), state);
+    };
+    // The entry is evaluated as the collections module writes it, with the fields the binding reads derived.
+    const say = (token: string, where: "text" | "html" = "text"): string => {
+      const bound = resolveTokens(token, ctx, undefined, { where });
+      return evalTemplate(bound, writtenScope(ctx, data));
+    };
     expect(say("{postdate=published=default}")).toBe("December 20, 2020");
     expect(say("{postdate=modified=3}")).toBe("03/12/2024");
     expect(say("{time=published=2}")).toBe("1:49 AM");
@@ -1421,10 +1440,17 @@ describe("an entry template", () => {
     expect(resolveTokens("{userqueryurl}", row)).toBe("${$map.item?.url ?? ''}");
     // A person's biography prints as text on the live pages (its tags show), not as markup, and the
     // character references in it are read as `esc_html` leaves them: once, and not double-escaped.
+    // The text is a field the converter writes beside the biography on every person it lists, so
+    // the binding is a path Jx Studio opens as a field.
     const bio = resolveTokens("{acffield=field_62d867cf871e7=userquery}", row);
-    expect(bio.startsWith("${") && bio.endsWith("}")).toBe(true);
+    expect(bio).toBe("${$map.item?.bioText ?? ''}");
+    expect(derivedFieldsOf(ctx.model, "person").map((f) => f.key)).toContain("bioText");
+    const person = (value: unknown): Record<string, unknown> => ({
+      bio: value,
+      ...derivedValues(derivedFieldsOf(ctx.model, "person"), { bio: value }),
+    });
     const shown = (value: unknown): unknown =>
-      new Function("$map", `return ${bio.slice(2, -1)};`)({ item: { bio: value } });
+      new Function("$map", `return ${bio.slice(2, -1)};`)({ item: person(value) });
     expect(
       shown('<p class=\\"x\\">a &quot;b&quot; &amp; c &#39;d&#x41;&nbsp;e &lt;i&gt;</p>\n'),
     ).toBe('<p class=\\"x\\">a "b" & c \'dA\u00a0e <i></p>\n');
@@ -2913,3 +2939,138 @@ describe("the small helpers", () => {
 });
 
 // END OF PART 7
+
+// ── Fields derived from a field ──────────────────────────────────────────────────────────────────
+
+describe("a field the converter derives from another and writes beside it", () => {
+  test("a limited excerpt in an entry reads the field the collections write: a path Jx Studio opens as a field", async () => {
+    const { ctx } = await realCtx(
+      "ap",
+      { kind: "template", slug: "single-post" },
+      { mode: "entry", entryType: "post" },
+    );
+    const loop = Object.assign(Object.create(ctx), { entryExpr: "$map.item" }) as ConvertCtx;
+    const html = (token: string, over: ConvertCtx): string =>
+      resolveTokens(token, over, undefined, { where: "html" });
+    expect(html("{postexcerpt=250}", loop)).toBe("${$map.item.data.excerpt250 ?? ''}");
+    expect(html("{postexcerpt=75}", ctx)).toBe("${state.entry.data.excerpt75 ?? ''}");
+    expect(derivedFieldsOf(ctx.model, "entry").map((f) => f.key)).toEqual(
+      expect.arrayContaining(["excerpt250", "excerpt75"]),
+    );
+    // With no limit the cut is nothing, and the entry stores the excerpt tags stripped and trimmed already.
+    expect(html("{postexcerpt}", ctx)).toBe("${state.entry.data.excerpt ?? ''}");
+    // A fallback is the `||` of the field.
+    const fb = block("cwicly/paragraph", { dynamicStaticFallback: "Read More" });
+    expect(resolveTokens("{postexcerpt=250}", loop, fb, { where: "html" })).toBe(
+      "${$map.item.data.excerpt250 || 'Read More'}",
+    );
+    // The page's own entry, which a page's layout reads, is written by the pages module and carries
+    // no derived field: the expression stays.
+    const layout = Object.assign(Object.create(ctx), { entryType: "page" }) as ConvertCtx;
+    expect(html("{postexcerpt=250}", layout)).toBe(
+      `\${${excerptCutExpr("state.entry.data.excerpt", 250)}}`,
+    );
+    // So does a key an ACF field already has.
+    const taken = Object.assign(Object.create(ctx), {
+      acf: {
+        ...ctx.acf,
+        groups: [
+          ...ctx.acf.groups,
+          { fields: [{ name: "excerpt60", subFields: [], layouts: [] }] },
+        ],
+      },
+    }) as ConvertCtx;
+    expect(acfNameTaken(taken, "excerpt60")).toBe(true);
+    expect(html("{postexcerpt=60}", taken)).toContain("TextEncoder");
+  });
+
+  test("the derived excerpt is what the expression makes of every entry of both sites, at every limit they use", async () => {
+    for (const site of ["ap", "fineline"] as const) {
+      const { ctx, loaded } = await realCtx(site, { kind: "post", id: 0 });
+      const differ: string[] = [];
+      let checked = 0;
+      for (const post of loaded.model.posts.values()) {
+        if (
+          post.status !== "publish" ||
+          /^(?:page|attachment|nav_menu_item|wp_|cc_|acf-)/.test(post.type)
+        )
+          continue;
+        const stored = postData(ctx, post).excerpt;
+        for (const limit of [0, 20, 60, 75, 150, 250]) {
+          const expected = run(excerptCutExpr("x", limit), stored);
+          const derived = limit > 0 ? (excerptField(limit).derive(stored) ?? "") : stored;
+          checked++;
+          if (derived !== expected) differ.push(`${post.id}@${limit}`);
+        }
+      }
+      expect(checked).toBeGreaterThan(site === "ap" ? 1000 : 300);
+      expect(differ).toEqual([]);
+    }
+  });
+
+  test("where the two differ, a `<` that a space follows, the field prints what a static page and WordPress print", () => {
+    const raw = "<p>If 5 < 6 and 7 > 3 then the rest of it follows here</p>";
+    const stored = php.stripAllTags(raw);
+    expect(stored).toBe("If 5 < 6 and 7 > 3 then the rest of it follows here");
+    // The expression strips the stored text a second time with `<[^>]*>`, which takes "< 6 and 7 >" out.
+    expect(run(excerptCutExpr("x", 0), stored)).toBe("If 5  3 then the rest of it follows here");
+    expect(run(excerptCutExpr("x", 30), stored)).toBe("If 5  3 then the rest of it");
+    expect(excerptField(30).derive(stored)).toBe("If 5 < 6 and 7 > 3 then the");
+    expect(excerptField(30).derive(stored)).toBe(limitExcerpt(raw, 30));
+    expect(limitExcerpt(raw, 0)).toBe(stored);
+  });
+
+  test("a person's biography in a list of people is a field every person carries, the references read as the expression reads them", async () => {
+    const { ctx } = await realCtx(
+      "ap",
+      { kind: "template", slug: "single-post" },
+      { mode: "entry", entryType: "post" },
+    );
+    const model = { ...ctx.model } as typeof ctx.model;
+    const bio =
+      "First &amp; &quot;last&quot;\n\nSecond <b>bold</b> &#8217;&#x1F3A8;&nbsp;&nope; &amp;quot;";
+    setUserProfiles(
+      model,
+      new Map([
+        [
+          9100,
+          {
+            id: 9100,
+            slug: "ada",
+            displayName: "Ada",
+            meta: { bio, position: "A &amp; B" },
+            roles: [],
+          },
+        ],
+      ]),
+    );
+    const own = { ...ctx, model } as ConvertCtx;
+    // A row of a list of people is written before the loop that prints it is converted: it carries
+    // the text of each wysiwyg field of the person, and nothing for the others.
+    const row = userRef(own, 9100) as unknown as Record<string, unknown>;
+    expect(row.bio).toBe(userFields(own, 9100, true).bio);
+    expect(row.bioText).toBe(run(basicReferencesExpr("x"), row.bio));
+    expect(row.bioText).toBe(
+      '<p>First & "last"</p>\n<p>Second <b>bold</b> ’\u{1F3A8} &nope; &quot;</p>\n',
+    );
+    expect(row.positionText).toBeUndefined();
+    // The derivation and the expression agree on every reference the expression reads.
+    for (const text of [
+      "",
+      "plain",
+      "&amp;&lt;&gt;&quot;&apos;&nbsp;",
+      "&#65;&#x41;&#X41;&#0065;",
+      "&amp;amp; &AMP; &#; &#x; &hellip;",
+      "a & b; &#8220;q&#8221;",
+    ]) {
+      expect(decodeBasicReferences(text)).toBe(run(basicReferencesExpr("x"), text) as string);
+    }
+    expect(personTextField("bio").derive(undefined)).toBeUndefined();
+    expect(personTextField("bio").derive("")).toBeUndefined();
+  });
+});
+
+/** An expression over `x`, evaluated. */
+function run(expr: string, value: unknown): unknown {
+  return new Function("x", `return ${expr};`)(value);
+}

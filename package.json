@@ -14,12 +14,12 @@
     "format": "oxfmt src tests scripts"
   },
   "dependencies": {
-    "@jxsuite/compiler": "^8.2.0",
-    "@jxsuite/import": "^0.42.4",
-    "@jxsuite/markup": "^1.0.4",
-    "@jxsuite/parser": "^4.3.0",
-    "@jxsuite/schema": "^5.2.0",
-    "@jxsuite/site": "^2.3.1",
+    "@jxsuite/compiler": "^8.7.0",
+    "@jxsuite/import": "^0.44.2",
+    "@jxsuite/markup": "^1.0.9",
+    "@jxsuite/parser": "^5.0.0",
+    "@jxsuite/schema": "^6.0.0",
+    "@jxsuite/site": "^2.7.0",
     "@wordpress/block-serialization-default-parser": "^5.56.0",
     "hast-util-from-html": "^2.0.3",
     "hast-util-whitespace": "^3.0.0",
