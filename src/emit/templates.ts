@@ -70,16 +70,19 @@
  *   (its title and description options, and the robots its `Paper\Author` prints: {@link authorRobots}),
  *   with `og:type` `profile`; a term's is `article`.
  * - **The posts index and the archives** are the static pages of their routes (`pages/blog.json`,
- *   `pages/projects.json`) with Rank Math's own title and head. **The 404** is `pages/404.json`: the Jx
- *   dev server serves it with the status 404, but the static build writes it to `/404/` and not `404.html`
- *   (`template.404-location`). **The search** is `pages/search.json` with its form and a notice where the
+ *   `pages/projects.json`) with Rank Math's own title and head; a listing whose list is paged on the
+ *   live site is a paged route (`pages/blog/[...page].json`, `emit/paging.ts`). **The 404** is
+ *   `pages/404.json`: the Jx dev server serves it with the status 404, and the static build writes it
+ *   to `404.html`, the file a static host serves for a missing address. **The search** is `pages/search.json` with its form and a notice where the
  *   results were: they are a query WordPress runs per request, the search term is a URL parameter a
  *   static page cannot read, and `@jxsuite/search` (a client-side index of titles and text) could not
  *   print the template's cards, which need an entry's image, date and fields (`template.search`). What
  *   else read the dropped results (a "No results found" paragraph, the "Load more" link) goes with them.
  * - **A route kind with no template** gets a minimal page and layout (`template.fallback`).
- * - Pagination does not exist in Jx: a listing shows every entry its query selects
- *   (`template.pagination`).
+ * - **Pagination**: a listing, term or author page is converted `pageable` (a term page with its
+ *   taxonomy and route parameter, `termArchive`), and a query that claims it makes the page a paged
+ *   route ({@link pagedFile}, `paging.paged`). A listing that pages nothing shows every entry its query
+ *   selects (`template.pagination`).
  *
  * ## What the converters leave to this module
  *
@@ -109,7 +112,7 @@
  * `template.posts-split`, `template.archive-split`, `template.route-mismatch`, `template.seo-failed`,
  * `template.og-image-unresolved`, `template.literal-template`, `template.shortcode-empty`,
  * `template.placeholder-neutral`, `template.dynamic-unavailable`, `template.term-binding-repaired`,
- * `template.search`, `template.404-location`, `template.pagination`, `template.breadcrumb-disabled`,
+ * `template.search`, `template.pagination`, `template.breadcrumb-disabled`,
  * `template.breadcrumb-approximated`, `template.hoisted-unplaced`,
  * `template.hoisted-collision`, `template.state-taken`, `template.binding-misplaced`, `template.convert-failed`, plus everything
  * the conversions and the menus report, located at their subject.
@@ -123,6 +126,7 @@ import { escapeTemplate, htmlEscapeExpr } from "../jx-util.ts";
 import { fluentFormFor } from "./fluentform.ts";
 import { geoMapFor } from "./geomap.ts";
 import { rewriteStyleUrls } from "./style-urls.ts";
+import { pagedFile, pagedHead, pagedPaths, pagedTitle } from "./paging.ts";
 import { menuResolvers, newUsed as newMenusUsed, type MenusUsed } from "./menus.ts";
 import {
   EMPTY_SHORTCODES,
@@ -221,6 +225,8 @@ export interface TemplatePageInfo {
   kind: PageKind;
   /** The layout it carries, `./layouts/<slug>.json`. */
   layout: string;
+  /** The page is built in pages of one of its lists (`emit/paging.ts`): `file` is its catch-all. */
+  paged?: true;
 }
 
 export interface TemplatesOptions {
@@ -1292,7 +1298,7 @@ export function slotContent(nodes: readonly JxNode[]): { nodes: JxNode[]; found:
 }
 
 /** `core/post-content` hides its box when the entry has no body (`state.entry.$children` empty). */
-const EMPTY_BODY = /^\$\{!\(\(state\.entry\.\$children\?\.length \?\? 0\) > 0\)\}$/;
+const EMPTY_BODY = /^\$\{!state\.entry\.\$children\?\.length\}$/;
 
 /**
  * A layout's slot is filled by the page, which has a body of its own: the entry that hiding reads
@@ -2189,6 +2195,13 @@ const ENTRY_SRC = "@jxsuite/parser/ContentEntry.class.json";
 
 type HeadMeta = { tagName: string; attributes: Record<string, string> };
 
+/**
+ * Whether a page's file can become a paged route: the page number is a catch-all after the page's own
+ * parameters, and a page whose own parameter is already a catch-all (`[...path].json`, a term whose
+ * slug holds a slash) has no room for a second one.
+ */
+const pageableFile = (file: string): boolean => !file.includes("[...");
+
 /** The conversion options a page of a kind needs. */
 function conversionOptions(page: PlannedPage): SubjectOptions {
   switch (page.kind) {
@@ -2200,16 +2213,34 @@ function conversionOptions(page: PlannedPage): SubjectOptions {
         target: "page",
       };
     case "term":
-      return { mode: "static", termExpr: "state.term", target: "page" };
+      // One conversion per taxonomy, so a list of the archive's term can name it in a collection rule.
+      return {
+        mode: "static",
+        termExpr: "state.term",
+        target: "page",
+        pageable: pageableFile(page.file),
+        ...(page.type === undefined
+          ? {}
+          : { termArchive: { taxonomy: page.type, param: page.dynamic?.param ?? "slug" } }),
+      };
     case "author":
-      return { mode: "entry", entryExpr: "state.author", target: "page" };
+      return {
+        mode: "entry",
+        entryExpr: "state.author",
+        target: "page",
+        pageable: pageableFile(page.file),
+      };
     case "archive":
       return {
         mode: "static",
         ...(page.type === undefined ? {} : { entryType: page.type }),
         target: "page",
+        pageable: true,
       };
+    case "posts":
+      return { mode: "static", target: "page", pageable: true };
     default:
+      // The search page's results are replaced by a notice, and a 404 is no listing: neither is paged.
       return { mode: "static", target: "page" };
   }
 }
@@ -3303,32 +3334,38 @@ async function bodyPage(input: BodyInput): Promise<BodyBuilt> {
       title = literalText(optionTitle(env, "404_title", "Page not found %sep% %sitename%"));
       head = [NOINDEX];
       sitemap = false;
-      env.report.add({
-        severity: "warn",
-        code: "template.404-location",
-        message:
-          "The 404 template is pages/404.json: the Jx dev server serves it with the status 404 for every address no page answers, but the static build writes it to /404/ and not 404.html, which is the file a static host (Cloudflare Pages, Netlify, GitHub Pages) serves for a missing address. The host has to be told to serve /404/ with a 404 (a rewrite rule), or the page copied to 404.html.",
-        where: `route:${page.route}`,
-        data: { file: page.file, built: "404/index.html", hostsWant: "404.html" },
-      });
       break;
     default:
       title = literalText(optionTitle(env, "search", "Search %sep% %sitename%"));
       head = [NOINDEX];
       sitemap = false;
   }
-  if (["posts", "archive", "term", "author", "search"].includes(page.kind)) {
+  // A page that pages one of its lists is a paged route (its pager reads `$page.pagination`).
+  const paging = converted?.paging;
+  const file = paging === undefined ? page.file : pagedFile(page.file);
+  if (paging !== undefined) {
+    $paths = pagedPaths($paths, paging);
+    title = pagedTitle(title);
+    if (head !== undefined) head = pagedHead(head) as HeadMeta[];
+    env.report.add({
+      severity: "info",
+      code: "paging.paged",
+      message: `The page is built in pages of ${paging.pageSize} entries of its list ${paging.key}, the first at its own address and the next ones numbered after it (${file}); WordPress's /page/N/ addresses are redirected there.`,
+      where: pageWhere,
+      data: { file, key: paging.key, pageSize: paging.pageSize },
+    });
+  } else if (["posts", "archive", "term", "author", "search"].includes(page.kind)) {
     env.report.add({
       severity: "info",
       code: "template.pagination",
-      message: `WordPress pages this listing (/page/2/); Jx has no pagination, so the page lists every entry its query selects, with more entries on one page than the live one has, and the live /page/N/ addresses (indexed and linked) do not exist in the migrated site: they need a redirect.`,
+      message: `WordPress pages this listing (/page/2/), and no list of the page is paged here (its query says why, \`query.pagination\`): the page lists every entry its query selects, with more entries on one page than the live one has, and the live /page/N/ addresses (indexed and linked) do not exist in the migrated site: they need a redirect.`,
       where: pageWhere,
       data: { page: page.file },
     });
   }
 
   const style = converted === undefined ? undefined : pageStyle(env, converted, pageWhere);
-  const elements = elementsFor(env, resolved, page.file);
+  const elements = elementsFor(env, resolved, file);
   const states = new Set(converted?.used.states ?? []);
   for (const key of droppedStates) states.delete(key);
   const content = pageContent(
@@ -3361,11 +3398,12 @@ async function bodyPage(input: BodyInput): Promise<BodyBuilt> {
   }
   return {
     info: {
-      file: page.file,
+      file,
       route: page.route,
       template: group.slug,
       kind: page.kind,
       layout,
+      ...(paging === undefined ? {} : { paged: true as const }),
     },
     content,
   };
@@ -3528,7 +3566,7 @@ export async function buildTemplates(
         }
       }
       const built = await bodyPage({ env, page, group, ...(data ? { data } : {}), frames, now });
-      files.push({ path: page.file, content: built.content });
+      files.push({ path: built.info.file, content: built.content });
       pages.push(built.info);
     });
   }

@@ -28,8 +28,9 @@
  * keeps producing placeholders), `placeholder.marker-leaked` (error: see below).
  *
  * `wp2jx-inner` is not one of them: it is the private marker `core/static.ts` puts where an inner
- * block goes, and it never leaves a converter ({@link INTERNAL_MARKERS}). Finding one in a result is
- * a bug in the converter that made it.
+ * block goes, and it never leaves a converter ({@link INTERNAL_MARKERS}). Nor is `wp2jx-pager-mark`,
+ * which a pagination block of a paged list leaves for its own query (`cwicly/blocks/data.ts`) to put
+ * the pager at. Finding either in a result is a bug in the converter that made it.
  */
 import { joinClass } from "./jx-util.ts";
 import type { JxElement, JxNode, Report } from "./types.ts";
@@ -48,7 +49,7 @@ export const BLOCK = "block";
 export const tagOf = (kind: string): string => `${PLACEHOLDER_PREFIX}${kind}`;
 
 /** Markers that are scaffolding of one converter, not placeholders for an emitter: they must not survive a conversion. */
-export const INTERNAL_MARKERS: readonly string[] = ["wp2jx-inner"];
+export const INTERNAL_MARKERS: readonly string[] = ["wp2jx-inner", "wp2jx-pager-mark"];
 
 /**
  * The attributes each kind carries, the ones named here being the contract. `data-block` is the

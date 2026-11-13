@@ -89,6 +89,7 @@ import { fileURLToPath } from "node:url";
 import { collectWpClasses } from "../core/block-css.ts";
 import { postData } from "../cwicly/tokens.ts";
 import { convertSubject, dedupeRules, type Converted } from "../convert.ts";
+import { pagedPage } from "./paging.ts";
 import { fluentFormFor } from "./fluentform.ts";
 import { geoMapFor } from "./geomap.ts";
 import { rewriteStyleUrls } from "./style-urls.ts";
@@ -178,6 +179,8 @@ export interface PageInfo {
   file: string;
   /** The `$layout` it carries, or null when no layout could be chosen. */
   layout: string | null;
+  /** The page is built in pages of one of its lists (`emit/paging.ts`): `file` is its catch-all. */
+  paged?: true;
 }
 
 export interface PageSkip {
@@ -705,7 +708,8 @@ function stateKeysIn(value: unknown, into: Set<string>): void {
   for (const [key, inner] of Object.entries(value)) {
     if (key === "$ref" && typeof inner === "string") {
       const state = stateKeyOf(inner);
-      if (state !== undefined) into.add(state);
+      // `$page` is the build's own (a page's route and pagination), not an entry a page declares.
+      if (state !== undefined && !state.startsWith("$")) into.add(state);
     } else stateKeysIn(inner, into);
   }
 }
@@ -1001,7 +1005,7 @@ export async function buildPages(site: SiteContext, opts: PageOptions = {}): Pro
     const pageReport = createReport();
     let converted: Converted;
     try {
-      converted = await convert(site, subject, { mode: "static", target: "page" });
+      converted = await convert(site, subject, { mode: "static", target: "page", pageable: true });
     } catch (error) {
       skip(post, {
         severity: "error",
@@ -1211,9 +1215,20 @@ export async function buildPages(site: SiteContext, opts: PageOptions = {}): Pro
         });
       }
 
+      // A page that pages one of its lists is a paged route (its pager reads `$page.pagination`).
+      const written =
+        converted.paging === undefined
+          ? { file: route.file, doc }
+          : pagedPage(route.file, doc, converted.paging, pageReport);
       for (const found of pageReport.entries()) addEntry(post, url, found);
-      files.push({ path: route.file, content: `${JSON.stringify(doc, null, 2)}\n` });
-      pages.push({ id: post.id, route: route.jxRoute, file: route.file, layout });
+      files.push({ path: written.file, content: `${JSON.stringify(written.doc, null, 2)}\n` });
+      pages.push({
+        id: post.id,
+        route: route.jxRoute,
+        file: written.file,
+        layout,
+        ...(converted.paging === undefined ? {} : { paged: true as const }),
+      });
       for (const tag of components) used.components.add(tag);
       for (const name of collectWpClasses(nodes)) used.wpClasses.add(name);
       for (const key of wanted) used.states.add(key);

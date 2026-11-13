@@ -12,24 +12,27 @@
  * `<div class="cc-query-item">`. {@link planQuery} reads those attributes into a plan; the plan is
  * written as Jx in one of three ways, by where the list lives:
  *
- * - **A list a collection can say** (one post type, an order, a limit, rules on a top-level field such
- *   as `url`) is ONE `ContentCollection` state entry with `filter`, `sort` and `limit`, and the loop is
- *   `{"$prototype": "Array", "items": {"$ref": "#/state/<list>"}, "map": <the item>}`: what Studio's
- *   collection panel edits, validated, with no JavaScript. The entry carries `$src` because
- *   `jx validate` wants it.
- * - **A list a collection cannot say** (taxonomy terms, the current entry or archive term, several post
- *   types, a meta comparison) is the computed children of the spec's section 8.4: the element's one
- *   child is `"${(<list>).map(($i0) => (<item>))}"`, `<list>` an expression over `state` that filters,
- *   orders and cuts the unfiltered collections (one state entry per post type, shared by every list of
- *   the page), and `<item>` the item tree as a JavaScript literal ({@link nodeExpr}). This is measured
- *   (`.dev/data/probe*.ts`), not guessed: a collection `filter` cannot read a nested field (`terms` is
- *   an object of objects), cannot name the current entry (a template or `$ref` in a rule is never
- *   resolved), `contains` on an array of `{slug, name, url}` never matches; a `Function` state entry
- *   with `timing: "compiler"` builds without JavaScript but `jx validate` rejects it (the schema's
- *   `FunctionDef` has no `timing`, and the spec's compile-time entries are external classes with an
- *   `$implementation`); an `Array` whose `items` is computed is a client render. Computed children
- *   validate, build static and ship no JavaScript, an empty list included. The two ways list the same
- *   entries and print the same page, which the tests compare byte for byte.
+ * - **A list a collection can say** is ONE `ContentCollection` state entry with `filter`, `sort` and
+ *   `limit`, and the loop is `{"$prototype": "Array", "items": {"$ref": "#/state/<list>"}, "map": <the
+ *   item>}`: what Studio's collection panel edits, validated, with no JavaScript. The entry carries
+ *   `$src` because `jx validate` wants it. A collection (site-architecture.md §6.4, Jx 8.1) lists one
+ *   post type or several (`contentType: [...]`), and its rules ({@link Rule}) read a dotted path that
+ *   crosses lists (`terms.series.slug contains <slug>`) and compare with a reference the page resolves
+ *   (`#/$params/slug`, `#/state/entry/data/url`). So a plan's url rules, its taxonomy clauses of one
+ *   term (and every `NOT IN`, `AND`, `EXISTS`), one author, and its true/false meta fields are rules;
+ *   an "or" of several terms, a hierarchy, text compared without regard to case, a search, an offset
+ *   and an order by title are not.
+ * - **A list a collection cannot say** is the computed children of the spec's section 8.4: the
+ *   element's one child is `"${(<list>).map(($i0) => (<item>))}"`, `<list>` an expression over `state`
+ *   that filters, orders and cuts the unfiltered collections (one state entry per post type, shared by
+ *   every list of the page), and `<item>` the item tree as a JavaScript literal ({@link nodeExpr}).
+ *   A `Function` state entry with `timing: "compiler"` builds without JavaScript but `jx validate`
+ *   rejects it; an `Array` whose `items` is computed is a client render. Computed children validate,
+ *   build static and ship no JavaScript, an empty list included, where an EMPTY mapped `Array` is
+ *   rendered in the browser: so a list the rules could say is computed too where it can be empty on a
+ *   route the page builds (its rules read the page's entry or the route's parameter) or is empty today
+ *   ({@link registerPostList}), and a paged list's items are computed over its collection. The two
+ *   ways list the same entries and print the same page, which the tests compare.
  * - **A Markdown entry cannot hold a loop** (it has no state, and a text child is never evaluated), so a
  *   query inside a post of any non-page type is written out: the entries the plan selects NOW, the
  *   template converted once per entry as a static page of that entry (`query.static`).
@@ -40,14 +43,23 @@
  * array makes its parent a client render (docs/bindings.md, rule 10), and the parent is then only the
  * query template's own element, never a container with siblings.
  *
- * **Pagination does not exist in Jx.** A query with a pagination device (`infiniteLoad`, a
- * `query-pagination` block, a previous, next or load-more link) lists ALL its entries (a list with no
- * way to reach the rest would lose content) and says so (`query.pagination`, with the counts); one
- * without is a plain limit (a "latest six" on a home page). The live page shows the first page and a
- * device, so the list is written the same way ({@link withLoadMore}): the entries past the page size
- * are hidden by a rule until a checkbox, the query's first child, is checked, which the "Load more"
- * button (or one of ours, where the page has none) does as a `label`. No script; one click shows
- * every entry, where the plugin loads a page at a time.
+ * **A paged list.** A query with a pagination device (`infiniteLoad`, a `query-pagination` block, a
+ * previous, next or load-more link, in the query or in a component it holds) is paged on the live
+ * site. Where its page is a page of its own (`SubjectOptions.pageable`: a page, a listing, a term or
+ * author page), the list is a collection whose rules read nothing of the page's state, and the page
+ * pages no other list, it claims the page's paging ({@link pagedHere}): the page is built once per
+ * page of the list (`emit/paging.ts`: `$paths` `paginate`, site-architecture.md §4.3), and the device
+ * is a pager over `$page.pagination` ({@link withPager}): in place of the "Load more" button (with its
+ * look), the first pagination block, or the component that is the pager. Any other paged list lists
+ * ALL its entries (a list with no way to reach the rest would lose content) and says why
+ * (`query.pagination`, with the counts); the live page shows the first page and a device, so the list
+ * is written the same way ({@link withLoadMore}): the entries past the page size are hidden by a rule
+ * until a checkbox, the query's first child, is checked, which the "Load more" button (or one of
+ * ours) does as a `label`. One without a device is a plain limit (a "latest six" on a home page).
+ *
+ * **A slider.** A query template that is a slider on the live page (`repeaterSlider`, Splide) puts
+ * its items in the site's slider component (`emit/slider.ts`, `SubjectCtx.sliderTag`), with the
+ * block's autoplay, interval and rewind as its properties.
  *
  * What the plan reads, from the PHP: `post_type` (default `post`), `posts_per_page` (an `absint` of
  * the number the block holds: `-1` is 1, and `0`, a word or nothing is the site's own
@@ -127,7 +139,8 @@
  * `serializedInnerBlocks` is the slot content: converted in the instance's context and written as
  * the host's children (the component's `innerblocks` is its one default `<slot>`).
  *
- * Report codes: `block.unsupported`, `query.approximated`, `query.url-parameter`, `query.pagination`,
+ * Report codes: `block.unsupported`, `query.approximated`, `query.url-parameter`, `query.pagination`
+ * (info when the list is paged, warn when it is not, with `why`),
  * `query.static`, `query.empty`, `query.type-unrouted`, `query.term-missing`, `query.slider`,
  * `loop.nested`, `component.missing`, `component.unknown-property`, `component.parent-unresolved`,
  * `component.property-unsupported`, `component.variant-unknown`, `component.markup-in-text`,
@@ -161,8 +174,10 @@ import {
   type Ref,
 } from "../tokens.ts";
 import { blockVisibility, type Visibility } from "../conditions.ts";
+import { formulaFunctions } from "../../formulas.ts";
 import { joinClass } from "../../jx-util.ts";
 import { walkElements } from "../../placeholders.ts";
+import { sliderProps } from "../../emit/slider.ts";
 import {
   assemble,
   baseName,
@@ -272,11 +287,24 @@ const staticOne = (s: Src): string | undefined => (s.kind === "static" ? s.value
 
 // ── The plan ─────────────────────────────────────────────────────────────────────────────────────
 
-/** A `ContentCollection` filter rule. Only the two operators whose meaning is the same in every reader are written. */
+/**
+ * A rule's value: a literal, or a reference the collection resolves where the page is built
+ * (`#/$params/<name>`, the route's parameter; `#/state/<pointer>`, an entry declared earlier in the
+ * page's state).
+ */
+export type RuleValue = string | boolean | { $ref: string };
+
+/**
+ * A `ContentCollection` filter rule (site-architecture.md §6.4). `field` may be a dotted path through
+ * the entry's data that crosses arrays (`terms.series.slug` is the slugs of the entry's series), and
+ * `contains` then asks whether any of them is the value. Only operators whose meaning the plan can
+ * state exactly are written: the comparisons of text are MySQL's, without regard to case, and stay
+ * JavaScript.
+ */
 export interface Rule {
   field: string;
-  op: "==" | "!=";
-  value: string;
+  op: "==" | "!=" | "contains" | "not contains" | "empty" | "not empty";
+  value?: RuleValue;
 }
 
 export interface SortRule {
@@ -284,10 +312,14 @@ export interface SortRule {
   order: "asc" | "desc";
 }
 
-/** One condition on the entries of a query: a collection rule when it can be one, and the same as JavaScript over an entry `e`. */
+/** One condition on the entries of a query: collection rules when it can be them, and the same as JavaScript over an entry `e`. */
 export interface Cond {
-  /** The rule a `ContentCollection` `filter` can say; absent when the condition needs more. */
-  native?: Rule;
+  /**
+   * The rules a `ContentCollection` `filter` can say, every one of which an entry must pass (none: the
+   * condition keeps every entry); absent when the condition needs more (an `or`, a hierarchy, text
+   * compared without regard to case).
+   */
+  native?: Rule[];
   /** A JavaScript expression over `e` (an entry `{id, data}`), true for an entry that stays. */
   js: string;
   /** Whether it reads page state (`state.entry`, `state.term`): it cannot be evaluated at conversion. */
@@ -429,12 +461,51 @@ export function currentOf(ctx: ConvertCtx): Current {
     : { kind: "post", post, facts: postFacts(ctx, post) };
 }
 
-/** The archive's term as expressions, when the conversion has one that a state entry can read. */
-function archiveTerm(ctx: ConvertCtx): { slug: string; taxonomy: string } | undefined {
+/**
+ * What the templates emitter knows of a term page that the conversion's own `termExpr` does not: the
+ * taxonomy every route of the page is of (a template that serves categories and tags is converted
+ * once for each), and the route parameter that names the term (`slug`: the term's slug, which is its
+ * entry's id). Set through `SubjectOptions.termArchive`.
+ */
+export interface TermArchive {
+  taxonomy: string;
+  param: string;
+}
+
+const termArchiveOf = (ctx: ConvertCtx): TermArchive | undefined =>
+  (ctx as { termArchive?: TermArchive }).termArchive;
+
+/**
+ * The archive's term, when the conversion has one that page state can read: as expressions (`slug`,
+ * `taxonomy`), and as what a collection rule compares with (`ref`). The rule reads the route's
+ * parameter where the page says which one names the term, because a paged list is cut into pages
+ * before the page's other state entries exist (`#/state/term/…` is nothing then), and the term's own
+ * entry otherwise. `staticTaxonomy` is the taxonomy when every route of the page is of the same one.
+ */
+function archiveTerm(
+  ctx: ConvertCtx,
+): { slug: string; taxonomy: string; ref: RuleValue; staticTaxonomy?: string } | undefined {
   const t = ctx.termExpr;
   if (t === undefined || !isStateExpr(t) || /^\$map\b/.test(t)) return undefined;
-  return { slug: `${t}.data.slug`, taxonomy: `${t}.data.taxonomy` };
+  const known = termArchiveOf(ctx);
+  const pointer = known === undefined ? pointerOf(t, "data", "slug") : `#/$params/${known.param}`;
+  return {
+    slug: `${t}.data.slug`,
+    taxonomy: `${t}.data.taxonomy`,
+    ref: { $ref: pointer ?? "#/$params/slug" },
+    ...(known === undefined ? {} : { staticTaxonomy: known.taxonomy }),
+  };
 }
+
+/** The pointer to a field of the page's current entry, for a rule; undefined inside a loop, which a page-level list cannot read. */
+function entryRef(cur: Current, ...path: string[]): RuleValue | undefined {
+  if (cur.kind !== "entry" || !isStateExpr(cur.expr) || /^\$map\b/.test(cur.expr)) return undefined;
+  const pointer = pointerOf(cur.expr, "data", ...path);
+  return pointer === undefined ? undefined : { $ref: pointer };
+}
+
+/** The field of an entry's terms of a taxonomy: their slugs, read through the list (`terms.series.slug`). */
+const termsField = (taxonomy: string): string => `terms.${taxonomy}.slug`;
 
 // ── The JavaScript the conditions are written in ─────────────────────────────────────────────────
 
@@ -562,6 +633,10 @@ function shortcodeKind(
 interface Clause {
   js: string;
   why: string;
+  /** The same as collection rules, all of which must hold; absent when they cannot say it. */
+  native?: Rule[];
+  /** The entry keys a meta clause reads (the true/false fields are said as rules: {@link booleanRules}). */
+  fields?: string[];
 }
 
 interface PlanEnv {
@@ -588,6 +663,21 @@ function termClause(operator: string, byTax: Map<string, string[]>): string {
   );
   const any = parts.length === 0 ? "false" : op === "AND" ? parts.join(" && ") : parts.join(" || ");
   return op === "NOT IN" ? `!(${any || "false"})` : `(${any})`;
+}
+
+/**
+ * {@link termClause} as collection rules, where rules joined by "and" can say it: `NOT IN` is no slug
+ * of any (one `not contains` each), `AND` every slug (one `contains` each), `IN` one slug of one
+ * taxonomy. `IN` over several is an "or", which a filter cannot say, and a clause that names no term
+ * at all matches nothing, which no rule says either.
+ */
+function termRules(operator: string, byTax: Map<string, string[]>): Rule[] | undefined {
+  const op = operator.toUpperCase();
+  const pairs = [...byTax].flatMap(([tax, slugs]) => slugs.map((slug) => [tax, slug] as const));
+  if (op === "NOT IN")
+    return pairs.map(([tax, value]) => ({ field: termsField(tax), op: "not contains", value }));
+  if (pairs.length === 0 || (op !== "AND" && pairs.length > 1)) return undefined;
+  return pairs.map(([tax, value]) => ({ field: termsField(tax), op: "contains", value }));
 }
 
 /** One tax clause of a query: `{taxonomy, field, terms, operator, include_children}`, each one a wrapped attribute. */
@@ -625,9 +715,11 @@ function taxClause(env: PlanEnv, clause: Rec): Clause | undefined {
   if (existsOnly) {
     if (taxonomy === undefined) return undefined;
     const has = `(e.data.terms?.[${j(taxonomy)}] ?? []).length > 0`;
+    const not = /^NOT/i.test(operator);
     return {
-      js: /^NOT/i.test(operator) ? `!(${has})` : `(${has})`,
+      js: not ? `!(${has})` : `(${has})`,
       why: `${operator} ${taxonomy}`,
+      native: [{ field: termsField(taxonomy), op: not ? "empty" : "not empty" }],
     };
   }
 
@@ -651,9 +743,11 @@ function taxClause(env: PlanEnv, clause: Rec): Clause | undefined {
       });
     }
     const byTax = slugsByTaxonomy(terms);
+    const native = termRules(operator, byTax);
     return {
       js: termClause(operator, byTax),
       why: `${operator} ${[...byTax].map(([t, s]) => `${t}:${s.join("|")}`).join(" ")}`,
+      ...(native === undefined ? {} : { native }),
     };
   }
   // A dynamic source.
@@ -693,6 +787,11 @@ function taxClause(env: PlanEnv, clause: Rec): Clause | undefined {
   let tax: string;
   let kidsOf: Record<string, string[]> = {};
   let what: string;
+  /** The rules, where they can say it: the taxonomy by name, and the one slug as a value or a reference. */
+  let ruleTax: string | undefined;
+  let ruleValue: RuleValue | undefined;
+  /** The current post's own slugs, where the conversion knows them: no slug is no clause. */
+  let known: string[] | undefined;
   if (code.kind === "archive") {
     const archive = archiveTerm(ctx);
     if (archive === undefined) {
@@ -703,18 +802,26 @@ function taxClause(env: PlanEnv, clause: Rec): Clause | undefined {
     tax = taxonomy === undefined ? (taxonomyExpr ?? archive.taxonomy) : j(taxonomy);
     if (taxonomy !== undefined && children) kidsOf = childMap(ctx, taxonomy);
     what = "the archive term";
+    ruleTax = taxonomy ?? archive.staticTaxonomy;
+    ruleValue = archive.ref;
   } else {
     // The current post's terms of the clause's taxonomy: the first by name (a `<taxonomy>_id` shortcode) or all of them (`postterms`).
     const taxName = code.taxonomy;
     const cur = env.current;
     const all = code.kind === "first-all";
+    ruleTax = taxName;
     if (cur.kind === "entry" && isStateExpr(cur.expr) && !/^\$map\b/.test(cur.expr)) {
       const own = `${cur.expr}.data.terms?.[${j(taxName)}]`;
       slugs = all ? `(${own} ?? []).map((x) => x.slug)` : `[${own}?.[0]?.slug].filter(Boolean)`;
+      // Not quite the clause for `IN`: WordPress drops a clause whose terms are none, and a rule's
+      // reference is then nothing, which no entry holds. Moot while rules that read the entry are
+      // not written ({@link registerPostList}).
+      if (!all) ruleValue = entryRef(cur, "terms", taxName, "0", "slug");
     } else if (cur.kind === "post") {
       const own =
         (cur.facts.terms as Record<string, { slug: string }[]> | undefined)?.[taxName] ?? [];
-      slugs = j((all ? own : own.slice(0, 1)).map((t) => t.slug));
+      known = (all ? own : own.slice(0, 1)).map((t) => t.slug);
+      slugs = j(known);
     } else {
       drop(
         env,
@@ -735,14 +842,51 @@ function taxClause(env: PlanEnv, clause: Rec): Clause | undefined {
       : op === "NOT IN"
         ? `!has(e, ${tax}, ${some})`
         : `has(e, ${tax}, ${some})`;
-  return { js: `((sl) => sl.length === 0 || ${test})(${slugs})`, why: `${operator} ${what}` };
+  // As rules: one slug (a value, or a reference the page resolves) of a taxonomy known by name, with
+  // no children to reach as well (a filter cannot look a term's descendants up).
+  let native: Rule[] | undefined;
+  if (ruleTax !== undefined && Object.keys(kidsOf).length === 0) {
+    if (known !== undefined) {
+      native = known.length === 0 ? [] : termRules(operator, new Map([[ruleTax, known]]));
+    } else if (ruleValue !== undefined) {
+      native = [
+        {
+          field: termsField(ruleTax),
+          op: op === "NOT IN" ? "not contains" : "contains",
+          value: ruleValue,
+        },
+      ];
+    }
+  }
+  return {
+    js: `((sl) => sl.length === 0 || ${test})(${slugs})`,
+    why: `${operator} ${what}`,
+    ...(native === undefined ? {} : { native }),
+  };
+}
+
+/**
+ * Clauses as one: their JavaScript joined by the relation, and their rules when the rules can say it,
+ * which is every clause's rules under "and" (a filter's rules all hold), or the one clause's own.
+ */
+function joined(parts: readonly Clause[], or: boolean): Clause {
+  const rel = or ? " || " : " && ";
+  const rules = parts.map((c) => c.native);
+  const native =
+    (parts.length === 1 || !or) && rules.every((r): r is Rule[] => r !== undefined)
+      ? rules.flat()
+      : undefined;
+  return {
+    js: parts.length === 1 ? parts[0]!.js : `(${parts.map((c) => c.js).join(rel)})`,
+    why: parts.map((c) => c.why).join(rel),
+    ...(native === undefined ? {} : { native }),
+  };
 }
 
 /** `tax_query` of a query: the clauses, joined by the relation the block says (AND by default). */
 function taxConds(env: PlanEnv, a: Rec): Cond[] {
-  const clauses: string[] = [];
-  const whys: string[] = [];
-  const relation = (str(a.queryTaxonomyRelation) ?? "").toUpperCase() === "OR" ? "||" : "&&";
+  const clauses: Clause[] = [];
+  const or = (str(a.queryTaxonomyRelation) ?? "").toUpperCase() === "OR";
   for (const raw of list(a.queryTaxonomy)) {
     const clause = record(raw);
     if (clause === undefined) continue;
@@ -753,23 +897,24 @@ function taxConds(env: PlanEnv, a: Rec): Cond[] {
         .map((c) => (record(c) ? taxClause(env, record(c)!) : undefined))
         .filter((c): c is Clause => c !== undefined);
       if (inner.length > 0) {
-        const rel = (str(clause.relation) ?? "").toUpperCase() === "OR" ? " || " : " && ";
-        made = {
-          js: `(${inner.map((c) => c.js).join(rel)})`,
-          why: inner.map((c) => c.why).join(rel),
-        };
+        const group = joined(inner, (str(clause.relation) ?? "").toUpperCase() === "OR");
+        made = { ...group, js: inner.length === 1 ? `(${group.js})` : group.js };
       }
     } else {
       made = taxClause(env, clause);
     }
-    if (made) {
-      clauses.push(made.js);
-      whys.push(made.why);
-    }
+    if (made) clauses.push(made);
   }
   if (clauses.length === 0) return [];
-  const js = clauses.length === 1 ? clauses[0]! : `(${clauses.join(` ${relation} `)})`;
-  return [{ js, dynamic: isDynamic(js), why: `tax_query ${whys.join(` ${relation} `)}` }];
+  const all = joined(clauses, or);
+  return [
+    {
+      js: all.js,
+      dynamic: isDynamic(all.js),
+      why: `tax_query ${all.why}`,
+      ...(all.native === undefined ? {} : { native: all.native }),
+    },
+  ];
 }
 
 // ── Meta, exclusions, search, order ──────────────────────────────────────────────────────────────
@@ -869,11 +1014,52 @@ function metaClause(env: PlanEnv, m: Rec): Clause | undefined {
       detail: `meta ${compare} ${key}`,
     });
   }
-  return { js: `((v) => ${body})(${read})`, why: `meta ${key} ${compare} ${values.join(",")}` };
+  return {
+    js: `((v) => ${body})(${read})`,
+    why: `meta ${key} ${compare} ${values.join(",")}`,
+    fields: [key],
+  };
+}
+
+/** Whether the site's ACF field of that name is a true/false switch: an entry holds `true`, `false`, or nothing. */
+const isSwitch = (ctx: ConvertCtx, name: string): boolean =>
+  ctx.acf.groups.some((g) => g.fields.some((f) => f.name === name && f.type === "true_false"));
+
+/** What each set of the values a switch can hold is, as rules: an empty set is no rule (nothing would pass). */
+const SWITCH_RULES: Record<string, (field: string) => Rule[]> = {
+  "true,false,undefined": () => [],
+  true: (field) => [{ field, op: "==", value: true }],
+  false: (field) => [{ field, op: "==", value: false }],
+  undefined: (field) => [{ field, op: "empty" }],
+  "false,undefined": (field) => [{ field, op: "!=", value: true }],
+  "true,undefined": (field) => [{ field, op: "!=", value: false }],
+  "true,false": (field) => [{ field, op: "not empty" }],
+};
+
+/**
+ * A meta clause over one true/false switch as rules. A switch holds one of three things, so the
+ * clause's own JavaScript is asked about each and the values it keeps are said as rules: exactly what
+ * it does, whatever comparison and grouping it is made of (`!= 1 OR NOT EXISTS`, the plugin's way of
+ * saying "not on", is `!= true`).
+ */
+function switchRules(ctx: ConvertCtx, clause: Clause): Rule[] | undefined {
+  const [name, ...more] = new Set(clause.fields ?? []);
+  if (name === undefined || more.length > 0 || !isSwitch(ctx, name)) return undefined;
+  const field = entryKey(name);
+  const keep = compileConditions([{ js: clause.js, dynamic: false, why: "" }]);
+  const kept = [true, false, undefined].filter((v) =>
+    keep({ id: "", data: v === undefined ? {} : { [field]: v } } as EntryLike),
+  );
+  return SWITCH_RULES[kept.map(String).join(",")]?.(field);
 }
 
 function metaConds(env: PlanEnv, a: Rec): Cond[] {
   const parts: Clause[] = [];
+  /** A clause with the fields it reads, and its rules where it reads one switch. */
+  const withRules = (c: Clause): Clause => {
+    const native = switchRules(env.ctx, c);
+    return native === undefined ? c : { ...c, native };
+  };
   for (const raw of list(a.queryMeta)) {
     const m = record(raw);
     if (m === undefined) continue;
@@ -883,26 +1069,42 @@ function metaConds(env: PlanEnv, a: Rec): Cond[] {
         .filter((c): c is Clause => c !== undefined);
       if (inner.length > 0) {
         const rel = (str(m.relation) ?? "").toUpperCase() === "OR" ? " || " : " && ";
-        parts.push({
-          js: `(${inner.map((c) => c.js).join(rel)})`,
-          why: inner.map((c) => c.why).join(rel),
-        });
+        parts.push(
+          withRules({
+            js: `(${inner.map((c) => c.js).join(rel)})`,
+            why: inner.map((c) => c.why).join(rel),
+            fields: inner.flatMap((c) => c.fields ?? []),
+          }),
+        );
       }
     } else {
       const made = metaClause(env, m);
-      if (made) parts.push(made);
+      if (made) parts.push(withRules(made));
     }
   }
   if (parts.length === 0) return [];
-  const rel = (str(a.queryMetaRelation) ?? "").toUpperCase() === "OR" ? " || " : " && ";
+  const or = (str(a.queryMetaRelation) ?? "").toUpperCase() === "OR";
+  const rel = or ? " || " : " && ";
   const js = parts.length === 1 ? parts[0]!.js : `(${parts.map((p) => p.js).join(rel)})`;
-  return [{ js, dynamic: false, why: parts.map((p) => p.why).join(rel) }];
+  // Under "or" the parts are one clause, which is rules only when it reads one switch.
+  const all =
+    or && parts.length > 1
+      ? withRules({ js, why: "", fields: parts.flatMap((p) => p.fields ?? []) })
+      : joined(parts, false);
+  return [
+    {
+      js,
+      dynamic: false,
+      why: parts.map((p) => p.why).join(rel),
+      ...(all.native === undefined ? {} : { native: all.native }),
+    },
+  ];
 }
 
 /** `url` is what names an entry: unique across the site, and a collection filter can read it. */
 function urlRule(url: string, why: string): Cond {
   return {
-    native: { field: "url", op: "!=", value: url },
+    native: [{ field: "url", op: "!=", value: url }],
     js: `e.data.url !== ${j(url)}`,
     dynamic: false,
     why,
@@ -924,10 +1126,12 @@ function authorConds(env: PlanEnv, a: Rec): Cond[] {
   if (ofPage) {
     const cur = env.current;
     if (cur.kind === "entry" && isStateExpr(cur.expr) && !/^\$map\b/.test(cur.expr)) {
+      const value = entryRef(cur, "authorUrl");
       out.push({
         js: `e.data.authorUrl === ${cur.expr}.data.authorUrl`,
         dynamic: true,
         why: "the author of the page",
+        ...(value === undefined ? {} : { native: [{ field: "authorUrl", op: "==", value }] }),
       });
     } else if (cur.kind === "post") {
       const url = ctx.urlForAuthor?.(cur.post.authorId);
@@ -937,6 +1141,7 @@ function authorConds(env: PlanEnv, a: Rec): Cond[] {
           js: `e.data.authorUrl === ${j(url)}`,
           dynamic: false,
           why: "the author of the page",
+          native: [{ field: "authorUrl", op: "==", value: url }],
         });
     } else drop(env, "the author of the page, where this conversion has no page");
   } else {
@@ -952,6 +1157,8 @@ function authorConds(env: PlanEnv, a: Rec): Cond[] {
       js: `${j(urls)}.includes(e.data.authorUrl)`,
       dynamic: false,
       why: `authors ${ids.join(",")}`,
+      // One author is a rule; several are an "or".
+      ...(urls.length === 1 ? { native: [{ field: "authorUrl", op: "==", value: urls[0]! }] } : {}),
     });
   } else if (srcOf(a.queryAuthor).kind === "dynamic")
     drop(env, "authors read from a dynamic source");
@@ -971,6 +1178,7 @@ function excludeConds(env: PlanEnv, a: Rec): Cond[] {
       js: `${j(urls)}.includes(e.data.url)`,
       dynamic: false,
       why: `include posts ${includeIds.join(",")}`,
+      ...(urls.length === 1 ? { native: [{ field: "url", op: "==", value: urls[0]! }] } : {}),
     });
     // `WP_Query` ignores `post__not_in` once `post__in` names the posts: so do the exclusions.
     return out;
@@ -988,7 +1196,13 @@ function excludeConds(env: PlanEnv, a: Rec): Cond[] {
       if (url !== undefined) out.push(urlRule(url, "exclude the current post"));
     } else if (cur.kind === "entry" && isStateExpr(cur.expr) && !/^\$map\b/.test(cur.expr)) {
       const js = `e.data.url !== ${cur.expr}.data.url`;
-      out.push({ js, dynamic: true, why: "exclude the current entry" });
+      const value = entryRef(cur, "url");
+      out.push({
+        js,
+        dynamic: true,
+        why: "exclude the current entry",
+        ...(value === undefined ? {} : { native: [{ field: "url", op: "!=", value }] }),
+      });
     } else {
       drop(env, "the exclusion of the current post, where this conversion has no current post");
     }
@@ -1048,10 +1262,24 @@ function sortOf(env: PlanEnv, a: Rec): SortRule[] {
   return [{ field: "date", order }];
 }
 
-/** Whether a block has a way to reach the entries the first page does not show. */
-export function isPaginated(block: WpBlock): boolean {
-  if (block.attrs.infiniteLoad === true) return true;
-  const stack = [...block.innerBlocks];
+/** The blocks of the component an instance names, where the conversion knows the component. */
+function componentBlocks(ctx: ConvertCtx | undefined, block: WpBlock): WpBlock[] {
+  if (ctx === undefined || block.name !== "cwicly/component") return [];
+  const ref = text(block.attrs.ref);
+  const info = ref === undefined ? undefined : ctx.components.get(ref);
+  const post = info === undefined ? undefined : ctx.model.posts.get(info.postId);
+  return post === undefined ? [] : parseBlocks(post.content);
+}
+
+/**
+ * Whether blocks hold a way to the next page: a pagination block, or a link that goes to the previous
+ * or next page or loads more. A component instance is looked into: a site that draws its pager once
+ * keeps it in a component (anabaptistperspectives' `query-pagination`), and the plugin prints the
+ * component's blocks inside the query, where they read it.
+ */
+function holdsPager(blocks: readonly WpBlock[], ctx: ConvertCtx | undefined): boolean {
+  const stack = [...blocks];
+  const seen = new Set<string>();
   while (stack.length > 0) {
     const b = stack.pop()!;
     if (b.name === "cwicly/query-pagination" || b.name === "cwicly/query-pagination-numbers")
@@ -1059,9 +1287,22 @@ export function isPaginated(block: WpBlock): boolean {
     const action = text(b.attrs.linkWrapperAction);
     if (action === "prevQuery" || action === "nextQuery" || action === "infiniteButtonLoad")
       return true;
+    // A query inside the query pages its own list.
+    if (b.name === "cwicly/query") continue;
+    const ref = b.name === "cwicly/component" ? text(b.attrs.ref) : undefined;
+    if (ref !== undefined && !seen.has(ref)) {
+      seen.add(ref);
+      stack.push(...componentBlocks(ctx, b));
+    }
     stack.push(...b.innerBlocks);
   }
   return false;
+}
+
+/** Whether a block has a way to reach the entries the first page does not show. */
+export function isPaginated(block: WpBlock, ctx?: ConvertCtx): boolean {
+  if (block.attrs.infiniteLoad === true) return true;
+  return holdsPager(block.innerBlocks, ctx);
 }
 
 /** The `query*` attributes this module reads; any other one that holds a value is a condition left out. */
@@ -1203,7 +1444,17 @@ function planPosts(block: WpBlock, ctx: ConvertCtx, env: PlanEnv): PostPlan {
       const kids = hierarchies(ctx);
       const reach = Object.keys(kids).length === 0 ? "[s]" : `[s, ...(${j(kids)}[t]?.[s] ?? [])]`;
       const js = `((s, t) => !s || has(e, t, ${reach}))(${archive.slug}, ${archive.taxonomy})`;
-      conds.push({ js, dynamic: true, why: "the archive's term" });
+      // The archive's term as a rule, where the page is of one taxonomy that has no children to reach too.
+      const tax = archive.staticTaxonomy;
+      const flat = tax !== undefined && kids[tax] === undefined;
+      conds.push({
+        js,
+        dynamic: true,
+        why: "the archive's term",
+        ...(flat
+          ? { native: [{ field: termsField(tax), op: "contains", value: archive.ref }] }
+          : {}),
+      });
     } else if (mainType !== undefined) {
       // A singular main query is the one post.
       const cur = env.current;
@@ -1213,12 +1464,15 @@ function planPosts(block: WpBlock, ctx: ConvertCtx, env: PlanEnv): PostPlan {
           js: url === undefined ? "false" : `e.data.url === ${j(url)}`,
           dynamic: false,
           why: "the current post (the main query of a single is that post)",
+          ...(url === undefined ? {} : { native: [{ field: "url", op: "==", value: url }] }),
         });
       } else if (cur.kind === "entry" && isStateExpr(cur.expr) && !/^\$map\b/.test(cur.expr)) {
+        const value = entryRef(cur, "url");
         conds.push({
           js: `e.data.url === ${cur.expr}.data.url`,
           dynamic: true,
           why: "the current entry (the main query of a single is that entry)",
+          ...(value === undefined ? {} : { native: [{ field: "url", op: "==", value }] }),
         });
       }
     }
@@ -1255,7 +1509,7 @@ function planPosts(block: WpBlock, ctx: ConvertCtx, env: PlanEnv): PostPlan {
     offset: off,
     sort,
     conds,
-    paginated: isPaginated(block),
+    paginated: isPaginated(block, ctx),
     dropped,
   };
 }
@@ -1524,35 +1778,79 @@ export const lengthOf = (source: ListSource): string =>
     : `(${source.expr}).length`;
 
 /**
- * The list a post plan selects as a source for a loop. A single post type with nothing but collection
- * rules is one `ContentCollection` (`filter`, `sort`, `limit`); anything else is an expression over
- * unfiltered collections, one state entry per post type, shared by every list of the page.
- * `opts.inline` writes the expression even for a native plan (the tests compare the two).
+ * A plan's conditions as one `filter`: every condition's rules, or undefined when one of them has
+ * none (the list is then computed).
+ */
+export function nativeRules(plan: PostPlan): Rule[] | undefined {
+  const rules = plan.conds.map((c) => c.native);
+  return rules.every((r): r is Rule[] => r !== undefined) ? rules.flat() : undefined;
+}
+
+/** Whether a rule's value is a reference to the page's state (an entry's field), which a paged list cannot read. */
+export const readsState = (rules: readonly Rule[]): boolean =>
+  rules.some(
+    (r) => typeof r.value === "object" && r.value !== null && r.value.$ref.startsWith("#/state/"),
+  );
+
+/** Whether a rule's value is a reference to the route's parameters (an archive's term). */
+const readsRoute = (rules: readonly Rule[]): boolean =>
+  rules.some(
+    (r) => typeof r.value === "object" && r.value !== null && r.value.$ref.startsWith("#/$params/"),
+  );
+
+/** Whether a plan that reads no page state selects nothing today. */
+const emptyNow = (ctx: ConvertCtx, plan: PostPlan): boolean =>
+  evaluatePosts(ctx, plan, { all: true })?.length === 0;
+
+/**
+ * The list a post plan selects as a source for a loop. A plan whose every condition is collection
+ * rules, with no offset and no order by title, is one `ContentCollection` (`contentType`, one type or
+ * several, `filter`, `sort`, `limit`); anything else is an expression over unfiltered collections, one
+ * state entry per post type, shared by every list of the page. `opts.inline` writes the expression
+ * even for a native plan (the tests compare the two).
+ *
+ * Lists the rules can say stay expressions, because of what the build does with an EMPTY mapped
+ * `Array`: it leaves it for the browser to render, and the page ships the runtime (measured; Jx keeps
+ * the definition for a client that may fill it, which a list resolved where the page is built never
+ * is). An expression that lists nothing renders as nothing. So these are written as expressions:
+ *
+ * - a list whose rules read the page's entry (a related list, "not this one", the author's own):
+ *   empty on some of the routes the page builds, and WordPress drops a term clause the entry has no
+ *   term for, which a rule cannot;
+ * - a list whose rules read the route's parameter (an archive's term), unless it is the page's paged
+ *   list (`opts.paged`), which must be a collection: a term with no entries is an empty list;
+ * - a list that selects nothing today;
+ * - a list inside a component (a Cwicly component, a template part): the build resolves no
+ *   collection of a component's own state, so its list would be empty for every instance, where a
+ *   computed one is left out and said by the components emitter (`component.query-unsupported`).
  */
 export function registerPostList(
   ctx: ConvertCtx,
   plan: PostPlan,
   id: string,
-  opts: { inline?: boolean } = {},
+  opts: { inline?: boolean; paged?: boolean } = {},
 ): ListSource {
   const base = typeKey(plan.types[0] ?? "post");
   const name = `${base}_q${keyOf(id)}`;
   const limit = plan.paginated ? undefined : plan.perPage;
   const sorts = plan.sort.map((s) => ({ field: s.field, order: s.order }));
-  const natives = plan.conds.map((c) => c.native);
-  const allNative = natives.every((n): n is Rule => n !== undefined);
+  const natives = nativeRules(plan);
   const collated = plan.sort.some((r) => COLLATED.has(r.field));
   if (
     opts.inline !== true &&
-    plan.types.length === 1 &&
-    allNative &&
+    plan.types.length > 0 &&
+    natives !== undefined &&
+    !readsState(natives) &&
     plan.offset === 0 &&
-    !collated
+    !collated &&
+    !inComponent(ctx) &&
+    (opts.paged === true || (!readsRoute(natives) && !emptyNow(ctx, plan)))
   ) {
+    // Several types are one collection over all of them: their entries in the block's order, then sorted.
     const key = defineState(ctx, name, {
       $prototype: "ContentCollection",
       $src: COLLECTION_SRC,
-      contentType: plan.types[0],
+      contentType: plan.types.length === 1 ? plan.types[0] : [...plan.types],
       ...(natives.length > 0 ? { filter: natives } : {}),
       sort: sorts,
       ...(limit === undefined ? {} : { limit }),
@@ -1792,6 +2090,8 @@ export type Loop =
       users?: boolean;
       /** The rows themselves, for a list the item is written out for (a component's terms). */
       rows?: readonly unknown[];
+      /** The list is the page's paged list: the pagination blocks inside are its pager. */
+      paged?: boolean;
     }
   | { kind: "static"; posts: WpPost[] }
   | { kind: "none" };
@@ -1802,6 +2102,10 @@ const loopOf = (ctx: ConvertCtx): Loop | undefined =>
 /** Context overrides that carry a loop (or clear it, with `undefined`) to the blocks inside. */
 const withLoop = (loop: Loop | undefined, more: Partial<ConvertCtx> = {}): Partial<ConvertCtx> =>
   ({ ...more, [LOOP]: loop }) as unknown as Partial<ConvertCtx>;
+
+/** The tag of the site's slider component (`SubjectCtx.sliderTag`), where the conversion has one. */
+const sliderTagOf = (ctx: ConvertCtx): string | undefined =>
+  (ctx as { sliderTag?: string }).sliderTag;
 
 /** Whether the blocks being converted become a component (a Cwicly component or a template part). */
 const inComponent = (ctx: ConvertCtx): boolean =>
@@ -1913,22 +2217,49 @@ const hasLoopRefs = (value: unknown): boolean =>
     ? value.some(hasLoopRefs)
     : "$prototype" in value || "$ref" in value || Object.values(value).some(hasLoopRefs));
 
-/** The value of a binding that reads the row alone, or `undefined` when it reads anything else (a name the build knows and this does not) or fails. */
-function rowValue(expr: string, row: unknown, index: number): { value: unknown } | undefined {
+/**
+ * The `state` a binding of a row may read here: the converter's formulas, and nothing of a page. A
+ * read of anything else throws, so the binding is left for the build, which has the page's state.
+ * `language` is the locale the pages are in, which `formatDate` writes a date in.
+ */
+const rowState = (language: string): object =>
+  new Proxy(formulaFunctions({ $page: { locale: language } }), {
+    get(formulas, key, receiver): unknown {
+      // Its own names only: `state.constructor` is the page's to answer, not `Object`'s.
+      if (!Object.hasOwn(formulas, key)) throw new ReferenceError("not a formula");
+      return Reflect.get(formulas, key, receiver);
+    },
+  });
+
+/** One row of a list whose rows are known: the row, where it stands, and the `state` its bindings may read. */
+interface Row {
+  item: unknown;
+  index: number;
+  state: object;
+}
+
+/**
+ * The value of a binding that reads the row alone (through a formula or not), or `undefined` when it
+ * reads anything else (a name the build knows and this does not) or fails.
+ */
+function rowValue(expr: string, row: Row): { value: unknown } | undefined {
   try {
-    return { value: new Function("$map", `return (${expr});`)({ item: row, index }) };
+    return {
+      value: new Function("$map", "state", `return (${expr});`)(
+        { item: row.item, index: row.index },
+        row.state,
+      ),
+    };
   } catch {
     return undefined;
   }
 }
 
 /** A string of the item for one row: each binding of the row replaced by its value, any other left as it is. */
-function rowString(text: string, row: unknown, index: number): unknown {
+function rowString(text: string, row: Row): unknown {
   if (!text.includes("${")) return text;
   const parts = bindingParts(text);
-  const values = parts.map((p) =>
-    p.expr === undefined ? undefined : rowValue(p.expr, row, index),
-  );
+  const values = parts.map((p) => (p.expr === undefined ? undefined : rowValue(p.expr, row)));
   const only = parts[0]!;
   if (parts.length === 1 && only.expr !== undefined) {
     const v = values[0];
@@ -1945,21 +2276,27 @@ function rowString(text: string, row: unknown, index: number): unknown {
     .join("");
 }
 
-function rowNode(value: unknown, row: unknown, index: number): unknown {
-  if (typeof value === "string") return rowString(value, row, index);
-  if (Array.isArray(value)) return value.map((v) => rowNode(v, row, index));
+function rowNode(value: unknown, row: Row): unknown {
+  if (typeof value === "string") return rowString(value, row);
+  if (Array.isArray(value)) return value.map((v) => rowNode(v, row));
   if (value !== null && typeof value === "object")
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rowNode(v, row, index)]));
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rowNode(v, row)]));
   return value;
 }
 
 /**
  * The item once per row, with the row's values written in: the children of a list whose rows are known
  * and that must not be a `$ref` (a component's), or `undefined` when the item holds a loop of its own.
+ * `language` is the site's, for a date a formula writes.
  */
-export function writtenOut(item: JxElement, rows: readonly unknown[]): JxNode[] | undefined {
+export function writtenOut(
+  item: JxElement,
+  rows: readonly unknown[],
+  language = "en-US",
+): JxNode[] | undefined {
   if (hasLoopRefs(item)) return undefined;
-  return rows.map((row, index) => rowNode(item, row, index) as JxNode);
+  const state = rowState(language);
+  return rows.map((row, index) => rowNode(item, { item: row, index, state }) as JxNode);
 }
 
 /** The children of a loop's element: the mapped array over a pointer, or the computed children that write each item of an expression's list. */
@@ -2198,6 +2535,9 @@ const query: BlockConverter = (block, ctx) => {
   }
   let loop: Loop = { kind: "none" };
   let counts: Counts = { shown: "0", total: () => "0" };
+  let paged = false;
+  /** Why a list with a pagination device is not paged. */
+  let notPaged = "it is not a live list of this page";
 
   if (plan.kind === "unsupported") {
     say(
@@ -2261,29 +2601,43 @@ const query: BlockConverter = (block, ctx) => {
         );
       } else {
         const id = str(block.attrs.queryId) ?? hashOf(plan);
-        const source = registerPostList(ctx, plan, id);
+        const verdict = pagedHere(ctx, block, plan);
+        let source = registerPostList(ctx, plan, id, { paged: typeof verdict !== "string" });
+        if (typeof verdict === "string") notPaged = verdict;
+        else if ("pointer" in source) {
+          verdict.key = source.pointer.replace(/^#\/state\//, "");
+          paged = true;
+          // The build cuts the collection into pages, and a page can hold none (a term with no
+          // entries): an empty mapped Array renders in the browser, an empty computed list is
+          // nothing. So the paged list's items are computed children over its state entry.
+          source = { expr: `state.${verdict.key}` };
+        }
         loop = {
           kind: "live",
           source,
           // A list of several types has no one type for its items: they carry their own (`postType`).
           ...(plan.types.length === 1 ? { entryType: plan.types[0]! } : {}),
+          ...(paged ? { paged } : {}),
         };
         const shown = lengthOf(source);
-        // `found_posts` ignores the page size: a list that is cut has a second source, with no limit, only if a block asks.
+        // `found_posts` ignores the page size: a list that is cut has a second source, with no limit,
+        // only if a block asks; a paged list is cut by the build, which counts every item of it.
         const cut = !plan.paginated && (plan.perPage !== undefined || plan.offset > 0);
         let all: string | undefined;
         counts = {
           shown,
           total: () =>
-            !cut
-              ? shown
-              : (all ??= lengthOf(
-                  registerPostList(
-                    ctx,
-                    { ...plan, perPage: undefined, offset: 0, paginated: false },
-                    `${id}_all`,
-                  ),
-                )),
+            paged
+              ? "state.$page.pagination.itemCount"
+              : !cut
+                ? shown
+                : (all ??= lengthOf(
+                    registerPostList(
+                      ctx,
+                      { ...plan, perPage: undefined, offset: 0, paginated: false },
+                      `${id}_all`,
+                    ),
+                  )),
         };
       }
       if (posts !== undefined && posts.length === 0) {
@@ -2298,22 +2652,36 @@ const query: BlockConverter = (block, ctx) => {
       }
       if (plan.paginated) {
         const total = evaluatePosts(ctx, plan, { all: true })?.length;
-        say(
-          ctx,
-          block,
-          "query.pagination",
-          "warn",
-          `Jx has no pagination: the query lists ${total === undefined ? "all its entries" : `all ${total} entries`}${plan.perPage === undefined ? "" : ` instead of ${plan.perPage} per page`}${ctx.hoist && plan.perPage !== undefined && loop.kind === "live" && pagedByClick(block) ? `, and hides all but the first ${plan.perPage} until its "Load more" control is used (a checkbox and a label, no script: one click shows them all)` : ""}.`,
-          {
-            detail: "pagination",
-            perPage: plan.perPage ?? null,
-            total: total ?? null,
-            pages:
-              total === undefined || plan.perPage === undefined
-                ? null
-                : Math.ceil(total / plan.perPage),
-          },
-        );
+        const data = {
+          detail: "pagination",
+          perPage: plan.perPage ?? null,
+          total: total ?? null,
+          pages:
+            total === undefined || plan.perPage === undefined
+              ? null
+              : Math.ceil(total / plan.perPage),
+          paged,
+        };
+        if (paged) {
+          say(
+            ctx,
+            block,
+            "query.pagination",
+            "info",
+            `The query's list is the page's own paged list: the page is built once per ${plan.perPage} entries (${data.pages === null ? "as many pages as it fills" : `${data.pages} page${data.pages === 1 ? "" : "s"} today`}), the first at the page's address and the next ones numbered after it, and its pagination device is a pager linking them.`,
+            data,
+          );
+        } else {
+          const why = notPaged;
+          say(
+            ctx,
+            block,
+            "query.pagination",
+            "warn",
+            `The query is paged on the live site and is not paged here (${why}): it lists ${total === undefined ? "all its entries" : `all ${total} entries`}${plan.perPage === undefined ? "" : ` instead of ${plan.perPage} per page`}${ctx.hoist && plan.perPage !== undefined && loop.kind === "live" && pagedByClick(block, ctx) ? `, and hides all but the first ${plan.perPage} until its "Load more" control is used (a checkbox and a label, no script: one click shows them all, every entry is in the page)` : ""}.`,
+            { ...data, why },
+          );
+        }
       }
     } else if (plan.kind === "users") {
       if (targetOf(ctx) === "markdown") {
@@ -2370,12 +2738,13 @@ const query: BlockConverter = (block, ctx) => {
   }
 
   const inside = convertInside(ctx, counts, loop, block.innerBlocks);
-  const children =
-    plan.kind === "posts" &&
-    plan.paginated &&
-    plan.perPage !== undefined &&
-    loop.kind === "live" &&
-    pagedByClick(block)
+  const children = paged
+    ? withPager(inside, plan.kind === "posts" ? plan.sort : [])
+    : plan.kind === "posts" &&
+        plan.paginated &&
+        plan.perPage !== undefined &&
+        loop.kind === "live" &&
+        pagedByClick(block, ctx)
       ? withLoadMore(
           ctx,
           inside,
@@ -2397,19 +2766,179 @@ const query: BlockConverter = (block, ctx) => {
  * following pages by itself as soon as the end of the list is in view, and a visitor who scrolls sees
  * every entry, so the static list is left whole.
  */
-export function pagedByClick(block: WpBlock): boolean {
+export function pagedByClick(block: WpBlock, ctx?: ConvertCtx): boolean {
   if (str(block.attrs.infiniteLoadMore) === "button") return true;
-  const stack = [...block.innerBlocks];
-  while (stack.length > 0) {
-    const b = stack.pop()!;
-    if (b.name === "cwicly/query-pagination" || b.name === "cwicly/query-pagination-numbers")
-      return true;
-    const action = str(b.attrs.linkWrapperAction);
-    if (action === "prevQuery" || action === "nextQuery" || action === "infiniteButtonLoad")
-      return true;
-    stack.push(...b.innerBlocks);
-  }
-  return false;
+  return holdsPager(block.innerBlocks, ctx);
+}
+
+// ── A paged list ─────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A list a page is built in pages of (site-architecture.md §4.3: `$paths` `{ "paginate": { "$ref":
+ * "#/state/<key>" }, "pageSize": n }`). A page pages one list; the session of a conversion that may
+ * be a page of its own grants the first claim (`SubjectCtx.claimPaging`), and the emitter that
+ * writes the page makes it a paged route (`emit/paging.ts`).
+ */
+export interface PagingClaim {
+  /** The list's state entry: a `ContentCollection` with no limit. */
+  key: string;
+  pageSize: number;
+}
+
+interface PagingCtx {
+  claimPaging?(claim: PagingClaim): boolean;
+}
+
+/**
+ * Whether this query's list is its page's paged list, or why not. It is when the live page shows its
+ * list a page at a time behind a click (a "Load more" button, a pagination block, a previous or next
+ * link), the list is a collection (the build pages a state entry, not an expression), its rules read
+ * nothing of the page's other state (the build cuts the list into pages before that state exists:
+ * the route's parameters are all a paged list can read), and the page has no paged list yet.
+ */
+function pagedHere(ctx: ConvertCtx, block: WpBlock, plan: PostPlan): PagingClaim | string {
+  if (!plan.paginated || plan.perPage === undefined) return "it has no page size";
+  if (!pagedByClick(block, ctx))
+    return "it loads the next entries by itself as the visitor scrolls";
+  if (nestedLoop(ctx)) return "it is inside another loop";
+  if (targetOf(ctx) === "markdown") return "it is in a Markdown entry";
+  const rules = nativeRules(plan);
+  const computed = plan.conds.find((c) => c.native === undefined);
+  if (rules === undefined || computed !== undefined)
+    return `its list is computed, because a collection cannot say ${computed?.why ?? "it"}`;
+  if (readsState(rules))
+    return "its rules read the page's entry, and a paged list is cut into pages before the page's state exists";
+  if (plan.types.length === 0) return "it lists no type the site has entries of";
+  if (plan.offset > 0) return "its list is computed, because a collection has no offset";
+  if (plan.sort.some((r) => COLLATED.has(r.field)))
+    return "its list is computed, because a collection cannot order titles as MySQL does";
+  const claimPaging = (ctx as PagingCtx).claimPaging;
+  if (claimPaging === undefined)
+    return "it is not a listing page of its own (a component, a template part, an entry's page, the search page)";
+  // The key is the list's once it is registered (`defineState` may number it); the session keeps this object.
+  const claim: PagingClaim = { key: "", pageSize: plan.perPage };
+  return claimPaging.call(ctx, claim)
+    ? claim
+    : "its page already pages another list, and a page pages one";
+}
+
+/** The marker a pagination block of a paged list leaves where it stood, for {@link withPager} to put the pager in. */
+const PAGER_MARK = "wp2jx-pager-mark";
+
+/** `$page.pagination` of the paged page (site-architecture.md §4.3.1), as an expression. */
+const PAGE = "state.$page.pagination";
+
+/**
+ * A page's address as a link: the build gives `/essays` and `/essays/2` (and `/` for a list at the
+ * root), and the site's addresses end in a slash.
+ */
+const hrefOf = (expr: string): string => `(${expr} === '/' ? '/' : ${expr} + '/')`;
+
+/**
+ * The pager of a paged list: a link to the page before and one to the page after (the "Load more"
+ * button's look where the page had one: its class and style), and the numbers between, the first, the
+ * last and two either side of this one, the current one marked (`aria-current`). A page with one page
+ * hides it. A list newest first says "Newer" and "Older", as a blog does; any other order "Previous"
+ * and "Next".
+ */
+function pagerNode(control: JxElement | undefined, sort: readonly SortRule[]): JxElement {
+  const byDate = sort[0]?.field === "date" && sort[0].order === "desc";
+  const [before, after] = byDate ? ["Newer", "Older"] : ["Previous", "Next"];
+  const look: Partial<JxElement> =
+    control === undefined
+      ? { className: "cc-pager__edge", style: { ...LOAD_MORE_STYLE, margin: "0" } as never }
+      : {
+          ...(control.className === undefined ? {} : { className: control.className }),
+          ...(control.style === undefined ? {} : { style: control.style }),
+        };
+  const edge = (rel: "prev" | "next", text: string): JxElement => ({
+    tagName: "a",
+    ...look,
+    className: joinClass(look.className, `cc-pager__${rel}`),
+    attributes: {
+      href: `\${${PAGE}.${rel} ? ${hrefOf(`${PAGE}.${rel}`)} : ''}`,
+      rel,
+      hidden: `\${!${PAGE}.${rel}}`,
+    },
+    style: {
+      ...(look.style as Record<string, unknown> | undefined),
+      "&[hidden]": { display: "none" },
+    } as never,
+    textContent: text,
+  });
+  return {
+    tagName: "nav",
+    className: "cc-pager",
+    attributes: { "aria-label": "Pages", hidden: `\${${PAGE}.pageCount < 2}` },
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: "0.75rem",
+      marginTop: "2rem",
+      "&[hidden]": { display: "none" },
+      "& .cc-pager__page": {
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        minWidth: "2.5rem",
+        height: "2.5rem",
+        padding: "0 0.5rem",
+        borderRadius: "9999px",
+        color: "inherit",
+        textDecoration: "none",
+        "&:hover": { backgroundColor: "color-mix(in srgb, currentColor 12%, transparent)" },
+        "&[aria-current]": { fontWeight: "700", outline: "2px solid currentColor" },
+        "&[hidden]": { display: "none" },
+      },
+    } as never,
+    children: [
+      edge("prev", before!),
+      {
+        $prototype: "Array",
+        items: { $ref: "#/state/$page/pagination/pages" },
+        map: {
+          tagName: "a",
+          className: "cc-pager__page",
+          attributes: {
+            href: `\${${hrefOf("$map.item.url")}}`,
+            // `false` leaves the attribute out where the page is built; `null` is not resolved there, and the page would render in the browser.
+            "aria-current": "${$map.item.current ? 'page' : false}",
+            "aria-label": "Page ${$map.item.number}",
+            hidden: `\${Math.abs($map.item.number - ${PAGE}.number) > 2 && $map.item.number !== 1 && $map.item.number !== ${PAGE}.pageCount}`,
+          },
+          textContent: "${$map.item.number}",
+        },
+      } as unknown as JxElement,
+      edge("next", after!),
+    ],
+  };
+}
+
+/**
+ * The pager where the live page had its device: in place of the "Load more" control (whose look it
+ * takes), or of the first pagination block (the others go), or after the list when the device was
+ * only the query's own setting.
+ */
+function withPager(nodes: JxNode[], sort: readonly SortRule[]): JxNode[] {
+  const own = structuredClone(nodes);
+  const control = loadMoreControl(own);
+  const pager = pagerNode(control, sort);
+  let placed = false;
+  const place = (list: JxNode[]): JxNode[] =>
+    list.flatMap((node): JxNode[] => {
+      if (typeof node === "string") return [node];
+      if (node === control || (control === undefined && node.tagName === PAGER_MARK)) {
+        if (placed) return [];
+        placed = true;
+        return [pager];
+      }
+      if (node.tagName === PAGER_MARK) return [];
+      return Array.isArray(node.children) ? [{ ...node, children: place(node.children) }] : [node];
+    });
+  const out = place(own);
+  return placed ? out : [...out, pager];
 }
 
 /** What a "Load more" control says, the plugin's own wording or the author's. */
@@ -2504,14 +3033,19 @@ const queryTemplate: BlockConverter = (block, ctx) =>
     const loop = loopOf(ctx);
     const a = block.attrs;
     const itemClass = joinClass("cc-query-item", a.repeaterMasonry === true && "cc-masonry-item");
+    // A slider is the slider component around the items, where a page can hold one (not a Markdown entry).
+    const slider =
+      a.repeaterSlider === true && loop?.kind === "live" ? sliderTagOf(ctx) : undefined;
     if (a.repeaterSlider === true) {
       say(
         ctx,
         block,
         "query.slider",
         "info",
-        "The query's items are a slider on the live page; the slider's script is not carried over, so they are an ordinary list.",
-        { detail: "slider" },
+        slider === undefined
+          ? "The query's items are a slider on the live page; the slider's script is not carried over, so they are an ordinary list."
+          : `The query's items are a slider on the live page: they are the items of <${slider}>, a component with Splide's look and no script of Splide's (its autoplay, interval and rewind are the block's).`,
+        { detail: "slider", ...(slider === undefined ? {} : { component: slider }) },
       );
     }
     const item = (children: JxNode[]): JxElement => ({
@@ -2524,11 +3058,23 @@ const queryTemplate: BlockConverter = (block, ctx) =>
         const inner = loop.terms === true ? block.innerBlocks.map(inTermLoop) : block.innerBlocks;
         const built = item(ctx.convert(inner, itemContext(loop)));
         sayHidden(ctx, block, loop.source, built);
+        const items =
+          (loop.rows !== undefined && writtenOut(built, loop.rows, ctx.model.site.language)) ||
+          loopChildren(loop.source, built);
         return {
           tag: "div",
           children:
-            (loop.rows !== undefined && writtenOut(built, loop.rows)) ||
-            loopChildren(loop.source, built),
+            slider === undefined
+              ? items
+              : [
+                  {
+                    tagName: slider,
+                    ...(Object.keys(sliderProps(a.repeaterSliderOptions)).length > 0
+                      ? { $props: sliderProps(a.repeaterSliderOptions) }
+                      : {}),
+                    children: items,
+                  } as JxElement,
+                ],
           attributes: { "cc-query-template": "" },
         };
       }
@@ -2587,12 +3133,18 @@ function inTermLoop(block: WpBlock): WpBlock {
   };
 }
 
-/** Pagination is a script of the plugin's (and links that reload the query); Jx has none, and the query says what that costs. */
+/**
+ * Pagination is a script of the plugin's (and links that reload the query). Inside a paged list the
+ * block marks where the pager goes (the query puts it there); anywhere else the query lists what it
+ * lists and says what that costs.
+ */
 const pagination =
   (what: string): BlockConverter =>
   (block, ctx) => {
     const env = prepare(block, ctx);
     if (!env) return [];
+    const loop = loopOf(ctx);
+    if (loop?.kind === "live" && loop.paged === true) return [{ tagName: PAGER_MARK }];
     say(
       ctx,
       block,
@@ -3257,6 +3809,10 @@ const component: BlockConverter = (block, ctx) => {
     );
     return [];
   }
+  // The component that is the pager of a paged list (its prev, next and page numbers) is that list's pager.
+  const loop = loopOf(ctx);
+  if (loop?.kind === "live" && loop.paged === true && holdsPager(componentBlocks(ctx, block), ctx))
+    return [{ tagName: PAGER_MARK }];
   const env = prepare(block, ctx);
   if (!env) return [];
   const variants = variantClasses(ctx, info, block.attrs);

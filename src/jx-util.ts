@@ -3,6 +3,7 @@
  * piece of Jx syntax that content can collide with, the `${` template marker.
  */
 import { isTemplateString } from "@jxsuite/schema/guards";
+import { formulaCall, pipeOf } from "./formulas.ts";
 import type { JxStyle } from "./types.ts";
 
 type StyleValue = JxStyle[string];
@@ -366,10 +367,14 @@ function splitMarkers(value: string): Piece[] {
 
 /**
  * The expression that escapes a plain-text value for markup: what a text binding needs where it
- * lands in an `innerHTML`. The regular expression, the arrow function and the object literal are all
- * evaluated by the Jx build (docs/bindings.md, section 5).
+ * lands in an `innerHTML`. A value read from a path (or from a formula on one) is the `escapeHtml`
+ * formula on it, which reads a missing value as empty itself; anything else is escaped by a
+ * regular expression, an arrow function and an object literal, all of which the Jx build evaluates
+ * (docs/bindings.md, section 5).
  */
 export function htmlEscapeExpr(expr: string): string {
+  const pipe = pipeOf(expr);
+  if (pipe !== undefined) return formulaCall("escapeHtml", pipe);
   return `String((${expr}) ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))`;
 }
 

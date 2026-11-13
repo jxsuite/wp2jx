@@ -10,6 +10,7 @@
  * 4. entry mode against static mode: a binding, evaluated over the entry data of a real post, prints
  *    what the static resolution of the same token prints for that post.
  */
+import { withFormulas } from "../helpers/formulas.ts";
 import { setUserProfiles } from "../../src/wp/profiles.ts";
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -135,7 +136,7 @@ function evalTemplate(template: string, state: unknown, map: unknown = undefined
     s: unknown,
     m: unknown,
   ) => string;
-  return fn(state, map);
+  return fn(withFormulas(state), map);
 }
 
 const entryScope = (
@@ -1259,8 +1260,9 @@ describe("an entry template", () => {
     expect(resolveTokens("{posttype}", ctx)).toBe("project");
     const item = Object.assign(Object.create(ctx), { entryExpr: "$map.item" }) as ConvertCtx;
     expect(resolveTokens("{title}", item)).toBe("${$map.item.data.title ?? ''}");
-    expect(resolveTokens("<h2>{title}</h2>", item, undefined, { where: "html" })).toMatch(
-      /^<h2>\$\{String\(\(\$map\.item\.data\.title \?\? ''\) \?\? ''\)\.replace\(/,
+    // A text that lands in markup is escaped by the `escapeHtml` formula on its path.
+    expect(resolveTokens("<h2>{title}</h2>", item, undefined, { where: "html" })).toBe(
+      "<h2>${state.escapeHtml($map.item.data.title)}</h2>",
     );
   });
 
@@ -1583,7 +1585,7 @@ describe("a component", () => {
     const rich = resolveTokens("{component=content=xdjvI}", ctx, undefined, { where: "html" });
     expect(rich).toBe(`\${state.${keys.xdjvI} ?? ''}`);
     const plain = resolveTokens("{component=content=1nsiW}", ctx, undefined, { where: "html" });
-    expect(plain).toContain(".replace(");
+    expect(plain).toBe(`\${state.escapeHtml(state.${keys["1nsiW"]})}`);
     expect(resolveTokens('<a href="{component=link=SKhKx}">', ctx)).toBe(
       `<a href="\${state.${keys.SKhKx}?.href ?? ''}">`,
     );

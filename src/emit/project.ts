@@ -11,7 +11,8 @@
  * 2. **The design system** (`emit/design-system.ts`) over the site's global CSS, **the compatibility
  *    stylesheet** (the plugin's own CSS and the theme's `style.css`, linked first in `$head`), and the
  *    **core block CSS** of exactly the WordPress classes the converted markup carries.
- * 3. **`project.json`**: `name`, `url`, `defaults {layout, lang}`, `$media`, `style`, `$head`, `content`,
+ * 3. **`project.json`**: `name`, `url`, `defaults {layout, lang}`, `$media`, `state` (the named formulas
+ *    the documents call, `src/formulas.ts`), `style`, `$head`, `content`,
  *    `redirects`, `extensions`, `images` (only for a site with more than {@link HEAVY_IMAGE_COUNT}
  *    images, or when the caller gives one) and `build`.
  * 4. **Media** (`media.ts`): the files the converted content actually asked for, and the local fonts.
@@ -107,18 +108,29 @@ import { ensureConverters } from "../convert.ts";
 import { downloadMedia, type DownloadResult, type FetchLike, type MediaFile } from "../media.ts";
 import { createReport, renderReportJson, renderReportMarkdown, summarise } from "../report.ts";
 import type { ReportSummary } from "../report.ts";
-import { pathKey } from "../routes.ts";
+import { HELD_STATUSES, pathKey } from "../routes.ts";
 import {
   allSubjects,
   importedStyleRules,
   loadSiteContext,
+  sliderTag,
   subjectBlocks,
   type HoistedRule,
   type LoadSiteOptions,
   type SiteContext,
   type Subject,
 } from "../site.ts";
+import { evaluateExpression } from "@jxsuite/runtime/expression";
 import type { JxHeadEntry } from "@jxsuite/schema/types";
+import {
+  ALL_FORMULAS,
+  FORMULAS,
+  formulaState,
+  formulasUsed,
+  lowerFormulasIn,
+  type FormulaEntry,
+  type FormulaName,
+} from "../formulas.ts";
 import type { JxStyle, Report, ReportEntry, Severity, Sink, WpBlock } from "../types.ts";
 import { walkBlocks } from "../wp/blocks.ts";
 import { openDb } from "../wp/db.ts";
@@ -146,6 +158,8 @@ import { CURRENT_PAGE_SCRIPT, menuResolvers, newUsed as newMenusUsed } from "./m
 import { buildPages, type PagesOutput } from "./pages.ts";
 import { markNoOptimize, undecodableImage } from "./no-optimize.ts";
 import { buildRedirects, type RedirectBuild, type RedirectTarget } from "./redirects.ts";
+import { pagedRedirect } from "./paging.ts";
+import { sliderComponent } from "./slider.ts";
 import { buildTemplates, layoutFor, type TemplatesOutput } from "./templates.ts";
 import {
   addIssues,
@@ -289,6 +303,22 @@ export interface MigrateOptions {
   concurrency?: number;
   /** Ship the WordPress preset styles (`--wp--preset--*`, `.has-<slug>-color`), which the live sites do not serve. Default false. */
   presets?: boolean;
+  /**
+   * Write the drafts, the posts pending review, the scheduled, private and password-protected posts
+   * of the content types as entries the build holds back (a content type's `hold`, jxsuite/jx#548;
+   * `CollectionsOptions.hold`). Default: whether the Jx this tool runs with has `hold`
+   * ({@link jxHolds}); without it they are left out, because a Jx without `hold` would publish them.
+   */
+  hold?: boolean;
+  /**
+   * Write a value that is read from a path and formatted as a call of a named formula
+   * (`${state.formatDate(state.entry.data.date, {…})}`, `src/formulas.ts`), which Jx Studio opens as a
+   * field with a format, and put the formulas in `project.json`'s `state`. `false` writes every one as
+   * the JavaScript it stands for; `true` writes every one as a call, whatever Jx is installed.
+   * Default: the formulas the Jx this tool runs with evaluates at build while the page stays free of
+   * JavaScript ({@link jxFormulas}), and JavaScript for the rest (`project.formulas-lowered`).
+   */
+  formulas?: boolean;
   /** Drop the compatibility stylesheet's rules for classes no converted markup carries. Default false. */
   pruneCompat?: boolean;
   inlineGaps?: "report" | "innerHTML";
@@ -1433,19 +1463,191 @@ export function fontFile(
 
 // ── package.json ─────────────────────────────────────────────────────────────────────────────────
 
-/** The version of a package installed beside this tool (a project is built with what it was tested with), as a caret range. */
-function installedRange(pkg: string, fallback: string): string {
+/**
+ * The first releases that hold what the emitted projects use: a list of several content types, a
+ * filter on a dotted field and on a reference to the page, and paged routes (`$paths` `paginate`,
+ * jxsuite/jx#535). A project written for less would build its lists wrong.
+ */
+export const JX_MINIMUM = {
+  "@jxsuite/compiler": "8.1.0",
+  "@jxsuite/parser": "4.2.0",
+  "@jxsuite/runtime": "6.0.2",
+} as const;
+
+/** `a` is an older version than `b` (`major.minor.patch`, a pre-release tag ignored). */
+const older = (a: string, b: string): boolean => {
+  const x = a.split(/[.+-]/).slice(0, 3).map(Number);
+  const y = b.split(/[.+-]/).slice(0, 3).map(Number);
+  for (let i = 0; i < 3; i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) < (y[i] ?? 0);
+  return false;
+};
+
+/**
+ * The first releases with a content type's `hold` rules (jxsuite/jx#548, `feat(content)`): a project
+ * whose collections hold entries back asks for them, because a Jx without `hold` reads no rule and
+ * publishes every entry. The compiler that has it asks for runtime 6.1.
+ */
+export const JX_HOLD_MINIMUM = {
+  "@jxsuite/compiler": "8.2.0",
+  "@jxsuite/parser": "4.3.0",
+  "@jxsuite/runtime": "6.1.0",
+} as const;
+
+/** The package.json of a package installed beside this tool, read from the nearest `node_modules`. */
+function installedFile(pkg: string, rel: string): string | undefined {
+  for (let dir = import.meta.dir, last = ""; dir !== last; last = dir, dir = dirname(dir)) {
+    const file = join(dir, "node_modules", pkg, rel);
+    if (existsSync(file)) return file;
+  }
+  return undefined;
+}
+
+/**
+ * Whether the Jx this tool runs with holds entries back: its parser's project schema has a content
+ * type's `hold`. A Jx without it accepts the key and ignores it (the schema is open), so the rules
+ * would publish what they name.
+ */
+export function jxHolds(): boolean {
+  const file = installedFile("@jxsuite/parser", "schemas/project.fragment.schema.json");
+  if (file === undefined) return false;
+  try {
+    return /"hold"\s*:/.test(readFileSync(file, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+/** A call of each formula that its definition must be able to answer at build, with what it answers. */
+const FORMULA_PROBES: Readonly<Record<FormulaName, [Record<string, unknown>, unknown]>> = {
+  formatDate: [
+    { value: "2024-02-15T17:30:00Z", options: { year: "numeric", timeZone: "UTC" } },
+    "2024",
+  ],
+  notEmpty: [{ value: [] }, false],
+  orBlank: [{ value: "0" }, ""],
+  escapeHtml: [{ text: "<" }, "&lt;"],
+};
+
+let formulasKnown: ReadonlySet<FormulaName> | undefined;
+
+/**
+ * The formulas (`src/formulas.ts`) the Jx this tool runs with lets a static page call: two things
+ * have to hold, and both are asked of the installed packages, not of a version number.
+ *
+ * 1. **The build drops a formula nothing reads any more.** A formula lives in `project.json`'s `state`,
+ *    which every page inherits. A compiler that keeps it on a page whose calls it has all evaluated
+ *    makes that page a client page (`app.js`, the runtime), and with it every page of the site,
+ *    whether it calls a formula or not. The compiler that drops it says so in its site build
+ *    (`isPureNamedFormula`).
+ * 2. **The build can evaluate the formula.** Its definition is run once here by the interpreter the
+ *    build uses, with no `window`, as the build runs it. A formula that calls a global the
+ *    interpreter looks up on `window` (`notEmpty` calls `Array.isArray`) throws there, and its
+ *    binding would be left for the browser.
+ *
+ * A formula that is not in the answer is written as the JavaScript it stands for, so the project
+ * builds the same pages either way.
+ */
+export function jxFormulas(): ReadonlySet<FormulaName> {
+  if (formulasKnown !== undefined) return formulasKnown;
+  const able = new Set<FormulaName>();
+  const build = installedFile("@jxsuite/compiler", "src/site/site-build.ts");
+  let drops = false;
+  try {
+    drops = build !== undefined && readFileSync(build, "utf8").includes("isPureNamedFormula");
+  } catch {
+    // A site build that does not read is one that is not known to drop a formula.
+  }
+  if (drops) {
+    for (const name of ALL_FORMULAS) {
+      const [args, expected] = FORMULA_PROBES[name];
+      try {
+        const got: unknown = evaluateExpression(
+          FORMULAS[name].$expression as Parameters<typeof evaluateExpression>[0],
+          {},
+          null,
+          { args } as NonNullable<Parameters<typeof evaluateExpression>[3]>,
+        );
+        if (got === expected) able.add(name);
+      } catch {
+        // The interpreter cannot answer: the formula stays JavaScript.
+      }
+    }
+  }
+  formulasKnown = able;
+  return able;
+}
+
+/**
+ * The documents of a project with their formulas settled, and the `state` `project.json` holds for
+ * them. A call of a formula in `supported` stays a call wherever the project's `state` is the
+ * document's own (a page, a layout); every other call is written as the JavaScript it stands for
+ * ({@link lowerFormulasIn}): any call in a component, whose `state` is its own and holds no formula of
+ * the project, and a call of a formula the build cannot be trusted with. `documents` maps a path to
+ * its JSON text; only the ones that changed are returned. `language` is the project's `lang`, which a
+ * date written out in a component is formatted in (a component's state has no page to ask).
+ */
+export function settleFormulas(
+  documents: Iterable<readonly [string, string]>,
+  supported: ReadonlySet<FormulaName>,
+  language?: string,
+): {
+  changed: Map<string, string>;
+  state: Record<string, FormulaEntry> | undefined;
+  lowered: FormulaName[];
+} {
+  const changed = new Map<string, string>();
+  const kept: string[] = [];
+  const lowered = new Set<FormulaName>();
+  for (const [path, text] of documents) {
+    if (!path.endsWith(".json")) continue;
+    const used = formulasUsed([text]);
+    if (used.length === 0) continue;
+    const names = new Set(
+      path.startsWith("components/") ? used : used.filter((name) => !supported.has(name)),
+    );
+    if (names.size === 0) {
+      kept.push(text);
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // Not a document: nothing in it is a binding.
+      continue;
+    }
+    for (const name of names) lowered.add(name);
+    const next = jsonText(lowerFormulasIn(parsed, names, language));
+    changed.set(path, next);
+    kept.push(next);
+  }
+  return {
+    changed,
+    state: formulaState(kept),
+    lowered: [...ALL_FORMULAS].filter((name) => lowered.has(name)),
+  };
+}
+
+/**
+ * The version of a package installed beside this tool (a project is built with what it was tested
+ * with), as a caret range, and never below the first release that holds what the project uses
+ * ({@link JX_MINIMUM}, and {@link JX_HOLD_MINIMUM} for a project that holds entries back): a checkout
+ * built against an unreleased Jx asks for the release.
+ */
+function installedRange(pkg: keyof typeof JX_MINIMUM, hold = false): string {
+  const minimum = hold ? JX_HOLD_MINIMUM[pkg] : JX_MINIMUM[pkg];
   for (let dir = import.meta.dir, last = ""; dir !== last; last = dir, dir = dirname(dir)) {
     const file = join(dir, "node_modules", pkg, "package.json");
     if (!existsSync(file)) continue;
     try {
       const version = (JSON.parse(readFileSync(file, "utf8")) as { version?: unknown }).version;
-      if (typeof version === "string" && /^\d+\.\d+\.\d+/.test(version)) return `^${version}`;
+      if (typeof version === "string" && /^\d+\.\d+\.\d+/.test(version))
+        return `^${older(version, minimum) ? minimum : version}`;
     } catch {
-      // A package.json that does not read is no version: the fallback stands.
+      // A package.json that does not read is no version: the minimum stands.
     }
   }
-  return fallback;
+  return `^${minimum}`;
 }
 
 /** An npm package name for a site: lower case letters, digits and hyphens. */
@@ -1461,9 +1663,13 @@ const packageName = (siteName: string): string =>
  * it). The versions are the ones this tool was run with. It is written once and never again: a
  * `package.json` is where a person adds what the site needs next.
  */
-export function projectPackageJson(siteName: string, hasCollections: boolean): string {
+export function projectPackageJson(
+  siteName: string,
+  hasCollections: boolean,
+  hold = false,
+): string {
   const dependencies = hasCollections
-    ? { "@jxsuite/parser": installedRange("@jxsuite/parser", "^1.8.2") }
+    ? { "@jxsuite/parser": installedRange("@jxsuite/parser", hold) }
     : undefined;
   return jsonText({
     name: packageName(siteName),
@@ -1473,8 +1679,8 @@ export function projectPackageJson(siteName: string, hasCollections: boolean): s
     scripts: { build: "jx build", dev: "jx dev", validate: "jx validate" },
     ...(dependencies === undefined ? {} : { dependencies }),
     devDependencies: {
-      "@jxsuite/compiler": installedRange("@jxsuite/compiler", "^4.0.2"),
-      "@jxsuite/runtime": installedRange("@jxsuite/runtime", "^4.0.2"),
+      "@jxsuite/compiler": installedRange("@jxsuite/compiler", hold),
+      "@jxsuite/runtime": installedRange("@jxsuite/runtime", hold),
     },
   });
 }
@@ -1724,6 +1930,17 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
   const writesNothing = opts.sink === undefined && opts.out === undefined;
 
   // ── Load ───────────────────────────────────────────────────────────────────────────────────────
+  // Entries a build holds back, only for a Jx that holds them (one without `hold` would publish them).
+  const holds = jxHolds();
+  const hold = opts.hold ?? holds;
+  if (hold && !holds) {
+    own.add({
+      severity: "warn",
+      code: "project.hold-unsupported",
+      message: `Unpublished entries are written to be held back, and the Jx this tool runs with has no \`hold\`: a build with it would publish them. The project's package.json asks for @jxsuite/parser ${JX_HOLD_MINIMUM["@jxsuite/parser"]} and @jxsuite/compiler ${JX_HOLD_MINIMUM["@jxsuite/compiler"]} at least.`,
+      where: "project.json",
+    });
+  }
   let site: SiteContext;
   /** Where the plugin's files come from, for the core block CSS to follow. */
   let pluginFrom = opts.pluginFrom === false ? undefined : opts.pluginFrom;
@@ -1754,6 +1971,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
         ...(pluginFrom === undefined ? {} : { pluginFrom }),
         ...(opts.componentPrefix === undefined ? {} : { componentPrefix: opts.componentPrefix }),
         ...(opts.routeTypes === undefined ? {} : { routeTypes: opts.routeTypes }),
+        ...(hold ? { held: HELD_STATUSES } : {}),
         ...(opts.report === undefined ? {} : { report: opts.report }),
         ...(opts.postTypes === undefined
           ? {}
@@ -1844,6 +2062,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
         classStyles: collectClassStyles([...components.files, ...templates.files, ...pages.files]),
         now,
         ...(opts.inlineGaps === undefined ? {} : { inlineGaps: opts.inlineGaps }),
+        ...(hold ? { hold } : {}),
       }),
     () => failedCollections(createReport()),
   );
@@ -2047,6 +2266,17 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
     }
   }
 
+  // WordPress's addresses of the pages after the first of a paged listing (`/essays/page/2/`) are the
+  // paged route's (`/essays/2/`): one wildcard rule per paged page, unless a rule of the site's own
+  // already answers there.
+  for (const page of [...pages.pages, ...templates.pages]) {
+    if (page.paged !== true) continue;
+    const { from, to } = pagedRedirect(page.route);
+    if (Object.hasOwn(redirects.redirects, from)) continue;
+    redirects.redirects[from] = to;
+    redirects.summary.wildcard++;
+  }
+
   // ── The files ──────────────────────────────────────────────────────────────────────────────────
   const files = new Map<string, string | Uint8Array>();
   const add = (path: string, content: string | Uint8Array, origin: string): void => {
@@ -2086,6 +2316,38 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
   for (const f of pages.files) add(f.path, f.content, "pages");
   for (const f of collections.files) add(f.path, f.content, "collections");
   if (design !== undefined) for (const f of design.files) add(f.path, f.content, "design system");
+  // The slider a query template became, once, where a document uses it (`emit/slider.ts`).
+  {
+    const tag = sliderTag(site);
+    const uses = `"tagName": ${JSON.stringify(tag)}`;
+    if ([...files.values()].some((c) => typeof c === "string" && c.includes(uses))) {
+      add(`components/${tag}.json`, jsonText(sliderComponent(tag)), "slider");
+    }
+  }
+
+  // The formulas the documents call (`src/formulas.ts`): the ones the build can be trusted with stay
+  // calls and go into project.json's `state`, once each; the rest are written out as JavaScript.
+  const formulas = settleFormulas(
+    [...files].filter((f): f is [string, string] => typeof f[1] === "string"),
+    opts.formulas === undefined ? jxFormulas() : opts.formulas ? ALL_FORMULAS : new Set(),
+    model.site.language,
+  );
+  for (const [path, text] of formulas.changed) files.set(path, text);
+  {
+    const held = new Set<FormulaName>(
+      opts.formulas === undefined ? [...ALL_FORMULAS].filter((n) => !jxFormulas().has(n)) : [],
+    );
+    const missing = formulas.lowered.filter((name) => held.has(name));
+    if (missing.length > 0) {
+      own.add({
+        severity: "info",
+        code: "project.formulas-lowered",
+        message: `The bindings that format a value (${missing.map((n) => `state.${n}`).join(", ")}) are written as JavaScript expressions, not as calls of named formulas, because the Jx this tool runs with would not build them into static pages: it either keeps a formula of project.json's \`state\` on every page (which makes every page load the client runtime) or cannot evaluate the formula at build. The pages are the same; in Jx Studio these bindings open as custom expressions instead of fields with a format. Convert again with a newer Jx, or with --formulas to write the calls anyway.`,
+        where: "project.json",
+        data: { formulas: missing },
+      });
+    }
+  }
 
   // ── project.json ───────────────────────────────────────────────────────────────────────────────
   const head: JxHeadEntry[] = design === undefined ? [] : clone(design.head);
@@ -2259,8 +2521,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
       breakpoints: site.options.breakpoints,
       media: mediaOf,
       palette: [...site.options.globalStyles.colorRefs.values()],
-      baseLayout:
-        templates.base === null ? undefined : templates.base.replace(/^\.\//, ""),
+      baseLayout: templates.base === null ? undefined : templates.base.replace(/^\.\//, ""),
       protect: PROTECTED_CLASSES,
       report: own,
       serialize: jsonText,
@@ -2295,6 +2556,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
     ...(Object.keys(defaults).length > 0 ? { defaults } : {}),
     $media: design?.media ?? site.options.media,
     ...(Object.keys(content).length > 0 ? { extensions: ["@jxsuite/parser"], content } : {}),
+    ...(formulas.state === undefined ? {} : { state: formulas.state }),
     style: composed.style,
     ...(head.length > 0 ? { $head: head } : {}),
     ...(Object.keys(redirects.redirects).length > 0 ? { redirects: redirects.redirects } : {}),
@@ -2309,7 +2571,7 @@ export async function migrateSite(opts: MigrateOptions): Promise<MigrationResult
    */
   const seeds = new Map<string, string>([
     [".gitignore", GITIGNORE],
-    ["package.json", projectPackageJson(siteName, Object.keys(content).length > 0)],
+    ["package.json", projectPackageJson(siteName, Object.keys(content).length > 0, hold)],
   ]);
 
   checkReferences(files, own);

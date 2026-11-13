@@ -28,6 +28,7 @@
  * `block.table-span-dropped` and `block.icon-dropped`.
  */
 import { createHash } from "node:crypto";
+import { INTL_FORMATS, formulaCall, intlDateOptions, isPath } from "../formulas.ts";
 import { escapeTemplate } from "../html.ts";
 import { joinClass } from "../jx-util.ts";
 import type {
@@ -1355,7 +1356,8 @@ const postContentBlock: BlockConverter = (block, ctx) => {
     return [
       wrapper(
         {
-          attributes: { hidden: `\${!((${ctx.entryExpr}.$children?.length ?? 0) > 0)}` },
+          // The entry's blocks are a list or nothing: it is empty when it has no length.
+          attributes: { hidden: `\${!${ctx.entryExpr}.$children?.length}` },
           children: bind(ctx, "$children") as unknown as NonNullable<JxElement["children"]>,
         },
         { "&[hidden]": { display: "none !important" } },
@@ -1493,15 +1495,6 @@ const featuredImageBlock: BlockConverter = (block, ctx) => {
   ];
 };
 
-/** PHP date formats that `Intl` writes exactly, for a binding that must format the entry's date itself. */
-const INTL_FORMATS: Readonly<Record<string, [string, Intl.DateTimeFormatOptions]>> = {
-  "F j, Y": ["en-US", { year: "numeric", month: "long", day: "numeric" }],
-  "M j, Y": ["en-US", { year: "numeric", month: "short", day: "numeric" }],
-  "m/d/Y": ["en-US", { year: "numeric", month: "2-digit", day: "2-digit" }],
-  "j F Y": ["en-GB", { year: "numeric", month: "long", day: "numeric" }],
-  "d/m/Y": ["en-GB", { year: "numeric", month: "2-digit", day: "2-digit" }],
-};
-
 /** The zone WordPress works in: the `timezone_string` option, else `gmt_offset` as `+HH:MM`, else UTC. */
 function siteZone(ctx: ConvertCtx): string {
   const zone = (ctx.model.options.get("timezone_string") ?? "").trim();
@@ -1594,8 +1587,15 @@ const postDateBlock: BlockConverter = (block, ctx) => {
   const known = INTL_FORMATS[format];
   const value = bind(ctx, `data.${field}`).slice(2, -1);
   let text: string;
-  if (known) {
-    // The offset form (`-04:00`) is a time zone `Intl` knows: UTC would print another day near midnight.
+  // The offset form (`-04:00`) is a time zone `Intl` knows: UTC would print another day near midnight.
+  const tag = isPath(value)
+    ? intlDateOptions(format, ctx.model.site.language, siteZone(ctx))
+    : undefined;
+  if (tag !== undefined) {
+    // The site is in the locale that writes this format: the `formatDate` formula, which formats in
+    // the page's locale, prints the same text and is a field with a format to Studio.
+    text = `\${${formulaCall("formatDate", value, tag)}}`;
+  } else if (known) {
     const options = { ...known[1], timeZone: siteZone(ctx) };
     text = `\${${value} ? new Date(${value}).toLocaleDateString('${known[0]}', ${JSON.stringify(options)}) : ''}`;
   } else {

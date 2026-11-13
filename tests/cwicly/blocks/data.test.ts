@@ -9,6 +9,7 @@
  * (`jx build` of a project made from the converted nodes and the entries of the model).
  */
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { FORMULAS } from "../../../src/formulas.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "parse5";
@@ -37,6 +38,13 @@ import {
   type Converted,
 } from "../../../src/convert.ts";
 import { walkElements } from "../../../src/placeholders.ts";
+import {
+  queryContentType,
+  resolveRuleValue,
+  type FilterRule,
+  type SortRule,
+} from "@jxsuite/parser/content";
+import type { JsonObject } from "@jxsuite/schema/types";
 import { createReport } from "../../../src/report.ts";
 import { walkBlocks } from "../../../src/wp/blocks.ts";
 import { decodeEntities, termsOf } from "../../../src/wp/model.ts";
@@ -60,11 +68,14 @@ import {
   loopChildren,
   writtenOut,
   lengthOf,
+  nativeRules,
+  readsState,
   userList,
   usesInComputedLists,
   type ListSource,
   type PostPlan,
   type QueryPlan,
+  type Rule,
   type TermsPlan,
 } from "../../../src/cwicly/blocks/data.ts";
 
@@ -287,27 +298,26 @@ function resolveList(
         if (def === undefined) throw new Error(`no state entry ${k}`);
         let value: unknown;
         if (def.$prototype === "ContentCollection") {
-          let entries = entryPosts(ctx, String(def.contentType)).map((p) => entryOf(ctx, p));
-          for (const rule of (def.filter as { field: string; op: string; value: unknown }[]) ??
-            []) {
-            entries = entries.filter((e) => {
-              const actual = rule.field === "id" ? e.id : e.data[rule.field];
-              return rule.op === "==" ? actual === rule.value : actual !== rule.value;
-            });
-          }
-          for (const rule of [
-            ...((def.sort as { field: string; order: string }[]) ?? []),
-          ].reverse()) {
-            // a stable sort applied from the last rule to the first is the multi-key sort
-            entries = [...entries].sort((a, b) => {
-              const x = (a.data[rule.field] ?? "") as string;
-              const y = (b.data[rule.field] ?? "") as string;
-              const c = x < y ? -1 : x > y ? 1 : 0;
-              return rule.order === "asc" ? c : -c;
-            });
-          }
-          if (typeof def.limit === "number") entries = entries.slice(0, def.limit);
-          value = entries;
+          // The parser's own query, references resolved as the build resolves them: `#/state/…`
+          // against what `extra` holds for the page (`entry`, `term`), `#/$params/…` against
+          // `extra.$params`.
+          const types = Array.isArray(def.contentType) ? def.contentType : [def.contentType];
+          const entries = types.flatMap((t) =>
+            entryPosts(ctx, String(t)).map((p) => entryOf(ctx, p)),
+          );
+          const document = {
+            state: JSON.parse(JSON.stringify({ ...extra })) as JsonObject,
+            route: { _pathParams: (extra.$params ?? {}) as Record<string, string> },
+          };
+          const filter = ((def.filter as FilterRule[] | undefined) ?? []).map((rule) => ({
+            ...rule,
+            value: resolveRuleValue(rule.value, document as never),
+          }));
+          value = queryContentType(entries as never, {
+            filter,
+            ...(def.sort === undefined ? {} : { sort: def.sort as SortRule[] }),
+            ...(typeof def.limit === "number" ? { limit: def.limit } : {}),
+          });
         } else if (def.$prototype === "Function") {
           value = new Function("state", String(def.body))(proxy);
         } else {
@@ -465,8 +475,10 @@ describe("the lists the live pages printed", () => {
     const [q] = queriesOf(site, { kind: "template", slug: "index" });
     const plan = postPlan(q!, ctx);
     expect(plan.perPage).toBe(20);
-    expect(plan.paginated).toBe(false);
-    const posts = evaluatePosts(ctx, plan)!;
+    // its pager is the site's `query-pagination` component, which the plugin prints inside the query
+    expect(plan.paginated).toBe(true);
+    // the first page
+    const posts = evaluatePosts(ctx, plan, { all: false })!;
     const live = liveItems("ap", "essays").filter((i) => i.href.includes("/essays/"));
     expect(live).toHaveLength(20);
     expect(urlsOfPosts(ctx, posts)).toEqual(live.map((i) => sitePath(i.href, site)));
@@ -640,7 +652,7 @@ describe("the plan of a posts query", () => {
     expect(dynamic.types).toEqual(["project"]);
   });
 
-  test("a pagination device decides whether a page size is a limit or a page", () => {
+  test("a pagination device decides whether a page size is a limit or a page", async () => {
     const device = (inner: WpBlock[], attrs: Record<string, unknown> = {}): WpBlock =>
       queryBlock(attrs, inner);
     expect(isPaginated(device([]))).toBe(false);
@@ -664,6 +676,20 @@ describe("the plan of a posts query", () => {
     expect(isPaginated(device([block("cwicly/button", { linkWrapperAction: "lightbox" })]))).toBe(
       false,
     );
+    // a pager drawn once, as a component the query holds: the component's blocks are looked into
+    const ap = await templateCtx("ap", "index");
+    const pagerRef = [...ap.components.values()].find((c) =>
+      ap.model.posts.get(c.postId)?.content.includes("wp:cwicly/query-pagination"),
+    )!.ref;
+    const instance = block("cwicly/component", { ref: pagerRef });
+    expect(isPaginated(device([instance]), ap)).toBe(true);
+    expect(pagedByClick(device([instance]), ap)).toBe(true);
+    // without the components to look into, an instance is nothing
+    expect(isPaginated(device([instance]))).toBe(false);
+    // a query inside the query pages its own list
+    expect(
+      isPaginated(device([block("cwicly/query", {}, [block("cwicly/query-pagination")])])),
+    ).toBe(false);
     // and it shows all the entries
     const paged = postPlan(
       queryBlock({ queryPostType: pick("project"), queryPerPage: st("5"), infiniteLoad: true }),
@@ -1072,8 +1098,8 @@ describe("the plan of a posts query: the current entry, exclusions, meta, search
     );
     // an id that is not an entry cannot be in the list, so there is nothing to leave out
     expect(plan.conds.map((c) => c.native)).toEqual([
-      { field: "url", op: "!=", value: ctx.urlFor("post", 5282)! },
-      { field: "url", op: "!=", value: ctx.urlFor("post", 5280)! },
+      [{ field: "url", op: "!=", value: ctx.urlFor("post", 5282)! }],
+      [{ field: "url", op: "!=", value: ctx.urlFor("post", 5280)! }],
     ]);
     const got = evaluatePosts(ctx, plan)!;
     expect(got.map((p) => p.id)).not.toContain(5282);
@@ -1088,6 +1114,14 @@ describe("the plan of a posts query: the current entry, exclusions, meta, search
     );
     expect(new Set(evaluatePosts(ctx, plan)!.map((p) => p.id))).toEqual(new Set([5282, 5280]));
     expect(plan.conds[0]!.native).toBeUndefined(); // an `or` is not a collection rule
+    // one post is one rule
+    const one = postPlan(
+      queryBlock({ queryPostType: pick("service"), queryInclude: pick(5282) }),
+      ctx,
+    );
+    expect(one.conds[0]!.native).toEqual([
+      { field: "url", op: "==", value: ctx.urlFor("post", 5282)! },
+    ]);
     expect(postPlan(queryBlock({ queryInclude: dyn("postid") }), ctx).dropped.join(" ")).toContain(
       "posts read from",
     );
@@ -1105,7 +1139,7 @@ describe("the plan of a posts query: the current entry, exclusions, meta, search
     );
     expect(plan.conds).toMatchObject([
       {
-        native: { field: "url", op: "!=", value: page.urlFor("post", exterior.id) },
+        native: [{ field: "url", op: "!=", value: page.urlFor("post", exterior.id) }],
         dynamic: false,
       },
     ]);
@@ -1363,49 +1397,67 @@ describe("the state a query registers", () => {
     expect(urlsOf(list)).toEqual(urlsOfPosts(ctx, evaluatePosts(ctx, plan)!));
   });
 
-  test("a taxonomy clause is computed children over unfiltered collections, one per post type, shared by every list of the page", async () => {
+  test("a clause of one term is a collection rule on the entries' term slugs; a clause of several terms is computed children over the unfiltered collection", async () => {
     const out = await convertSubject(await loadSite("fineline"), {
       kind: "template",
       slug: "archive-service",
     });
-    // three lists of services, one source, and no Function state entry (jx validate refuses `timing` on one)
-    expect(out.state).toEqual({
-      service_entries: {
-        $prototype: "ContentCollection",
-        $src: "@jxsuite/parser/ContentCollection.class.json",
-        contentType: "service",
-        timing: "compiler",
-      },
+    const state = out.state as StateMap;
+    // three lists of services: two of one service type each, written as collections, and one of
+    // three types (an "or", which a filter cannot say) over the type's unfiltered collection
+    const collections = Object.entries(state).filter(
+      ([key, def]) => key !== "service_entries" && (def as { filter?: unknown }).filter,
+    );
+    expect(collections).toHaveLength(2);
+    const filters = collections.map(([, def]) => (def as { filter: unknown[] }).filter);
+    for (const [filter, slug] of [
+      [filters[0], "interior"],
+      [filters[1], "exterior"],
+    ] as const) {
+      expect(filter).toContainEqual({
+        field: "terms.service-type.slug",
+        op: "contains",
+        value: slug,
+      });
+      expect(filter).toContainEqual({
+        field: "url",
+        op: "!=",
+        value: "/service/interior-painting/",
+      });
+    }
+    expect(state.service_entries).toEqual({
+      $prototype: "ContentCollection",
+      $src: "@jxsuite/parser/ContentCollection.class.json",
+      contentType: "service",
+      timing: "compiler",
     });
     expect(JSON.stringify(out.state)).not.toContain("Function");
     const loops = inlineLoops(out.nodes);
-    expect(loops).toHaveLength(3);
-    const lists = loops.map((e) => inlineList((e.children as string[])[0]!));
-    for (const list of lists) {
-      expect(list).toContain("[...state.service_entries]");
-      expect(list).toContain(".sort((a, b) => by('date', -1)(a, b))");
-      expect(list).toContain(".slice(0, 25)");
-      expect(list).not.toContain("${");
-    }
-    // each list is its own taxonomy clause, the exclusions written into it
-    expect(lists[0]).toContain("has(e, 'service-type', ['interior'])");
-    expect(lists[1]).toContain("has(e, 'service-type', ['exterior'])");
-    expect(lists[2]).toContain("['agricultural', 'municipal', 'other']");
-    expect(lists[2]).toContain("e.data.url !== '/service/interior-painting/'");
-    expect(lists[2]).not.toContain("/service/municipal-painting/");
-    // the lists are what the model says, in the order it says
+    expect(loops).toHaveLength(1);
+    const computed = inlineList((loops[0]!.children as string[])[0]!);
+    expect(computed).toContain("[...state.service_entries]");
+    expect(computed).toContain(".sort((a, b) => by('date', -1)(a, b))");
+    expect(computed).toContain(".slice(0, 25)");
+    expect(computed).toContain("['agricultural', 'municipal', 'other']");
+    expect(computed).toContain("e.data.url !== '/service/interior-painting/'");
+    expect(computed).not.toContain("/service/municipal-painting/");
+    // the lists are what the model says, in the order it says (the collections by the parser's own query)
     const ctx = await makeCtx(
       "fineline",
       { kind: "template", slug: "archive-service" },
       { mode: "static" },
     );
-    const state = out.state as StateMap;
     const want = (slugs: string[], exclude: number[]): string[] =>
       urlsOfPosts(
         ctx,
         postsWith(ctx, "service", "service-type", slugs).filter((p) => !exclude.includes(p.id)),
       );
-    const got = lists.map((expr) => urlsOf(resolveSource(ctx, state, { expr })));
+    const got = [
+      ...collections.map(([key]) =>
+        urlsOf(resolveSource(ctx, state, { pointer: `#/state/${key}` })),
+      ),
+      urlsOf(resolveSource(ctx, state, { expr: computed })),
+    ];
     expect(got[0]).toEqual(want(["interior"], [5282, 5280, 5307]));
     expect(got[1]).toEqual(want(["exterior"], [5282, 5280, 5307]));
     expect(got[2]).toEqual(want(["agricultural", "municipal", "other"], [5282, 5280]));
@@ -2109,7 +2161,8 @@ describe("a query block", () => {
     expect(ctx.report.entries().find((e) => e.code === "query.empty")).toMatchObject({
       severity: "info",
     });
-    // a list a collection can say is a mapped array over it
+    // a list a collection could say is computed too while it selects nothing: an empty mapped array
+    // is rendered in the browser, an empty computed list is nothing
     const native = await convertQuery({
       queryExclude: pick(
         ...entryPosts(await makeCtx("fineline", { kind: "post", id: 195 }), "project").map(
@@ -2118,7 +2171,8 @@ describe("a query block", () => {
       ),
       queryPerPage: st("3"),
     });
-    expect(elementsWhere(native.nodes, isArray)).toHaveLength(1);
+    expect(elementsWhere(native.nodes, isArray)).toHaveLength(0);
+    expect(inlineLoops(native.nodes)).toHaveLength(1);
     expect(native.ctx.report.entries().some((e) => e.code === "query.empty")).toBe(true);
   });
 
@@ -3665,7 +3719,10 @@ describe("every data block of both sites", () => {
         for (const e of inlines) {
           const expr = (e.children as string[])[0]!;
           for (const m of expr.matchAll(/\bstate\.([A-Za-z_]\w*)/g)) {
-            expect(m[1]! in out.state || ["entry", "term"].includes(m[1]!)).toBe(true);
+            // (or a formula of the project's, which `project.json` holds for every page)
+            expect(
+              m[1]! in out.state || ["entry", "term"].includes(m[1]!) || m[1]! in FORMULAS,
+            ).toBe(true);
           }
           expect(expr).not.toContain("$map");
         }
@@ -3798,7 +3855,9 @@ const ENTRY = (type: string): Record<string, unknown> => ({
 function pageOf(out: Converted, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     title: "t",
-    state: { ...out.state, ...(extra.state as object | undefined) },
+    // The page's own entry first, as the templates emitter writes it: a collection whose rule reads the
+    // entry (`#/state/entry/…`) is resolved after it.
+    state: { ...(extra.state as object | undefined), ...out.state },
     children: replacePlaceholders(out.nodes, { "*": () => null }),
     ...Object.fromEntries(Object.entries(extra).filter(([k]) => k !== "state")),
   };
@@ -4051,8 +4110,46 @@ describe("built by Jx", () => {
     expect(computed).toMatch(/<div class="querytemplate-test"[^>]*><\/div>/);
     expect(shipsJs(computed)).toBe(false);
     expect(computed).not.toContain("data-bind");
-    // a mapped array over a collection that has nothing: its parent (the template's element only) is rendered by the client
-    const mapped = await emptyPage({ queryExclude: pick(...all) });
+    // a list a collection could say, which selects nothing today, is written computed too: no JavaScript
+    const excluded = await emptyPage({ queryExclude: pick(...all) });
+    expect(itemsOf(excluded)).toEqual([]);
+    expect(shipsJs(excluded)).toBe(false);
+    // because a mapped array over a collection that has nothing is the measured exception: its parent
+    // (the template's element only) is rendered by the client
+    const built = await buildJxProject(
+      {
+        ...files,
+        "pages/index.json": {
+          title: "t",
+          state: {
+            none: {
+              $prototype: "ContentCollection",
+              $src: "@jxsuite/parser/ContentCollection.class.json",
+              contentType: "project",
+              filter: [{ field: "url", op: "==", value: "/nothing/" }],
+              timing: "compiler",
+            },
+          },
+          children: [
+            { tagName: "p", textContent: "before" },
+            {
+              tagName: "div",
+              className: "querytemplate-test",
+              children: [
+                {
+                  $prototype: "Array",
+                  items: { $ref: "#/state/none" },
+                  map: { tagName: "div", className: "cc-query-item" },
+                },
+              ],
+            },
+            { tagName: "p", textContent: "after" },
+          ],
+        },
+      },
+      { name: "empty-mapped" },
+    );
+    const mapped = built.html("/");
     expect(mapped).toContain("<p>before</p>");
     expect(mapped).toContain("<p>after</p>");
     expect(itemsOf(mapped)).toEqual([]);
@@ -5276,6 +5373,8 @@ describe("the plan of a posts query: the plugin's and WordPress's own rules", ()
         queryPostType: pick("3d-model"),
         queryPerPage: st("4"),
         queryTaxonomy: [taxEntry({ taxonomy: "project_type", terms: pick(124) })],
+        // by title: a computed list (a collection cannot order titles as MySQL does)
+        queryOrderBy: st("title"),
       }),
       ctx,
     );
@@ -5756,5 +5855,353 @@ describe("the author clauses of a posts query", () => {
       { queryAuthorName: dyn("shortcode", "x") },
     );
     expect((other.plan as PostPlan).dropped.join(" ")).toContain("queryAuthorName");
+  });
+});
+
+// ── Collection rules, paged lists and sliders ────────────────────────────────────────────────────
+
+describe("collection rules: what a plan says as a filter, and that it is the same list", () => {
+  let ap: ConvertCtx;
+  test("setup", async () => {
+    ap = await makeCtx("ap", { kind: "post", id: 819 });
+  });
+
+  /** The list the rules select, by the parser's own query over the site's entries. */
+  const byRules = (plan: PostPlan): string[] => {
+    const rules = nativeRules(plan)!;
+    expect(rules).toBeDefined();
+    const entries = plan.types.flatMap((t) => entryPosts(ap, t).map((p) => entryOf(ap, p)));
+    return urlsOf(
+      queryContentType(entries as never, {
+        filter: rules as FilterRule[],
+        sort: plan.sort,
+      }) as never,
+    );
+  };
+  const byModel = (plan: PostPlan): string[] =>
+    urlsOfPosts(ap, evaluatePosts(ap, plan, { all: true })!);
+  const planOf = (attrs: Record<string, unknown>): PostPlan =>
+    postPlan(queryBlock({ queryPerPage: st("9999"), ...attrs }), ap);
+  const meta = (key: string, compare: string, value: string): Record<string, unknown> => ({
+    multiple: false,
+    key: st(key),
+    value: st(value, { formatType: "boolean" }),
+    compare: st(compare),
+    type: st("BINARY"),
+    relation: "AND",
+    meta_query: [],
+  });
+
+  test("several post types are one collection over all of them, in the block's order, sorted together", () => {
+    const plan = planOf({ queryPostType: pick("episode", "post", "supporters_update") });
+    expect(nativeRules(plan)).toEqual([]);
+    const source = registerPostList(bare(ap), plan, "multi");
+    expect(source).toEqual({ pointer: "#/state/episode_qmulti" });
+    expect(byRules(plan)).toEqual(byModel(plan));
+  });
+
+  test("taxonomy clauses: one term, NOT IN, AND, EXISTS and NOT EXISTS are rules on the entries' term slugs; IN over several is not", () => {
+    const tax = (operator: string, ...terms: string[]): Record<string, unknown> =>
+      taxEntry({ taxonomy: "series", field: "slug", terms: pick(...terms), operator });
+    const series = [...ap.model.terms.values()].filter((t) => t.taxonomy === "series");
+    const used = series.filter((t) => postsWith(ap, "episode", "series", [t.slug]).length > 0);
+    expect(used.length).toBeGreaterThan(1);
+    const [a, b] = used.map((t) => t.slug) as [string, string];
+    const cases: [Record<string, unknown>, Rule[]][] = [
+      [tax("IN", a!), [{ field: "terms.series.slug", op: "contains", value: a }]],
+      [
+        tax("NOT IN", a!, b!),
+        [
+          { field: "terms.series.slug", op: "not contains", value: a },
+          { field: "terms.series.slug", op: "not contains", value: b },
+        ],
+      ],
+      [
+        tax("AND", a!, b!),
+        [
+          { field: "terms.series.slug", op: "contains", value: a },
+          { field: "terms.series.slug", op: "contains", value: b },
+        ],
+      ],
+      [
+        { ...tax("EXISTS", a!), terms: pick(a!) },
+        [{ field: "terms.series.slug", op: "not empty" }],
+      ],
+      [
+        { ...tax("NOT EXISTS", a!), terms: pick(a!) },
+        [{ field: "terms.series.slug", op: "empty" }],
+      ],
+    ];
+    for (const [clause, rules] of cases) {
+      const plan = planOf({ queryPostType: pick("episode", "post"), queryTaxonomy: [clause] });
+      expect(nativeRules(plan)).toEqual(rules);
+      expect(byRules(plan)).toEqual(byModel(plan));
+    }
+    // an "or" of two terms is computed
+    const or = planOf({ queryPostType: pick("episode"), queryTaxonomy: [tax("IN", a!, b!)] });
+    expect(nativeRules(or)).toBeUndefined();
+    // and so is an "or" of two clauses
+    const two = planOf({
+      queryPostType: pick("episode"),
+      queryTaxonomyRelation: "OR",
+      queryTaxonomy: [tax("IN", a!), tax("IN", b!)],
+    });
+    expect(nativeRules(two)).toBeUndefined();
+  });
+
+  test("a true/false field: whatever the comparisons, the values a switch keeps are the rules (`!= 1 OR NOT EXISTS` is `!= true`)", () => {
+    const group = (
+      relation: string,
+      ...parts: Record<string, unknown>[]
+    ): Record<string, unknown> => ({
+      multiple: true,
+      relation,
+      meta_query: parts,
+    });
+    const cases: [unknown[], Rule[]][] = [
+      [[meta("premium", "=", "true")], [{ field: "premium", op: "==", value: true }]],
+      [[meta("premium", "=", "false")], [{ field: "premium", op: "==", value: false }]],
+      // WordPress's `!=` wants a stored row: a switch never saved is not listed
+      [[meta("premium", "!=", "true")], [{ field: "premium", op: "==", value: false }]],
+      [
+        [group("OR", meta("premium", "!=", "true"), meta("premium", "NOT EXISTS", ""))],
+        [{ field: "premium", op: "!=", value: true }],
+      ],
+      [[meta("premium", "EXISTS", "")], [{ field: "premium", op: "not empty" }]],
+      [[meta("premium", "NOT EXISTS", "")], [{ field: "premium", op: "empty" }]],
+    ];
+    for (const [queryMeta, rules] of cases) {
+      const plan = planOf({ queryPostType: pick("episode"), queryMeta });
+      expect(nativeRules(plan)).toEqual(rules);
+      expect(byRules(plan)).toEqual(byModel(plan));
+    }
+    // a text field is compared as MySQL does, without regard to case: not a rule
+    const text = planOf({
+      queryPostType: pick("episode"),
+      queryMeta: [{ ...meta("id", "=", "1"), value: st("1") }],
+    });
+    expect(nativeRules(text)).toBeUndefined();
+  });
+
+  test("the archive's term reads the route's parameter, where the page says which taxonomy and parameter it is", async () => {
+    const ctx = bare(
+      await makeCtx("ap", { kind: "template", slug: "archive" }, {
+        mode: "static",
+        termExpr: "state.term",
+      } as Partial<ConvertCtx>),
+    );
+    const known = { ...ctx, termArchive: { taxonomy: "category", param: "slug" } } as ConvertCtx;
+    const plan = postPlan(queryBlock({ queryPostType: pick("post"), queryInherit: true }), known);
+    expect(nativeRules(plan)).toEqual([
+      { field: "terms.category.slug", op: "contains", value: { $ref: "#/$params/slug" } },
+    ]);
+    // without the page's word, the taxonomy is the term's own, which no rule can name
+    expect(
+      nativeRules(postPlan(queryBlock({ queryPostType: pick("post"), queryInherit: true }), ctx)),
+    ).toBeUndefined();
+    // a list that reads the route is a collection only when it is the page's paged list
+    expect("expr" in registerPostList(known, plan, "a")).toBe(true);
+    expect(registerPostList(known, plan, "b", { paged: true })).toEqual({
+      pointer: "#/state/post_qb",
+    });
+  });
+
+  test("rules that read the page's entry are worked out, and the list stays computed: it is empty on some routes, and an empty mapped list renders in the browser", async () => {
+    const entry = bare(
+      await makeCtx("ap", { kind: "template", slug: "single-post" }, {
+        mode: "entry",
+        entryExpr: "state.entry",
+        entryType: "post",
+      } as Partial<ConvertCtx>),
+    );
+    const plan = postPlan(
+      queryBlock({
+        queryPostType: pick("post", "episode"),
+        queryPerPage: st("6"),
+        queryExcludeCurrent: true,
+        queryTaxonomy: [
+          taxEntry({ taxonomy: "series", terms: dyn("shortcode", "series_id"), operator: "IN" }),
+        ],
+      }),
+      entry,
+    );
+    expect(nativeRules(plan)).toEqual([
+      { field: "url", op: "!=", value: { $ref: "#/state/entry/data/url" } },
+      {
+        field: "terms.series.slug",
+        op: "contains",
+        value: { $ref: "#/state/entry/data/terms/series/0/slug" },
+      },
+    ]);
+    expect(readsState(nativeRules(plan)!)).toBe(true);
+    expect("expr" in registerPostList(entry, plan, "r")).toBe(true);
+  });
+});
+
+describe("a paged list", () => {
+  /** A query converted where the page lets one list be paged; what it claimed, and the nodes. */
+  const pagedQuery = async (
+    attrs: Record<string, unknown>,
+    inner: WpBlock[] = [templateBlock()],
+    taken = false,
+  ): Promise<{ nodes: JxNode[]; ctx: ConvertCtx; claims: { key: string; pageSize: number }[] }> => {
+    const claims: { key: string; pageSize: number }[] = [];
+    const ctx = await fresh("fineline", { kind: "post", id: 195 });
+    Object.assign(ctx, {
+      claimPaging: (claim: { key: string; pageSize: number }) => {
+        if (taken || claims.length > 0) return false;
+        claims.push(claim);
+        return true;
+      },
+    });
+    const q = {
+      ...queryBlock({ queryPostType: pick("project"), queryPerPage: st("5"), ...attrs }, inner),
+      innerHTML: queryHtml,
+    };
+    return { nodes: convertBlocks([q], ctx), ctx, claims };
+  };
+  const loadMore = (): WpBlock =>
+    block("cwicly/button", { linkWrapperAction: "infiniteButtonLoad" }, [], "");
+
+  test("claims the page's paging: the collection with no limit, its items computed over it, and a pager after the list", async () => {
+    const { nodes, ctx, claims } = await pagedQuery({
+      infiniteLoad: true,
+      infiniteLoadMore: "button",
+    });
+    expect(claims).toEqual([{ key: "project_q7", pageSize: 5 }]);
+    const state = Object.fromEntries(collectedState(ctx));
+    expect(state.project_q7).not.toHaveProperty("limit");
+    // computed children over the paged entry: a page of nothing is nothing, not a client render
+    const loops = inlineLoops(nodes);
+    expect(loops).toHaveLength(1);
+    expect(inlineList((loops[0]!.children as string[])[0]!)).toBe("state.project_q7");
+    expect(elementsWhere(nodes, isArray).map((e) => (e.items as { $ref: string }).$ref)).toEqual([
+      "#/state/$page/pagination/pages",
+    ]);
+    const [pager] = elementsWhere(nodes, (e) => e.tagName === "nav");
+    expect(pager).toMatchObject({ className: "cc-pager", attributes: { "aria-label": "Pages" } });
+    expect(JSON.stringify(nodes)).not.toContain("cc-more-");
+    const note = ctx.report.entries().find((e) => e.code === "query.pagination")!;
+    expect(note).toMatchObject({ severity: "info", data: { paged: true, perPage: 5 } });
+    // newest first: "Newer" and "Older"
+    expect(
+      elementsWhere([pager!], (e) => e.tagName === "a" && e.attributes?.rel !== undefined).map(
+        (e) => e.textContent,
+      ),
+    ).toEqual(["Newer", "Older"]);
+  });
+
+  test("the author's Load More button is the pager's place and look; a pagination block marks its place; the others go", async () => {
+    const { nodes } = await pagedQuery({}, [
+      templateBlock(),
+      block("cwicly/div", {}, [
+        block("cwicly/query-pagination"),
+        block("cwicly/query-pagination-numbers"),
+      ]),
+    ]);
+    expect(elementsWhere(nodes, (e) => e.tagName === "nav")).toHaveLength(1);
+    expect(JSON.stringify(nodes)).not.toContain("wp2jx-pager-mark");
+    // inside the div, where the first block stood
+    const [div] = elementsWhere(
+      nodes,
+      (e) => (e.children as JxElement[] | undefined)?.some((c) => c.tagName === "nav") ?? false,
+    );
+    expect(div).toBeDefined();
+  });
+
+  test("a list newest first is not the rule: another order says Previous and Next", async () => {
+    const { nodes } = await pagedQuery({
+      infiniteLoad: true,
+      infiniteLoadMore: "button",
+      queryOrder: st("ASC"),
+    });
+    const [pager] = elementsWhere(nodes, (e) => e.tagName === "nav");
+    expect(
+      elementsWhere([pager!], (e) => e.tagName === "a" && e.attributes?.rel !== undefined).map(
+        (e) => e.textContent,
+      ),
+    ).toEqual(["Previous", "Next"]);
+  });
+
+  test("a page that pages another list already, or a list the build cannot page, keeps the Load more device, and says why", async () => {
+    const taken = await pagedQuery(
+      { infiniteLoad: true, infiniteLoadMore: "button" },
+      [templateBlock(), loadMore()],
+      true,
+    );
+    expect(JSON.stringify(taken.nodes)).toContain("cc-more-");
+    expect(
+      taken.ctx.report.entries().find((e) => e.code === "query.pagination")!.data,
+    ).toMatchObject({
+      paged: false,
+      why: "its page already pages another list, and a page pages one",
+    });
+    const titled = await pagedQuery({
+      infiniteLoad: true,
+      infiniteLoadMore: "button",
+      queryOrderBy: st("title"),
+    });
+    expect(titled.claims).toEqual([]);
+    expect(
+      titled.ctx.report.entries().find((e) => e.code === "query.pagination")!.data,
+    ).toMatchObject({
+      why: "its list is computed, because a collection cannot order titles as MySQL does",
+    });
+    // a page of no paging (a component, a part) is not asked at all
+    const plain = await convertQuery({ infiniteLoad: true, infiniteLoadMore: "button" });
+    expect(
+      plain.ctx.report.entries().find((e) => e.code === "query.pagination")!.data,
+    ).toMatchObject({
+      paged: false,
+    });
+  });
+
+  test("a component that is the pager (prev, next, the numbers) is the paged list's pager, in its place", async () => {
+    const ap = await fresh("ap", { kind: "template", slug: "index" });
+    const claims: unknown[] = [];
+    Object.assign(ap, { claimPaging: (c: unknown) => (claims.push(c), true) });
+    const site = await loadSite("ap");
+    const [q] = queriesOf(site, { kind: "template", slug: "index" });
+    const nodes = convertBlocks([q!], ap);
+    expect(claims).toHaveLength(1);
+    const pager = elementsWhere(nodes, (e) => e.tagName === "nav");
+    expect(pager).toHaveLength(1);
+    const tags = [...walkElements(nodes)].map((e) => e.tagName);
+    expect(tags.some((t) => typeof t === "string" && t.endsWith("-query-pagination"))).toBe(false);
+  });
+});
+
+describe("a slider", () => {
+  test("is the items of the site's slider component, with the block's autoplay, interval and rewind", async () => {
+    const ctx = await fresh("fineline", { kind: "post", id: 195 });
+    Object.assign(ctx, { sliderTag: "fp-query-slider" });
+    const q = {
+      ...queryBlock({ queryPostType: pick("project"), queryPerPage: st("4") }, [
+        block(
+          "cwicly/query-template",
+          {
+            repeaterSlider: true,
+            repeaterSliderOptions: { lg: { rewind: "true" }, autoplay: "true", interval: "3000" },
+          },
+          [titleHeading()],
+        ),
+      ]),
+      innerHTML: queryHtml,
+    };
+    const nodes = convertBlocks([q], ctx);
+    const [host] = elementsWhere(nodes, (e) => e.tagName === "fp-query-slider");
+    expect(host).toBeDefined();
+    expect(host!.$props).toEqual({ autoplay: true, interval: 3000, rewind: true });
+    // the loop is the host's one child, and the host the template's
+    expect(host!.children).toHaveLength(1);
+    expect(isArray((host!.children as JxElement[])[0]!)).toBe(true);
+    expect(ctx.report.entries().find((e) => e.code === "query.slider")!.data).toMatchObject({
+      component: "fp-query-slider",
+    });
+    // where the conversion has no slider component, the items are an ordinary list, and that is said
+    const plain = await fresh("fineline", { kind: "post", id: 195 });
+    Object.assign(plain, { sliderTag: undefined });
+    const listed = convertBlocks([q], plain);
+    expect(elementsWhere(listed, (e) => e.tagName === "fp-query-slider")).toEqual([]);
   });
 });

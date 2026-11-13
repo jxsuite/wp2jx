@@ -12,6 +12,7 @@
  * Every string returned is final-form (docs/bindings.md): a `${…}` binding where the value belongs to
  * the entry, text with its literal parts escaped for the place it is written otherwise.
  */
+import { orFallback } from "../formulas.ts";
 import { escapeTemplate, finishBindings, finishNodes } from "../jx-util.ts";
 import { htmlToContent, type HtmlContent, type HtmlOptions } from "../html.ts";
 import type { ConvertCtx, WpBlock } from "../types.ts";
@@ -290,7 +291,7 @@ function omitEmpty(v: Val): string | number | undefined {
     if (v.lit === "") return undefined;
     return /^\d+$/.test(v.lit) ? Number(v.lit) : v.lit;
   }
-  return `\${(${v.expr}) || false}`;
+  return `\${${orFallback(v.expr, "false")}}`;
 }
 
 /** The alt text a block states itself: its `imageAlt`, or a component parameter. */
@@ -358,7 +359,7 @@ function withFallbackSrc(ctx: ConvertCtx, src: Val, fallback: string | undefined
     const chosen = src.lit !== "" ? src.lit : fallback;
     return literalFinal(ctx, chosen ?? "");
   }
-  return `\${(${src.expr}) || ${jsString(fallback ?? "")}}`;
+  return `\${${orFallback(src.expr, jsString(fallback ?? ""))}}`;
 }
 
 /**

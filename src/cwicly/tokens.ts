@@ -54,6 +54,7 @@ import {
   htmlEscapeExpr,
   type BindingContext,
 } from "../jx-util.ts";
+import { formulaCall, intlDateOptions, isPath, isPipe, orFallback } from "../formulas.ts";
 import { htmlToContent, htmlToNodes, type HtmlContent, type HtmlOptions } from "../html.ts";
 import { parseBlocks } from "../wp/blocks.ts";
 import type { ConvertCtx, JxNode, WpBlock, WpPost, WpTerm } from "../types.ts";
@@ -315,7 +316,7 @@ export function orElse(primary: Val | undefined, fallback: Val | undefined): Val
       : html && fallback.html !== true
         ? htmlEscapeExpr(fallback.expr)
         : fallback.expr;
-  return { expr: `(${first}) || ${second}`, html };
+  return { expr: orFallback(first, second), html };
 }
 
 // ── Text the way WordPress writes it ─────────────────────────────────────────────────────────────
@@ -851,6 +852,23 @@ export function dateExpr(
   const partsExpr = `Object.assign(Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:${jsString(zone)},${fields.join(",")}}).formatToParts(d).map(q => [q.type, q.type === 'weekday' ? q.value : +q.value]))${instant})`;
   const body = parts.length === 0 ? "''" : parts.join(" + ");
   return { expr: `((d) => ((p) => '' + ${body})(${partsExpr}))(new Date(${dateExpr}))` };
+}
+
+/**
+ * The date at a path as a call of the `formatDate` formula, where that prints exactly what
+ * {@link dateExpr} prints for the format: one of the formats Intl writes whole, on a site whose
+ * language is the locale that writes it (`intlDateOptions`). A missing or empty date prints nothing
+ * either way. `undefined` for any other format, language or expression: the caller writes `dateExpr`.
+ */
+export function dateTag(
+  ctx: ConvertCtx,
+  format: string,
+  path: string,
+  zoneName?: string,
+): string | undefined {
+  if (!isPath(path)) return undefined;
+  const options = intlDateOptions(format, ctx.model.site.language, zoneName ?? siteZone(ctx));
+  return options === undefined ? undefined : formulaCall("formatDate", path, options);
 }
 
 /** The format a Cwicly date or time token names: a number, `default`, or a PHP format (`custom`). */
@@ -1494,9 +1512,15 @@ export function phpEmpty(v: unknown): boolean {
   return Array.isArray(v) && v.length === 0;
 }
 
-/** The expression that is true when an expression's value is not empty in that sense (`0` and `'0'` are empty, as in PHP). */
+/**
+ * The expression that is true when an expression's value is not empty in that sense (`0` and `'0'` are
+ * empty, as in PHP): the `notEmpty` formula on a value read from a path, which is {@link phpEmpty}
+ * negated for every value, and the same test written out for any other expression.
+ */
 export const notEmptyExpr = (e: string): string =>
-  `((v) => !!v && v != '0' && !(Array.isArray(v) && !v.length))(${e})`;
+  isPipe(e)
+    ? formulaCall("notEmpty", e)
+    : `((v) => !!v && v != '0' && !(Array.isArray(v) && !v.length))(${e})`;
 
 /** A textarea's `new_lines` setting: how ACF turns its line breaks into markup when it reads the value (`wpautop`, `br`, or nothing). */
 const newLines = (f: AcfField): string =>
@@ -1652,12 +1676,10 @@ export function fieldText(ctx: ConvertCtx, f: AcfField, ref: Ref): Val | undefin
         typeof f.settings.return_format === "string" ? f.settings.return_format : "d/m/Y";
       // A date picker holds a day, which the entry stores as `YYYY-MM-DD`: it is read as the UTC midnight
       // it parses to and formatted in UTC, or a zone west of Greenwich prints the day before.
-      const made = dateExpr(
-        ctx,
-        format,
-        `(${e}) ?? ''`,
-        f.type === "date_picker" ? "UTC" : undefined,
-      );
+      const zone = f.type === "date_picker" ? "UTC" : undefined;
+      const tag = dateTag(ctx, format, e, zone);
+      if (tag !== undefined) return exprV(tag);
+      const made = dateExpr(ctx, format, `(${e}) ?? ''`, zone);
       // A missing date must print nothing, not "Invalid Date".
       return exprV(`(${e}) ? ${made.expr} : ''`);
     }
@@ -1913,6 +1935,8 @@ function postDate(env: Env, args: string[], time: boolean): Outcome {
     const ms = Date.parse(String(r.value));
     return Number.isNaN(ms) ? litV("") : litV(formatDate(ctx, format, ms));
   }
+  const tag = dateTag(ctx, format, r.expr);
+  if (tag !== undefined) return exprV(tag);
   const made = dateExpr(ctx, format, `${r.expr}`);
   return exprV(`(${r.expr}) ? ${made.expr} : ''`);
 }
@@ -2165,10 +2189,12 @@ const SCALAR_FIELDS = new Set([...STRING_FIELDS, "select", "radio", "button_grou
 function withoutPhpZero(f: AcfField, v: Val): Val {
   if (!SCALAR_FIELDS.has(f.type)) return v;
   if ("lit" in v) return v.lit === "0" ? litV("", v.html === true) : v;
-  return exprV(
-    `((t) => t == '0' ? '' : t ?? '')(${v.expr.replace(/ \?\? ''$/, "")})`,
-    v.html === true,
-  );
+  const value = v.expr.replace(/ \?\? ''$/, "");
+  // A field read from a path holds a string, a number or nothing, and for those the `orBlank` formula
+  // is this test exactly. (They part on a list such as `['0']`, which `==` reads as `'0'`: no path of
+  // a scalar field holds one, and an expression that might is not a path.)
+  if (isPipe(value)) return exprV(formulaCall("orBlank", value), v.html === true);
+  return exprV(`((t) => t == '0' ? '' : t ?? '')(${value})`, v.html === true);
 }
 
 // ── Components ───────────────────────────────────────────────────────────────────────────────────

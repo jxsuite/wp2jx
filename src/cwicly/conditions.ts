@@ -48,6 +48,7 @@ import {
   termRef,
   type Ref,
 } from "./tokens.ts";
+import { isPath, isPipe, pipeOf } from "../formulas.ts";
 import { termsOf } from "../wp/model.ts";
 
 export interface Visibility {
@@ -84,8 +85,23 @@ const no: Answer = { c: false };
 const when = (b: boolean): Answer => (b ? yes : no);
 const isConst = (a: Answer): a is { c: boolean } => "c" in a;
 
-/** `!(x)` with its parentheses dropped again when `x` is itself `!(…)` all the way round. */
+/** `!!x`: whether a value is there. A value read from a path takes no parentheses, so Studio reads the binding as "is set". */
+const truthy = (e: string): string => {
+  const pipe = pipeOf(e);
+  return pipe === undefined ? `!!(${e})` : `!!${pipe}`;
+};
+
+/**
+ * `!(x)` with its parentheses dropped again when `x` is itself `!(…)` all the way round. A value read
+ * from a path (or from a formula on one) is negated bare, `!x`, and `!x` and `!!x` turn into each
+ * other: all three are bindings Studio reads as a field that is empty or set.
+ */
 function negate(e: string): string {
+  // `path ?? ''` is false exactly when the path's value is.
+  const pipe = pipeOf(e);
+  if (pipe !== undefined) return `!${pipe}`;
+  if (e.startsWith("!!") && isPipe(e.slice(2))) return e.slice(1);
+  if (e.startsWith("!") && isPipe(e.slice(1))) return `!${e}`;
   if (e.startsWith("!(") && e.endsWith(")")) {
     let depth = 0;
     for (let i = 1; i < e.length; i++) {
@@ -245,7 +261,7 @@ function operandOf(entry: Entry, ctx: ConvertCtx): Operand | string {
     case "postfeaturedimage": {
       const r = currentRef(ctx, "featuredImage");
       if (!r) return "there is no current post";
-      return { bool: isExprRef(r) ? { e: `!!(${r.expr})` } : when(!!r.value) };
+      return { bool: isExprRef(r) ? { e: truthy(r.expr) } : when(!!r.value) };
     }
     case "postexcerpt": {
       const r = currentRef(ctx, "excerpt");
@@ -322,7 +338,7 @@ function functionAnswer(entry: Entry, ctx: ConvertCtx): Maybe {
       : when(((terms.value as Record<string, unknown[]> | undefined)?.post_tag ?? []).length > 0);
   } else if (fn === "has_post_thumbnail()") {
     const image = currentRef(ctx, "featuredImage");
-    if (image) value = isExprRef(image) ? { e: `!!(${image.expr})` } : when(!!image.value);
+    if (image) value = isExprRef(image) ? { e: truthy(image.expr) } : when(!!image.value);
   }
   if (value === undefined) return UNKNOWN;
   if (entry.operator === "true") return value;
@@ -391,15 +407,18 @@ function acfAnswer(entry: Entry, ctx: ConvertCtx): Maybe {
   const filled: Answer = !isExprRef(ref)
     ? when(!phpEmpty(ref.value))
     : f.type === "image" || f.type === "file"
-      ? { e: `!!(${ref.expr}?.src)` }
+      ? { e: truthy(`${ref.expr}?.src`) }
       : f.type === "link"
-        ? { e: `!!(${ref.expr}?.url)` }
+        ? { e: truthy(`${ref.expr}?.url`) }
         : f.multiple ||
             f.type === "gallery" ||
             f.type === "repeater" ||
             f.type === "flexible_content" ||
             f.type === "relationship"
-          ? { e: `(${ref.expr}?.length ?? 0) > 0` }
+          ? // A list has items when its length is not zero: `!!list?.length`, which Studio reads as "is set".
+            isPath(ref.expr)
+            ? { e: `!!${ref.expr}?.length` }
+            : { e: `(${ref.expr}?.length ?? 0) > 0` }
           : { e: notEmptyExpr(ref.expr) };
   switch (entry.operator) {
     case "empty":

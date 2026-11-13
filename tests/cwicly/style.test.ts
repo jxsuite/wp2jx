@@ -1438,7 +1438,7 @@ describe("an inline style that holds a ${…} binding (entry templates, loops)",
       "post",
     );
     expect(styling.boundStyle).toMatch(
-      /^--background-image:url\(\$\{\(state\.entry\.data\.featuredImage\?\.src \?\? ''\) \|\| '[^']+maxresdefault\.jpg'\}\)$/,
+      /^--background-image:url\(\$\{state\.entry\.data\.featuredImage\?\.src \|\| '[^']+maxresdefault\.jpg'\}\)$/,
     );
     expect(problems(ctx)).toEqual([]);
   });
@@ -1450,7 +1450,9 @@ describe("an inline style that holds a ${…} binding (entry templates, loops)",
       "div-c4eb023",
       "post",
     );
-    expect(styling.boundStyle).toContain("${(state.entry.data.picture?.src ?? '')");
+    expect(styling.boundStyle).toBe(
+      "--background-image:url(${state.entry.data.picture?.src || '/media/2021/10/pictures_2021-10_headshot_profile_pic.jpeg'})",
+    );
     expect(problems(ctx)).toEqual([]);
   });
 

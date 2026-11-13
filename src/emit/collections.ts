@@ -13,9 +13,13 @@
  *   from Rank Math, `hasExcerpt`, `postType` (a list of several types asks each entry what it is), and every key of every object in order (`sortDeep`): the same site
  *   writes the same bytes. A string that holds `${` is spelled with a zero-width space between the two
  *   characters (`md.literal-template`): the build evaluates it wherever it is written.
- * - **Only published, routed posts get a file**, at the route's `file`. Drafts, private, pending and
- *   scheduled posts are `collection.excluded` (the build does not filter drafts), a password protected
- *   post is `collection.protected`, a post that lost its address or never had one is
+ * - **Published, routed posts get a file**, at the route's `file`. With `hold` (a Jx that has a
+ *   content type's `hold`, jxsuite/jx#548) so do the drafts, the posts pending review, the scheduled,
+ *   private and password-protected posts, at the address each will have once published
+ *   (`RouteTable.held`), with `postStatus` and `passwordProtected`: the collection's `hold` rules
+ *   ({@link HOLD_RULES}) keep them out of a build, and `jx dev` and Studio show them with the rule's
+ *   label (`collection.held`). Without it they are `collection.excluded`, and a password protected
+ *   post is `collection.protected`. A post that lost its address or never had one is
  *   `collection.no-route`, and a post type no route knows (a plugin's) is `collection.unrouted`
  *   unless `routeTypes` gives it its rewrite rule.
  * - **Addresses are the Jx site's.** A value that is one address (an ACF `url` or `link` field) and
@@ -112,8 +116,10 @@
  *   caption, a table cell, a `div`. The paragraph is made here, so the tree written is the tree read.
  * - **The first row of a Markdown table is a header row, a cell has no spans, attributes or blocks.**
  *   A table that is not exactly that (no `thead`, a class, a span) is written as directives, which carry
- *   all of it; so is a list with a class on it or on an item (a Markdown item inside a directive reads
- *   back as a list in a list), an image with attributes a Markdown image has no place for (width,
+ *   all of it (the serializer of `@jxsuite/parser` 4 decides the same for a table; {@link tableIsNative}
+ *   says which it will be, because a cell written as a directive reads back with a paragraph); so is
+ *   a list with a class on it or on an item (a Markdown item inside a directive reads back as a list
+ *   in a list), an image with attributes a Markdown image has no place for (width,
  *   height, a class), a link with no address, and a block inside a link (the serializer writes the
  *   content of a link, emphasis, paragraph or heading as one line, whatever it is).
  * - **An inline element alone in a container that is a directive** (the image in a `figure`) is a
@@ -156,7 +162,7 @@
  * that those paragraphs are HTML in an attribute, not Markdown a person edits, which is why it is
  * opt-in (headings and the other containers keep the gap and the report).
  *
- * Report codes: `collection.excluded`, `collection.protected`, `collection.no-route`,
+ * Report codes: `collection.excluded`, `collection.held`, `collection.protected`, `collection.no-route`,
  * `collection.unrouted`, `collection.duplicate-file`, `collection.inline-gap-summary`,
  * `collection.item-paragraph-rule`, `collection.fixed-layout-rule`,
  * `entry.date-invalid`, `entry.seo-failed`, `entry.key-collision`, `entry.placeholder-dropped`,
@@ -184,7 +190,7 @@ import { fluentFormFor } from "./fluentform.ts";
 import { sortedJson, type ClassStyles } from "./class-styles.ts";
 import { rewriteStyleUrls } from "./style-urls.ts";
 import { createReport } from "../report.ts";
-import { buildRoutes, createUrlTools } from "../routes.ts";
+import { HELD_STATUSES, buildRoutes, createUrlTools } from "../routes.ts";
 import type { Route, RouteOptions } from "../routes.ts";
 import { subjectCtx } from "../site.ts";
 import type { HoistedRule, SiteContext } from "../site.ts";
@@ -428,7 +434,13 @@ export const emptyNotes = (): BodyNotes => ({
   addressSpaces: 0,
 });
 
-/** The Jx build evaluates `${…}` in every text of an entry, however it is spelled; a zero-width space between the two characters ends that. */
+/**
+ * The Jx build evaluates `${…}` in an entry's data, attributes, classes and component properties,
+ * however it is spelled; a zero-width space between the two characters ends that. The reader makes the
+ * text of a body inert itself (`@jxsuite/parser` 4, `inert.ts`), by putting a `span` around a text
+ * that has siblings, which the build then separates from them with a space: the body's text is
+ * spelled the same way as the rest, and no element is made.
+ */
 export const degradeTemplate = (text: string): string => text.replaceAll("${", "$\u200b{");
 
 /**
@@ -2036,7 +2048,36 @@ export interface CollectionsOptions {
    * on the live page. Default: nothing known, so no rule is written for that reason.
    */
   classStyles?: ClassStyles;
+  /**
+   * Write the entries that are not public (the site's held routes: a draft, a post pending review, a
+   * scheduled or private one) and the password-protected ones, each with what keeps it back
+   * (`postStatus`, `passwordProtected`), and give every collection the `hold` rules that keep them
+   * out of a build ({@link HOLD_RULES}; jxsuite/jx#548). Jx before `hold` reads no rule and would
+   * publish them, so this is only for a Jx that has it. Default false: they are left out, and said.
+   */
+  hold?: boolean;
 }
+
+/** A content type's rule of what holds an entry back: the label authors see, and the entries it holds (jxsuite/jx#548). */
+export interface HoldRule {
+  label: string;
+  when: Rec;
+}
+
+/**
+ * What holds a migrated entry back from a build, in WordPress's terms. The statuses are WordPress's
+ * own (`postStatus`): a draft, a post pending review and a private post (only signed-in users read
+ * one, and a static site has no one signed in). A scheduled post (`future`) is held by its date,
+ * because WordPress publishes it then: it is published by the first build after it. A password
+ * protected post shows a form on the live site and not its content, which a static site cannot.
+ */
+export const HOLD_RULES: readonly HoldRule[] = [
+  { label: "Draft", when: { postStatus: "draft" } },
+  { label: "Pending review", when: { postStatus: "pending" } },
+  { label: "Private", when: { postStatus: "private" } },
+  { label: "Scheduled", when: { date: { $gt: { $now: true } } } },
+  { label: "Password protected", when: { passwordProtected: true } },
+];
 
 /** What a collection's `$elements` lists: a component file, or the name that only switches directives on. */
 export type ElementRef = string | { $ref: string };
@@ -2053,6 +2094,8 @@ export interface CollectionDef {
   format: "Markdown";
   schema: CollectionSchema;
   $elements: ElementRef[];
+  /** What holds an entry back from a build (`CollectionsOptions.hold`). */
+  hold?: HoldRule[];
 }
 
 export interface CollectionEntry {
@@ -2276,6 +2319,7 @@ async function entryData(
   report: Report,
   seoReport: Report,
   now: Date | undefined,
+  hold = false,
 ): Promise<Rec> {
   const ctx = await subjectCtx(work, { kind: "post", id: post.id }, { target: "markdown", report });
   const data: Rec = { ...postData(ctx, post) };
@@ -2300,13 +2344,19 @@ async function entryData(
   // ACF's own findings about the values (a field deleted since, a group switched off) belong to the entry that has them.
   const fields = acfValues(work.model, work.acf, postTarget(work.model, post), { report });
   // The two keys this module adds to the contract are not reserved by ACF's own list (`BASE_KEYS`), so a field of that name has taken the key.
-  for (const key of ["authorUrl", "hasExcerpt", "postType", "authorInfo"]) {
+  for (const key of [
+    "authorUrl",
+    "hasExcerpt",
+    "postType",
+    "authorInfo",
+    ...(hold ? ["postStatus", "passwordProtected"] : []),
+  ]) {
     if (!Object.hasOwn(fields, key)) continue;
     add(
       report,
       "warn",
       "entry.key-collision",
-      `An ACF field is called \`${key}\`, which is also a key of the entry data contract (${key === "authorUrl" ? "the address of the author's page" : key === "postType" ? "the post's type" : key === "authorInfo" ? "the author's names and biography" : "whether the post has an excerpt"}): the entry holds the field's value under it, and a template that reads the contract's key gets that. Rename the field to keep both.`,
+      `An ACF field is called \`${key}\`, which is also a key of the entry data contract (${key === "authorUrl" ? "the address of the author's page" : key === "postType" ? "the post's type" : key === "authorInfo" ? "the author's names and biography" : key === "postStatus" ? "the post's status, which the collection's hold rules read" : key === "passwordProtected" ? "whether a password gates the post, which a hold rule reads" : "whether the post has an excerpt"}): the entry holds the field's value under it, and a template that reads the contract's key gets that. Rename the field to keep both.`,
       where,
       url,
       { key },
@@ -2318,6 +2368,12 @@ async function entryData(
   if (authorUrl !== undefined && data.authorUrl === undefined) data.authorUrl = authorUrl;
   // A list that mixes types (a tag's posts and episodes) asks each entry what it is (`postType`).
   if (data.postType === undefined) data.postType = post.type;
+  // What the collection's `hold` rules read: WordPress's status, and the password that gates the post.
+  if (hold) {
+    if (data.postStatus === undefined) data.postStatus = post.status;
+    if (post.passwordProtected && data.passwordProtected === undefined)
+      data.passwordProtected = true;
+  }
   // What `{authorinfo}` prints of the author (the biography box of an essay's "Essay Author" section, the names):
   // the profile's fields, for an author who has any.
   const info = authorInfoOf(work.model, post.authorId);
@@ -2503,7 +2559,9 @@ async function buildEntry(
   const url = publicUrl(work.model.site, post);
   const entryReport = createReport();
   // Rank Math's own findings are about the site (a plugin it cannot port), so they are said once, by the report that is kept.
-  const data = await entryData(work, post, entryReport, report, opts.now);
+  const data = await entryData(work, post, entryReport, report, opts.now, opts.hold === true);
+  // A held entry is in no public lookup (`RouteTable.held`): its address is where it will be once published.
+  if (data.url === undefined || data.url === "") data.url = route.jxRoute;
   const literal = { n: 0 };
   const clean = degradeStrings(data, literal) as Rec;
 
@@ -2989,6 +3047,8 @@ function withRoutes(
     report: own,
     media: site.media,
     postTypes: routeTypes,
+    // The entries the site's own table holds back, held here too.
+    held: [...new Set(site.routes.held().map((r) => r.status))],
   });
   const urls = createUrlTools(site.model, routes, site.media, { report: own });
   // What the site's own load already said is not said twice.
@@ -3019,6 +3079,11 @@ export async function buildCollections(
     entryRoutes.set(Number(route.id), route);
     if (route.type !== undefined) routedTypes.add(route.type);
   }
+  // The entries that are not public, where they will be once published: written only to be held.
+  const hold = opts.hold === true;
+  const heldRoutes = new Map<number, Route>(
+    hold ? work.routes.held().map((r) => [Number(r.id), r] as const) : [],
+  );
 
   const byType = new Map<string, WpPost[]>();
   for (const post of model.posts.values()) {
@@ -3034,20 +3099,40 @@ export async function buildCollections(
   for (const type of [...byType.keys()].sort()) {
     const posts = byType.get(type)!.sort((a, b) => a.id - b.id);
     const excluded = new Map<string, number[]>();
+    const heldOf = new Map<string, number[]>();
     const published: WpPost[] = [];
     for (const post of posts) {
-      if (post.status !== "publish") {
+      if (post.status === "publish") published.push(post);
+      else if (heldRoutes.has(post.id)) {
+        published.push(post);
+        heldOf.set(post.status, [...(heldOf.get(post.status) ?? []), post.id]);
+      } else {
         const list = excluded.get(post.status) ?? [];
         list.push(post.id);
         excluded.set(post.status, list);
-      } else published.push(post);
+      }
     }
     for (const [status, ids] of [...excluded].sort(([a], [b]) => (a < b ? -1 : 1))) {
       add(
         report,
         "info",
         "collection.excluded",
-        `${plural(ids.length, `${type} ${status === "publish" ? "post" : status}`)} ${ids.length === 1 ? "is" : "are"} not published, and the Jx build does not filter drafts, so ${ids.length === 1 ? "it was" : "they were"} left out.`,
+        hold && HELD_STATUSES.includes(status)
+          ? `${plural(ids.length, `${type} ${status}`)} ${ids.length === 1 ? "has" : "have"} no address on the migrated site to be held at (the type has none, or another post has it), so ${ids.length === 1 ? "it was" : "they were"} left out.`
+          : hold
+            ? `${plural(ids.length, `${type} ${status === "publish" ? "post" : status}`)} ${ids.length === 1 ? "is" : "are"} not published and not a status a build holds back (a draft, pending, scheduled or private post), so ${ids.length === 1 ? "it was" : "they were"} left out.`
+            : `${plural(ids.length, `${type} ${status === "publish" ? "post" : status}`)} ${ids.length === 1 ? "is" : "are"} not published, and the project holds nothing back (the Jx this ran with has no \`hold\`, or it was turned off), so ${ids.length === 1 ? "it was" : "they were"} left out.`,
+        `collection:${type}`,
+        undefined,
+        { type, status, count: ids.length, ids: sample(ids, 20) },
+      );
+    }
+    for (const [status, ids] of [...heldOf].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      add(
+        report,
+        "info",
+        "collection.held",
+        `${plural(ids.length, `${type} ${status}`)} ${ids.length === 1 ? "is" : "are"} written as ${ids.length === 1 ? "an entry" : "entries"} the build holds back (\`postStatus: ${status}\`, the collection's \`hold\` rules): authors see ${ids.length === 1 ? "it" : "them"} in \`jx dev\` and Studio, the site does not.`,
         `collection:${type}`,
         undefined,
         { type, status, count: ids.length, ids: sample(ids, 20) },
@@ -3078,7 +3163,7 @@ export async function buildCollections(
     for (const post of published) {
       const where = `post:${post.id}`;
       const url = publicUrl(model.site, post);
-      if (post.passwordProtected) {
+      if (post.passwordProtected && !hold) {
         add(
           report,
           "warn",
@@ -3090,7 +3175,7 @@ export async function buildCollections(
         );
         continue;
       }
-      const route = entryRoutes.get(post.id);
+      const route = entryRoutes.get(post.id) ?? heldRoutes.get(post.id);
       if (!route) {
         const winner = work.routes.forPost(post.id);
         add(
@@ -3183,6 +3268,13 @@ export async function buildCollections(
       ...(mine.some((b) => b.entry.frontmatter.captivate !== undefined)
         ? { captivate: { type: "object" } }
         : {}),
+      // What the hold rules read, a choice of WordPress's statuses and a switch, for Studio's form.
+      ...(opts.hold === true
+        ? {
+            postStatus: { type: "string", enum: ["publish", ...HELD_STATUSES] },
+            passwordProtected: { type: "boolean" },
+          }
+        : {}),
       ...relaxAddressFormats(fields.properties as Record<string, JsonSchema> | undefined),
     };
     // A group applies to some of the entries and not to others (a location rule on a taxonomy term, a
@@ -3216,6 +3308,7 @@ export async function buildCollections(
       format: "Markdown",
       schema,
       $elements: elements,
+      ...(opts.hold === true ? { hold: HOLD_RULES.map((r) => structuredClone(r)) } : {}),
     };
 
     for (const b of mine) {

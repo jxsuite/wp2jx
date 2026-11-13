@@ -28,6 +28,7 @@
  * load-more buttons, sliders, filters, dark-mode toggles and WooCommerce actions have no static
  * equivalent: `link.unsupported`, and the link has no destination.
  */
+import { orFallback } from "../formulas.ts";
 import { finishBindings } from "../jx-util.ts";
 import type { ConvertCtx, WpBlock } from "../types.ts";
 import { maybeUnserialize } from "../wp/phpser.ts";
@@ -187,7 +188,7 @@ function acfHref(
   }
   const v = fieldText(ctx, info.field, got.ref);
   if (!v) return undefined;
-  if (isExprRef(got.ref)) return `\${(${(v as { expr: string }).expr}) || false}`;
+  if (isExprRef(got.ref)) return `\${${orFallback((v as { expr: string }).expr, "false")}}`;
   return "lit" in v && v.lit !== "" ? finalForm(ctx, v) : undefined;
 }
 

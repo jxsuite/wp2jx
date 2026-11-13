@@ -61,6 +61,7 @@ import type {
   WpModel,
   WpPost,
 } from "./types.ts";
+import type { PagingClaim, TermArchive } from "./cwicly/blocks/data.ts";
 import { loadAcf, userFieldNames, type AcfModel } from "./wp/acf.ts";
 import { addReferencedUsers, referencedUsers } from "./wp/profiles.ts";
 import { loadFluentForms, type FluentForm } from "./wp/fluentform.ts";
@@ -626,6 +627,7 @@ export const componentTag = (
 interface TagTable {
   parts: Map<string, string>;
   reusables: Map<number, string>;
+  slider: string;
 }
 
 const tagTables = new WeakMap<object, TagTable>();
@@ -665,19 +667,27 @@ function tagTable(site: SiteContext): TagTable {
       ),
     );
   }
-  table = { parts, reusables };
+  // The slider a query template is (`emit/slider.ts`), written only where a page uses it.
+  const slider = pool.take([`${pre}-query-slider`, `${pre}-wp2jx-slider`]);
+  table = { parts, reusables, slider };
   tagTables.set(site, table);
   return table;
 }
 
-/** Every tag the emitters write for this site: its components, template parts and reusable blocks. */
+/** Every tag the emitters write for this site: its components, template parts, reusable blocks and the query slider. */
 export function siteTags(site: SiteContext): Set<string> {
   const table = tagTable(site);
   return new Set([
     ...[...site.components.values()].map((info) => info.tagName),
     ...table.parts.values(),
     ...table.reusables.values(),
+    table.slider,
   ]);
+}
+
+/** The tag of the slider component a Cwicly query template becomes (`ap-query-slider`; `emit/slider.ts`). */
+export function sliderTag(site: SiteContext): string {
+  return tagTable(site).slider;
 }
 
 /** The tag of the component a template part becomes (`fp-header`). */
@@ -712,6 +722,8 @@ export interface LoadSiteOptions {
   postTypes?: string[];
   /** Rewrite rules of post types registered in code, which ACF knows nothing about (`RouteOptions.postTypes`). */
   routeTypes?: RouteOptions["postTypes"];
+  /** Statuses of the entries routed as held, for a project that holds them back (`RouteOptions.held`). Default: none. */
+  held?: readonly string[];
   report?: Report;
 }
 
@@ -887,6 +899,7 @@ export async function loadSiteContext(opts: LoadSiteOptions): Promise<SiteContex
     report,
     media,
     ...(opts.routeTypes === undefined ? {} : { postTypes: opts.routeTypes }),
+    ...(opts.held === undefined ? {} : { held: opts.held }),
   });
   const urls = createUrlTools(model, routes, media, { report });
 
@@ -952,6 +965,14 @@ export interface SubjectOptions {
   entryType?: string;
   termExpr?: string;
   target?: "page" | "markdown";
+  /**
+   * The conversion is a page of its own, which can be built in pages of one of its lists: its session
+   * grants the first query that asks (`SubjectCtx.claimPaging`), and the emitter that writes the page
+   * makes it a paged route (`Converted.paging`, `emit/paging.ts`).
+   */
+  pageable?: boolean;
+  /** A term page's taxonomy and route parameter (`cwicly/blocks/data.ts`, `TermArchive`). */
+  termArchive?: TermArchive;
 }
 
 /** Post types whose conversion is a JSON document; everything else that is a post is a Markdown entry. */
@@ -1066,6 +1087,8 @@ export interface SubjectSession {
   cssNames: string[];
   /** Stylesheet names its blocks' attributes made unusable (see {@link CssPlan}); the conversion reports them. */
   cssInvalid: string[];
+  /** The list the page is built in pages of, when a query claimed it (`SubjectOptions.pageable`). */
+  paging?: PagingClaim;
 }
 
 /** A `ConvertCtx` with the one facility the contract has no slot for: registering page-level state. */
@@ -1078,6 +1101,16 @@ export interface SubjectCtx extends ConvertCtx {
   defineState(key: string, definition: unknown): string;
   /** The blocks become a component (a Cwicly component or a template part), not a page or a layout. */
   readonly inComponent?: boolean;
+  /**
+   * Ask for a list to be the one the page is built in pages of: true for the first claim of a page
+   * conversion (`SubjectOptions.pageable`), false after it. Absent where the blocks are no page of
+   * their own (a component, a part, a layout, an entry's page).
+   */
+  claimPaging?(claim: PagingClaim): boolean;
+  /** A term page's taxonomy and route parameter (`SubjectOptions.termArchive`). */
+  readonly termArchive?: TermArchive;
+  /** The tag of the slider component a query template that is a slider becomes ({@link sliderTag}). */
+  readonly sliderTag?: string;
 }
 
 const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
@@ -1091,6 +1124,7 @@ export async function subjectSession(
   site: SiteContext,
   subject: Subject,
   overrides: Partial<ConvertCtx> = {},
+  page: Pick<SubjectOptions, "pageable" | "termArchive"> = {},
 ): Promise<SubjectSession> {
   // The registry is built once; from here on a conversion is synchronous throughout.
   await ensureConverters();
@@ -1148,9 +1182,21 @@ export async function subjectSession(
       state.set(use, definition);
       return use;
     },
+    ...(page.pageable === true && subject.kind !== "component" && subject.kind !== "part"
+      ? {
+          claimPaging(claim: PagingClaim) {
+            if (session.paging !== undefined) return false;
+            session.paging = claim;
+            return true;
+          },
+        }
+      : {}),
+    ...(page.termArchive === undefined ? {} : { termArchive: page.termArchive }),
+    sliderTag: sliderTag(site),
     ...overrides,
   };
-  return { ctx, hoisted, state, cssNames, cssInvalid };
+  const session: SubjectSession = { ctx, hoisted, state, cssNames, cssInvalid };
+  return session;
 }
 
 /** The `ConvertCtx` of one subject, `convert` wired to the registry. */
