@@ -7,7 +7,13 @@
  * The units (paths, sinks, secrets, the merged report, the style order, the owner's decisions) are
  * checked on their own first, with hand-made inputs where a fixture has no case for them.
  */
-import { ALL_FORMULAS, FORMULAS, formulasUsed, lowerFormulasIn } from "../../src/formulas.ts";
+import {
+  ALL_FORMULAS,
+  FORMULAS,
+  formulasUsed,
+  lowerFormulasIn,
+  type FormulaName,
+} from "../../src/formulas.ts";
 import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   existsSync,
@@ -67,6 +73,7 @@ import {
   type ProjectSink,
   JX_HOLD_MINIMUM,
   JX_MINIMUM,
+  jxComponentFormulas,
   jxFormulas,
   jxHolds,
 } from "../../src/emit/project.ts";
@@ -1425,34 +1432,47 @@ describe("named formulas", () => {
   const documents = (files: Map<string, string>): [string, string][] =>
     [...files].filter(([path]) => path !== "project.json");
 
-  test("the calls the pages and layouts make are in project.json's state, once each; a component's are written out; and nothing else differs", async () => {
+  test("the calls the documents make are in project.json's state, once each; a component's stay where the Jx gives it the project's formulas; and nothing else differs", async () => {
     const on = await run(true);
     const off = await run(false);
     const auto = await run();
-    // Asked for: every call of a page or a layout stays, and the project holds exactly those formulas.
-    const kept = documents(on.files).filter(([path]) => !path.startsWith("components/"));
-    const used = formulasUsed(kept.map(([, text]) => text));
-    expect(used.length).toBeGreaterThan(0);
+    const calls = (files: Map<string, string>, components: boolean): FormulaName[] =>
+      formulasUsed(
+        documents(files)
+          .filter(([path]) => path.startsWith("components/") === components)
+          .map(([, text]) => text),
+      );
+    // Asked for: every call in a page stays, a component's only where the Jx gives one the
+    // project's formulas (without them it would build empty), and the project holds exactly the
+    // formulas still called.
+    const used = formulasUsed(documents(on.files).map(([, text]) => text));
+    expect(calls(on.files, false).length).toBeGreaterThan(0);
+    if (!jxComponentFormulas()) expect(calls(on.files, true)).toEqual([]);
     expect(Object.keys(on.state ?? {})).toEqual(used);
     for (const name of used) expect(on.state?.[name]).toEqual(FORMULAS[name]);
     expect(on.codes).not.toContain("project.formulas-lowered");
-    // A component's state is its own: no call is left in one, whatever was asked.
-    for (const run of [on, off, auto]) {
-      for (const [path, text] of documents(run.files)) {
-        if (path.startsWith("components/")) expect([path, CALL.test(text)]).toEqual([path, false]);
-      }
-    }
     // Refused: no call anywhere, no state, and nothing to say about it.
     expect(off.state).toBeUndefined();
     for (const [path, text] of documents(off.files)) {
       expect([path, CALL.test(text)]).toEqual([path, false]);
     }
     expect(off.codes).not.toContain("project.formulas-lowered");
-    // By default: the formulas the installed Jx builds into a static page, and a line in the
-    // report when one a page calls is not among them.
+    // By default: the formulas the installed Jx builds into a static page, in a component only
+    // where that Jx gives one the project's formulas, and a line in the report when one a page
+    // calls is not among them.
     const trusted = used.filter((name) => jxFormulas().has(name));
-    expect(Object.keys(auto.state ?? {})).toEqual(trusted);
-    expect(auto.codes.includes("project.formulas-lowered")).toBe(trusted.length < used.length);
+    expect(Object.keys(auto.state ?? {})).toEqual(
+      formulasUsed(documents(auto.files).map(([, text]) => text)),
+    );
+    for (const name of Object.keys(auto.state ?? {})) {
+      expect(trusted).toContain(name as FormulaName);
+    }
+    expect(calls(auto.files, true)).toEqual(
+      jxComponentFormulas() ? calls(on.files, true).filter((n) => trusted.includes(n)) : [],
+    );
+    expect(auto.codes.includes("project.formulas-lowered")).toBe(
+      used.some((name) => !jxFormulas().has(name)),
+    );
     // The three projects are the same documents: with every call written out they are equal.
     expect([...on.files.keys()]).toEqual([...off.files.keys()]);
     for (const [path, text] of documents(on.files)) {

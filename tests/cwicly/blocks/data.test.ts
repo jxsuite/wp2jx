@@ -78,9 +78,24 @@ import {
   type Rule,
   type TermsPlan,
 } from "../../../src/cwicly/blocks/data.ts";
+import { jxEmptyListsStatic, setNativeLists } from "../../../src/cwicly/blocks/empty-lists.ts";
 
 setDefaultTimeout(180_000);
 afterAll(cleanupJxProjects);
+
+/** What `run` gives with the lists written for a Jx whose build renders an empty mapped Array in the browser. */
+async function forOlderJx<T>(run: () => T | Promise<T>): Promise<T> {
+  setNativeLists(false);
+  try {
+    return await run();
+  } finally {
+    setNativeLists(undefined);
+  }
+}
+
+test("the installed Jx builds an empty list it resolved as nothing: the lists below are written for it", () => {
+  expect(jxEmptyListsStatic()).toBe(true);
+});
 
 const FIXTURES = join(import.meta.dir, "../../fixtures");
 
@@ -2152,28 +2167,42 @@ describe("a query block", () => {
   });
 
   test("a query that selects nothing today still writes its list, and says it is empty", async () => {
-    const { nodes, state, ctx } = await convertQuery({
+    const empty = {
       queryTaxonomy: [taxEntry({ taxonomy: "project_tag", terms: pick(34) })], // commercial-projects: no posts
+    };
+    const { nodes, state, ctx } = await convertQuery(empty);
+    // a clause of one term is a rule: the collection, and a mapped array over it, empty or not (the
+    // build renders a list it resolved as nothing)
+    expect([...state.keys()]).toEqual(["project_q7"]);
+    expect(state.get("project_q7")).toMatchObject({
+      filter: [{ field: "terms.project_tag.slug", op: "contains", value: "commercial-projects" }],
     });
-    // a taxonomy clause is computed children over the one collection of the type
-    expect([...state.keys()]).toEqual(["project_entries"]);
-    expect(inlineLoops(nodes)).toHaveLength(1);
+    expect(elementsWhere(nodes, isArray)).toHaveLength(1);
+    expect(inlineLoops(nodes)).toHaveLength(0);
     expect(ctx.report.entries().find((e) => e.code === "query.empty")).toMatchObject({
       severity: "info",
     });
-    // a list a collection could say is computed too while it selects nothing: an empty mapped array
-    // is rendered in the browser, an empty computed list is nothing
-    const native = await convertQuery({
+    // for an older Jx, which renders an empty mapped array in the browser, the list is computed
+    // children over the one collection of the type, which are nothing when they list nothing
+    const old = await forOlderJx(() => convertQuery(empty));
+    expect([...old.state.keys()]).toEqual(["project_entries"]);
+    expect(inlineLoops(old.nodes)).toHaveLength(1);
+    expect(elementsWhere(old.nodes, isArray)).toHaveLength(0);
+    const excluded = {
       queryExclude: pick(
         ...entryPosts(await makeCtx("fineline", { kind: "post", id: 195 }), "project").map(
           (p) => p.id,
         ),
       ),
       queryPerPage: st("3"),
-    });
-    expect(elementsWhere(native.nodes, isArray)).toHaveLength(0);
-    expect(inlineLoops(native.nodes)).toHaveLength(1);
+    };
+    const native = await convertQuery(excluded);
+    expect(elementsWhere(native.nodes, isArray)).toHaveLength(1);
+    expect(inlineLoops(native.nodes)).toHaveLength(0);
     expect(native.ctx.report.entries().some((e) => e.code === "query.empty")).toBe(true);
+    const computed = await forOlderJx(() => convertQuery(excluded));
+    expect(elementsWhere(computed.nodes, isArray)).toHaveLength(0);
+    expect(inlineLoops(computed.nodes)).toHaveLength(1);
   });
 
   test("that cannot be a list is its element and an empty template, and is reported as unsupported with where it is", async () => {
@@ -4071,7 +4100,7 @@ describe("built by Jx", () => {
     expect(shipsJs(html)).toBe(false);
   });
 
-  test("an empty computed list is empty and ships nothing; an empty mapped array is the measured exception, a client render of its one element", async () => {
+  test("an empty list is empty and ships nothing, a mapped array over a collection the build resolved and computed children alike", async () => {
     const { files } = await entryProject("fineline", ["project"]);
     const all = entryPosts(await makeCtx("fineline", { kind: "post", id: 195 }), "project").map(
       (p) => p.id,
@@ -4100,36 +4129,34 @@ describe("built by Jx", () => {
       );
       return built.html("/");
     };
-    // computed children: commercial-projects has no posts
-    const computed = await emptyPage({
-      queryTaxonomy: [taxEntry({ taxonomy: "project_tag", terms: pick(34) })],
-    });
-    expect(computed).toContain("<p>before</p>");
-    expect(computed).toContain("<p>after</p>");
-    expect(itemsOf(computed)).toEqual([]);
-    expect(computed).toMatch(/<div class="querytemplate-test"[^>]*><\/div>/);
-    expect(shipsJs(computed)).toBe(false);
-    expect(computed).not.toContain("data-bind");
-    // a list a collection could say, which selects nothing today, is written computed too: no JavaScript
-    const excluded = await emptyPage({ queryExclude: pick(...all) });
-    expect(itemsOf(excluded)).toEqual([]);
-    expect(shipsJs(excluded)).toBe(false);
-    // because a mapped array over a collection that has nothing is the measured exception: its parent
-    // (the template's element only) is rendered by the client
+    // commercial-projects has no posts: its one-term clause is a rule, so the list is a mapped array
+    // over the collection, which the build resolved as nothing: no item, the siblings kept, no JavaScript
+    const tagged = { queryTaxonomy: [taxEntry({ taxonomy: "project_tag", terms: pick(34) })] };
+    const empties: [string, Record<string, unknown>][] = [
+      ["tagged", tagged],
+      // a list that selects nothing today, all of its entries excluded
+      ["excluded", { queryExclude: pick(...all) }],
+    ];
+    for (const [what, attrs] of empties) {
+      const native = await emptyPage(attrs);
+      expect(native, what).toContain("<p>before</p>");
+      expect(native, what).toContain("<p>after</p>");
+      expect(itemsOf(native), what).toEqual([]);
+      expect(native, what).toMatch(/<div class="querytemplate-test"[^>]*><\/div>/);
+      expect(shipsJs(native), what).toBe(false);
+      expect(native, what).not.toContain("data-bind");
+      // the same list as computed children, the form for an older Jx, is the same page
+      const computed = await forOlderJx(() => emptyPage(attrs));
+      expect(computed.slice(computed.indexOf("<body"))).toBe(native.slice(native.indexOf("<body")));
+    }
+    // what is still a client render on any Jx: a mapped array over an AUTHORED empty list, which the
+    // browser may fill (`terms_*` and `rows_*` lists are authored, so wp2jx writes none of them empty)
     const built = await buildJxProject(
       {
         ...files,
         "pages/index.json": {
           title: "t",
-          state: {
-            none: {
-              $prototype: "ContentCollection",
-              $src: "@jxsuite/parser/ContentCollection.class.json",
-              contentType: "project",
-              filter: [{ field: "url", op: "==", value: "/nothing/" }],
-              timing: "compiler",
-            },
-          },
+          state: { none: [] },
           children: [
             { tagName: "p", textContent: "before" },
             {
@@ -4717,6 +4744,97 @@ describe("loops inside loops", () => {
     void site;
   });
 
+  test("terms inside the items of a mapped array: the inner loop reads the item's terms as computed children, so an entry with none is nothing and the page stays static", async () => {
+    const { files, ctx } = await entryProject("fineline", ["project"]);
+    const own = block(
+      "cwicly/taxonomyterms",
+      {
+        classID: "tt",
+        id: "tt",
+        taxtermsSource: "current",
+        taxtermsInclude: [{ label: "Tags", value: "project_tag", taxonomy: true }],
+      },
+      [
+        block(
+          "cwicly/heading",
+          {
+            classID: "th",
+            headingTag: "h4",
+            dynamic: "taxonomyquery",
+            dynamicWordPressType: "name",
+          },
+          [],
+          '<h4 class="th">{taxterms=name}</h4>',
+        ),
+      ],
+      '<div class="tt" id="tt"><ccdyn></ccdyn></div>',
+    );
+    const q = (): WpBlock => ({
+      ...queryBlock({ queryPostType: pick("project"), queryPerPage: st("9999") }, [
+        templateBlock([titleHeading(), own]),
+      ]),
+      innerHTML: queryHtml,
+    });
+    const wanted = entryPosts(ctx, "project").sort((a, b) =>
+      a.date < b.date ? 1 : a.date > b.date ? -1 : 0,
+    );
+    // the case: a project with no tag has no `terms.project_tag` in its entry
+    expect(wanted.some((p) => termsOf(ctx.model, p.id, "project_tag").length === 0)).toBe(true);
+    expect(wanted.some((p) => termsOf(ctx.model, p.id, "project_tag").length > 0)).toBe(true);
+
+    const c = await fresh("fineline", { kind: "post", id: 195 }, { target: "page" });
+    const nodes = convertBlocks([q()], c);
+    const [list] = elementsWhere(nodes, isArray);
+    expect(String((list as unknown as { items: { $ref: string } }).items.$ref)).toMatch(
+      /^#\/state\/project_/,
+    );
+    // the outer list is the repeater Studio edits; the item's own loop is the one computed string
+    expect(elementsWhere(nodes, isArray)).toHaveLength(1);
+    const [inner] = inlineLoops(nodes);
+    const text = String((inner!.children as string[])[0]);
+    expect(
+      text.startsWith("${($map.item?.data?.terms?.project_tag ?? []).map(($i0, $x0) => ("),
+    ).toBe(true);
+    expect(inner!.className).toBe("tt");
+
+    // for an older Jx the inner loop stays the mapped array it was
+    const oc = await fresh("fineline", { kind: "post", id: 195 }, { target: "page" });
+    const older = await forOlderJx(() => convertBlocks([q()], oc));
+    expect(elementsWhere(older, isArray)).toHaveLength(2);
+    expect(JSON.stringify(older)).toContain('"$ref":"$map/item/data/terms/project_tag"');
+
+    files["pages/index.json"] = {
+      title: "t",
+      state: Object.fromEntries(collectedState(c)),
+      children: nodes,
+    } as ProjectFile;
+    files["pages/older.json"] = {
+      title: "t",
+      state: Object.fromEntries(collectedState(oc)),
+      children: older,
+    } as ProjectFile;
+    const built = await buildJxProject(files, { name: "nested-native" });
+    // why: built by this Jx, the pointer to a tag list a project does not have is no list, and the
+    // whole list is left for the browser
+    expect(built.html("/older/")).toContain("data-bind");
+    const html = built.html("/");
+    expect(html).not.toContain("data-bind");
+    expect(shipsJs(html)).toBe(false);
+    const items = [
+      ...html.matchAll(
+        /<div class="cc-query-item">([\s\S]*?)(?=<div class="cc-query-item">|<\/div><\/div><\/div>)/g,
+      ),
+    ].map((m) => m[1]!);
+    expect(items).toHaveLength(wanted.length);
+    items.forEach((item, i) => {
+      const names = [...item.matchAll(/<h4[^>]*>([^<]*)<\/h4>/g)].map((m) => decodeEntities(m[1]!));
+      const mine = termsOf(ctx.model, wanted[i]!.id, "project_tag")
+        .map((t) => decodeEntities(t.name))
+        .sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }));
+      expect(names).toEqual(mine);
+    });
+  });
+
   test("a loop whose list is not a pointer cannot be written inside a computed one, and says so", () => {
     const item = {
       tagName: "div",
@@ -4834,16 +4952,24 @@ describe("the edges of a loop", () => {
     });
   });
 
-  test("a terms query that selects nothing says so", async () => {
-    const { ctx } = await convertQuery({
+  test("a terms query that selects nothing says so, and is the build's own empty list on every Jx", async () => {
+    const attrs = {
       queryType: "terms",
       queryTaxonomies: pick("project_tag"),
       queryParent: st("99"),
       queryPostType: undefined,
-    });
+    };
+    const { ctx, nodes } = await convertQuery(attrs);
     expect(ctx.report.entries().find((e) => e.code === "query.empty")).toMatchObject({
       severity: "info",
     });
+    // a mapped array over authored rows of none is a client render whatever the Jx ([NL2] in
+    // tests/native-lists-build.test.ts), so an older Jx gets the empty computed list too
+    for (const out of [nodes, (await forOlderJx(() => convertQuery(attrs))).nodes]) {
+      expect(elementsWhere(out, isArray)).toEqual([]);
+      const [list] = inlineLoops(out);
+      expect(inlineList(String((list!.children as string[])[0]))).toBe("[]");
+    }
   });
 
   test("a taxonomyterms with no terms to list says so, and is still its own element", async () => {
@@ -5999,14 +6125,21 @@ describe("collection rules: what a plan says as a filter, and that it is the sam
     expect(
       nativeRules(postPlan(queryBlock({ queryPostType: pick("post"), queryInherit: true }), ctx)),
     ).toBeUndefined();
-    // a list that reads the route is a collection only when it is the page's paged list
-    expect("expr" in registerPostList(known, plan, "a")).toBe(true);
+    // a list that reads the route is a collection, though it is empty for a term with no entries
+    expect(registerPostList(known, plan, "a")).toEqual({ pointer: "#/state/post_qa" });
     expect(registerPostList(known, plan, "b", { paged: true })).toEqual({
       pointer: "#/state/post_qb",
     });
+    // for an older Jx only when it is the page's paged list
+    await forOlderJx(() => {
+      expect("expr" in registerPostList(known, plan, "c")).toBe(true);
+      expect(registerPostList(known, plan, "d", { paged: true })).toEqual({
+        pointer: "#/state/post_qd",
+      });
+    });
   });
 
-  test("rules that read the page's entry are worked out, and the list stays computed: it is empty on some routes, and an empty mapped list renders in the browser", async () => {
+  test("rules that read the page's entry are worked out; a `contains` of the entry's first term stays computed, because WordPress drops the clause where the entry has no such term and the rule would match nothing", async () => {
     const entry = bare(
       await makeCtx("ap", { kind: "template", slug: "single-post" }, {
         mode: "entry",
@@ -6035,6 +6168,25 @@ describe("collection rules: what a plan says as a filter, and that it is the sam
     ]);
     expect(readsState(nativeRules(plan)!)).toBe(true);
     expect("expr" in registerPostList(entry, plan, "r")).toBe(true);
+    // "not this one" alone means the same on every route: a collection whose rule reads the entry
+    const notThis = postPlan(
+      queryBlock({
+        queryPostType: pick("post", "episode"),
+        queryPerPage: st("6"),
+        queryExcludeCurrent: true,
+      }),
+      entry,
+    );
+    expect(registerPostList(entry, notThis, "n")).toEqual({ pointer: "#/state/post_qn" });
+    expect(collectedState(entry).get("post_qn")).toMatchObject({
+      contentType: ["post", "episode"],
+      filter: [{ field: "url", op: "!=", value: { $ref: "#/state/entry/data/url" } }],
+      limit: 6,
+    });
+    // an older Jx renders it in the browser on a route where it is empty: computed
+    await forOlderJx(() => {
+      expect("expr" in registerPostList(entry, notThis, "o")).toBe(true);
+    });
   });
 });
 
@@ -6063,7 +6215,7 @@ describe("a paged list", () => {
   const loadMore = (): WpBlock =>
     block("cwicly/button", { linkWrapperAction: "infiniteButtonLoad" }, [], "");
 
-  test("claims the page's paging: the collection with no limit, its items computed over it, and a pager after the list", async () => {
+  test("claims the page's paging: the collection with no limit, a mapped array over it, and a pager after the list", async () => {
     const { nodes, ctx, claims } = await pagedQuery({
       infiniteLoad: true,
       infiniteLoadMore: "button",
@@ -6071,13 +6223,25 @@ describe("a paged list", () => {
     expect(claims).toEqual([{ key: "project_q7", pageSize: 5 }]);
     const state = Object.fromEntries(collectedState(ctx));
     expect(state.project_q7).not.toHaveProperty("limit");
-    // computed children over the paged entry: a page of nothing is nothing, not a client render
-    const loops = inlineLoops(nodes);
-    expect(loops).toHaveLength(1);
-    expect(inlineList((loops[0]!.children as string[])[0]!)).toBe("state.project_q7");
+    // a mapped array over the paged entry: the build resolves the page's slice, and a page of
+    // nothing is nothing
+    expect(inlineLoops(nodes)).toHaveLength(0);
     expect(elementsWhere(nodes, isArray).map((e) => (e.items as { $ref: string }).$ref)).toEqual([
+      "#/state/project_q7",
       "#/state/$page/pagination/pages",
     ]);
+    // for an older Jx, computed children over the paged entry: an empty mapped array would render in
+    // the browser
+    const old = await forOlderJx(() =>
+      pagedQuery({ infiniteLoad: true, infiniteLoadMore: "button" }),
+    );
+    expect(old.claims).toEqual([{ key: "project_q7", pageSize: 5 }]);
+    const loops = inlineLoops(old.nodes);
+    expect(loops).toHaveLength(1);
+    expect(inlineList((loops[0]!.children as string[])[0]!)).toBe("state.project_q7");
+    expect(
+      elementsWhere(old.nodes, isArray).map((e) => (e.items as { $ref: string }).$ref),
+    ).toEqual(["#/state/$page/pagination/pages"]);
     const [pager] = elementsWhere(nodes, (e) => e.tagName === "nav");
     expect(pager).toMatchObject({ className: "cc-pager", attributes: { "aria-label": "Pages" } });
     expect(JSON.stringify(nodes)).not.toContain("cc-more-");

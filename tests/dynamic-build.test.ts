@@ -31,6 +31,7 @@ import {
 import { blockLink } from "../src/cwicly/links.ts";
 import { blockVisibility } from "../src/cwicly/conditions.ts";
 import { postData, postFacts, resolveTokens, tokenNodes } from "../src/cwicly/tokens.ts";
+import { withDerivedFields } from "../src/emit/collections.ts";
 
 setDefaultTimeout(120_000);
 afterAll(cleanupJxProjects);
@@ -141,9 +142,11 @@ const COMPONENTS: Record<string, ProjectFile> = {
     ],
   },
 };
+// Relative to the page (`pages/c-<case>/[slug].json`): compiler 8.7.0 refuses an `$elements` entry
+// that names a file outside the project.
 const ELEMENTS = [
-  { $ref: "../../../components/fp-card.json" },
-  { $ref: "../../../components/fp-obj.json" },
+  { $ref: "../../components/fp-card.json" },
+  { $ref: "../../components/fp-obj.json" },
 ];
 
 function projectFiles(
@@ -667,11 +670,12 @@ describe("bindings matrix, timing: compiler (docs/bindings.md)", () => {
         '<a href="https://example.com/" target="_blank" rel="noopener">x</a>',
       );
     });
-    test("[A5] the build counts braces without reading strings: a brace in a string literal costs the attribute its type", () => {
+    test("[A5] the build reads the strings of an expression: a brace in a string literal keeps the attribute its type", () => {
       expect(get("A5ok").html).toBe('<input data-k="k">');
-      // `${cond ? '{' : false}` is no longer one expression to the build, so `false` is the text "false".
-      expect(get("A5brace").html).toBe('<input disabled="false" data-k="k">');
-      // Written as an escape, the same literal keeps the type.
+      // Compiler 8.7.0 reads `${cond ? '{' : false}` as one expression (an older one counted the brace
+      // and printed `disabled="false"`), so `false` omits the attribute.
+      expect(get("A5brace").html).toBe('<input data-k="k">');
+      // Written as an escape, as wp2jx writes it for every Jx, the same literal keeps the type too.
       expect(get("A5escaped").html).toBe('<input data-k="k">');
     });
     test("[A4] a nullish single binding is left to the client", () => {
@@ -759,11 +763,13 @@ describe("bindings matrix, timing: compiler (docs/bindings.md)", () => {
     });
     test("[L2] per-item style", () =>
       expect(get("L2").css).toContain(".row { order: 1 } .row { order: 2 }"));
-    test("[L3] an empty or missing array makes the parent a client render", () => {
-      for (const id of ["L3", "L3missing"]) {
-        expect(get(id).html).toBe('<ul data-bind :render="_children0"></ul>');
-        expect(get(id).js).toBe(true);
-      }
+    test("[L3] an empty field of the entry is nothing, its siblings kept; a missing one makes the parent a client render", () => {
+      // Compiler 8.7.0 renders an empty list the build resolved as nothing (an older one left it for
+      // the client, as it still leaves a pointer to a field the entry does not have).
+      expect(get("L3").html).toBe("<ul><li>head</li></ul>");
+      expect(get("L3").js).toBe(false);
+      expect(get("L3missing").html).toBe('<ul data-bind :render="_children0"></ul>');
+      expect(get("L3missing").js).toBe(true);
     });
     test("[L4] a ContentCollection", () => {
       expect(get("L4").html).toBe("<ul><li>Bar Title / bar</li>\n  <li>Foo Title / foo</li></ul>");
@@ -1585,7 +1591,11 @@ describe("the rest of what the modules emit, built", () => {
       `<div class="div-x" style="--background-image:url({bgfeaturedimage});"><span class="before">About This </span>{title}</div>`,
       `<p>{postexcerpt=60}<span class="after">... Read More</span> <ccd>custom_current_date=Y</ccd></p>`,
     ].join("\n");
-    const data = postData(probe, post);
+    const entryNodes = tokenNodes(html, entry);
+    // The entry as the collections module writes it: with the fields its bindings derive from its data (`excerpt60`).
+    const data: Record<string, unknown> = { ...postData(probe, post) };
+    withDerivedFields(entry, data);
+    expect(JSON.stringify(entryNodes)).toContain("state.entry.data.excerpt60 ?? ''");
     const files: Record<string, ProjectFile> = {
       "project.json": {
         ...PROJECT,
@@ -1616,7 +1626,7 @@ describe("the rest of what the modules emit, built", () => {
             timing: "compiler",
           },
         },
-        children: [{ tagName: "main", children: tokenNodes(html, entry) }],
+        children: [{ tagName: "main", children: entryNodes }],
       },
       "pages/s.json": {
         title: "static",

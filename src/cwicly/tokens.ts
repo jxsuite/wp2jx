@@ -918,7 +918,59 @@ const DISCARD = { add: () => undefined, entries: () => [] } as const;
 /** The ACF fields of a person's profile in the shapes of the entry data contract, none for a person with no profile. */
 /** A person as an entry holds a reference to one: `{id, slug, title, url}` and the profile's own fields. */
 export function userRef(ctx: ConvertCtx, id: number): EntryRef | undefined {
-  return hooksFor(ctx).user(id);
+  const ref = hooksFor(ctx).user(id);
+  return ref === undefined ? undefined : (withPersonTexts(ctx, ref) as EntryRef);
+}
+
+/**
+ * A person written into a page as it is, with the text of each of their wysiwyg fields beside it. A
+ * list of people is written into the page before the loop that prints it is converted, so it cannot
+ * wait to hear which texts the loop reads (a list holds a few people; an entry's people carry only the
+ * texts some document reads, which the collections module writes).
+ */
+function withPersonTexts(ctx: ConvertCtx, person: unknown): unknown {
+  if (person === null || typeof person !== "object" || Array.isArray(person)) return person;
+  const rec = person as Record<string, unknown>;
+  if (typeof rec.id !== "number") return person;
+  const texts = personWysiwygKeys(ctx, rec.id)
+    .map(personTextField)
+    .filter((f) => !acfNameTaken(ctx, f.key));
+  return { ...rec, ...derivedValues(texts, rec) };
+}
+
+/**
+ * The people an ACF user field holds now (a static page, another post, the options), each with the
+ * texts {@link withPersonTexts} adds: a users query that lists them writes them into the page as they
+ * are, and its loop reads the texts as it reads them on the rows of any other list of people.
+ */
+function heldPeople(ctx: ConvertCtx, info: FieldInfo, ref: Ref): Ref {
+  if (info.field.type !== "user" || !("value" in ref)) return ref;
+  const v = ref.value;
+  return {
+    value: Array.isArray(v) ? v.map((p) => withPersonTexts(ctx, p)) : withPersonTexts(ctx, v),
+  };
+}
+
+const wysiwygKeys = new WeakMap<object, Map<number, string[]>>();
+
+/** The keys of a person's profile that hold a wysiwyg field. */
+function personWysiwygKeys(ctx: ConvertCtx, id: number): string[] {
+  let byId = wysiwygKeys.get(ctx.model);
+  if (!byId) {
+    byId = new Map();
+    wysiwygKeys.set(ctx.model, byId);
+  }
+  let keys = byId.get(id);
+  if (keys === undefined) {
+    const values = userProfiles(ctx.model).has(id)
+      ? acfValues(ctx.model, ctx.acf, { kind: "user", userId: id }, { report: DISCARD })
+      : {};
+    keys = Object.entries(values)
+      .filter(([, raw]) => raw.type === "wysiwyg")
+      .map(([name]) => entryKey(name));
+    byId.set(id, keys);
+  }
+  return keys;
 }
 
 export function userFields(
@@ -1274,6 +1326,161 @@ export function termData(ctx: ConvertCtx, term: WpTerm): EntryData {
   return data;
 }
 
+// ── Fields derived from a field, written beside it ───────────────────────────────────────────────
+
+/**
+ * A value the converter computes from one field of every entry it writes (or of every person an
+ * entry or a list names) and writes beside that field, so that a binding reads a path where it would
+ * otherwise apply a function to one. Jx Studio opens `${$map.item.data.excerpt250 ?? ''}` as a field it
+ * can edit, and `${((s) => …)($map.item.data.excerpt)}` as a custom expression. The value is what that
+ * expression makes of the stored field, computed by the function the static road uses, so the static
+ * page and the entry print the same text and a test can hold the expression to it. A derivation is
+ * registered by the binding that reads it, and an entry carries only the derivations some document reads.
+ */
+export interface DerivedField {
+  /** The key the value is written under, beside the field it is computed from. */
+  key: string;
+  /** The key of that field. */
+  from: string;
+  /** What the value is, for the collection's schema. */
+  description: string;
+  /** The value from the stored value of `from`; undefined writes nothing, which the binding reads as ''. */
+  derive: (value: unknown) => string | undefined;
+}
+
+/** What a derived field is written on: an entry's data, or a person (a user field's reference, a row of a list of people). */
+export type DerivedOn = "entry" | "person";
+
+/** The derivations the documents of a conversion read, by the model the conversion is of. */
+const derivations = new WeakMap<object, Record<DerivedOn, Map<string, DerivedField>>>();
+
+function derivationsOf(model: object): Record<DerivedOn, Map<string, DerivedField>> {
+  let found = derivations.get(model);
+  if (!found) {
+    found = { entry: new Map(), person: new Map() };
+    derivations.set(model, found);
+  }
+  return found;
+}
+
+/** Say that a document reads `field`, so the entries (or people) of the conversion are written with it. */
+export function deriveField(
+  ctx: Pick<ConvertCtx, "model">,
+  on: DerivedOn,
+  field: DerivedField,
+): void {
+  const known = derivationsOf(ctx.model)[on];
+  if (!known.has(field.key)) known.set(field.key, field);
+}
+
+/** The derivations the documents converted so far read, by key. */
+export function derivedFieldsOf(model: object, on: DerivedOn): DerivedField[] {
+  return [...derivationsOf(model)[on].values()].sort((a, b) =>
+    a.key < b.key ? -1 : a.key > b.key ? 1 : 0,
+  );
+}
+
+/**
+ * The derived values of one object (an entry's data, a person): each field's value from the object's
+ * own `from`. A key the object already holds is left to it: an ACF field of that name was there first,
+ * and {@link acfNameTaken} keeps a binding from reading it as the derivation.
+ */
+export function derivedValues(
+  fields: readonly DerivedField[],
+  data: Readonly<Record<string, unknown>>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const field of fields) {
+    if (Object.hasOwn(data, field.key)) continue;
+    let value: string | undefined;
+    try {
+      value = field.derive(data[field.from]);
+    } catch {
+      // The expression would throw at build too (a character reference past U+10FFFF): nothing is written.
+      value = undefined;
+    }
+    if (value !== undefined) out[field.key] = value;
+  }
+  return out;
+}
+
+/**
+ * `{postexcerpt=N}` of an entry: its excerpt cut to `limit` bytes at the last space ({@link limitExcerpt},
+ * the cut a static page makes). It strips tags as PHP's `strip_tags` does, which leaves a `<` that a space
+ * follows; {@link excerptCutExpr} strips with `<[^>]*>`, which would also take `< 6 and 7 >` out of an
+ * excerpt reading "5 < 6 and 7 > 3". The field follows WordPress there; on every excerpt of both
+ * fixture sites the two agree.
+ */
+export function excerptField(limit: number): DerivedField {
+  return {
+    key: `excerpt${limit}`,
+    from: "excerpt",
+    description: `The excerpt cut to ${limit} bytes at the last space before them, as Cwicly's {postexcerpt=${limit}} prints it. Written by wp2jx from \`excerpt\`; write it again when the excerpt changes.`,
+    derive: (value) => {
+      const cut = limitExcerpt(String(value ?? ""), limit);
+      return cut === "" ? undefined : cut;
+    },
+  };
+}
+
+const BASIC_REFERENCE = /&(#\d+|#[xX][0-9a-fA-F]+|quot|amp|lt|gt|apos|nbsp);/g;
+const BASIC_NAMED: Readonly<Record<string, string>> = {
+  quot: '"',
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  apos: "'",
+  nbsp: "\u00a0",
+};
+
+/**
+ * The character references `esc_html` leaves for the browser to read (numeric ones and the five named
+ * ones it writes, and `&nbsp;`), read: what the expression of {@link escapedText} computes at build.
+ */
+export function decodeBasicReferences(text: string): string {
+  return text.replace(BASIC_REFERENCE, (_whole, e: string) =>
+    e.startsWith("#")
+      ? String.fromCodePoint(
+          e[1] === "x" || e[1] === "X" ? Number.parseInt(e.slice(2), 16) : Number(e.slice(1)),
+        )
+      : (BASIC_NAMED[e] ?? ""),
+  );
+}
+
+/** A person's wysiwyg field as the text the page prints (its `<p>` tags and all, its references read): `bio` gives `bioText`. */
+export function personTextField(key: string): DerivedField {
+  return {
+    key: `${key}Text`,
+    from: key,
+    description: `\`${key}\` as the text the site prints of it, its character references read. Written by wp2jx; write it again when \`${key}\` changes.`,
+    derive: (value) => {
+      const text = decodeBasicReferences(String(value ?? ""));
+      return text === "" ? undefined : text;
+    },
+  };
+}
+
+/**
+ * Whether an ACF field is called `key` (or is written as it), in any group: its value would then sit
+ * where a derived field is written, so a binding keeps the expression instead.
+ */
+export function acfNameTaken(ctx: Pick<ConvertCtx, "acf">, key: string): boolean {
+  const visit = (f: AcfField): boolean =>
+    f.name === key ||
+    entryKey(f.name) === key ||
+    f.subFields.some(visit) ||
+    f.layouts.some((l) => l.subFields.some(visit));
+  return ctx.acf.groups.some((g) => g.fields.some(visit));
+}
+
+/**
+ * Whether the entry a binding reads is one the collections module writes, which carries the derived
+ * fields. The page's own entry, which a page's layout reads, is written by the pages module from a
+ * fixed list of keys, and a loop of a page layout over more than one type keeps the page's type; both
+ * keep the expression.
+ */
+const writesEntry = (ctx: ConvertCtx): boolean => ctx.entryType !== "page";
+
 // ── References: a value known now, or an expression over the entry ───────────────────────────────
 
 /**
@@ -1440,6 +1647,15 @@ const profileOf = (ctx: ConvertCtx, id: number): boolean => userProfiles(ctx.mod
 
 /** The reference to an ACF field's value for a scope, or why there is none. */
 export function acfRef(
+  ctx: ConvertCtx,
+  info: FieldInfo,
+  scope: AcfScope,
+): { ref: Ref } | { problem: string } {
+  const got = fieldRef(ctx, info, scope);
+  return "ref" in got ? { ref: heldPeople(ctx, info, got.ref) } : got;
+}
+
+function fieldRef(
   ctx: ConvertCtx,
   info: FieldInfo,
   scope: AcfScope,
@@ -1996,7 +2212,7 @@ export function limitExcerpt(text: string, limit: number): string {
  * sites, over every limit they use); weighing every curly quote as one byte instead is wrong for the
  * far commoner case of text typed with curly quotes (five times as many excerpts).
  */
-function excerptCutExpr(expr: string, limit: number): string {
+export function excerptCutExpr(expr: string, limit: number): string {
   const plain = `String((${expr}) ?? '').replace(/<(script|style)[^>]*?>[\\s\\S]*?<\\/\\1>/gi, '').replace(/<[^>]*>/g, '').replace(/^[ \\t\\n\\r\\0\\x0B]+|[ \\t\\n\\r\\0\\x0B]+$/g, '')`;
   if (limit <= 0) return plain;
   return `((s) => { const b = new TextEncoder().encode(s); if (b.length <= ${limit}) return s; const c = b.subarray(0, ${limit}); const i = c.lastIndexOf(32); return i < 0 ? '' : new TextDecoder().decode(c.subarray(0, i)); })(${plain})`;
@@ -2010,6 +2226,17 @@ function excerpt(env: Env, args: string[]): Outcome {
   // The text has had its tags stripped but not its character references: `&nbsp;` is printed as it was written.
   if (!isExprRef(r))
     return withFallback(env, litV(limitExcerpt(String(r.value ?? ""), limit), true));
+  if (writesEntry(ctx)) {
+    // The entry stores the excerpt with its tags stripped and trimmed, so with no limit it is the value as
+    // it is (stripping it again with the expression's `<[^>]*>` would take a "5 < 6 and 7 > 3" apart).
+    if (limit <= 0) return withFallback(env, exprV(`${r.expr} ?? ''`, true));
+    // With one, the cut is a field the collections module writes beside it.
+    const field = excerptField(limit);
+    if (!acfNameTaken(ctx, field.key)) {
+      deriveField(ctx, "entry", field);
+      return withFallback(env, exprV(`${propPath(entryDataExpr(ctx), field.key)} ?? ''`, true));
+    }
+  }
   return withFallback(env, exprV(excerptCutExpr(r.expr, limit), true));
 }
 
@@ -2149,7 +2376,7 @@ function acfField(env: Env, args: string[]): Outcome {
     // Measured on the live pages: a person's biography (a wysiwyg field of the user form) prints as text,
     // its `<p>` tags and all, where the same kind of field of a post prints as markup.
     if (text !== undefined && scope.kind === "user" && info.field.type === "wysiwyg") {
-      text = escapedText({ ...text, html: false });
+      text = personText(ctx, info, scope.detail) ?? escapedText({ ...text, html: false });
     }
     if (text === undefined) {
       report(
@@ -2166,17 +2393,40 @@ function acfField(env: Env, args: string[]): Outcome {
 }
 
 /**
+ * The text of a person's wysiwyg field in a list of people, read from the field the converter writes
+ * beside it on every person ({@link personTextField}): the people of a list are rows the converter
+ * wrote (`userRef`, the people a user field holds now, or the user field of an entry the collections
+ * module writes). Undefined where the person may not be such a row (a field inside a group; a page
+ * layout, whose list may read the page's own entry, which the pages module writes without the texts)
+ * or an ACF field already has the name, which keep the expression.
+ */
+function personText(ctx: ConvertCtx, info: FieldInfo, detail: string): Val | undefined {
+  const row = extrasOf(ctx).rowExpr;
+  if (detail !== "userquery" || row === undefined || info.path.length > 0) return undefined;
+  if (ctx.mode === "entry" && !writesEntry(ctx)) return undefined;
+  const field = personTextField(entryKey(info.field.name));
+  if (acfNameTaken(ctx, field.key)) return undefined;
+  deriveField(ctx, "person", field);
+  return exprV(`${optPath(row, field.key)} ?? ''`);
+}
+
+/**
  * What `esc_html` makes of a value, as the text the page shows. It does not escape the `&` of a
  * character reference that is already there (`&quot;` stays `&quot;`), so the browser reads it as the
  * character; the emitter below this escapes every `&`, so the references are read here, once.
  */
 function escapedText(v: Val): Val {
   if ("lit" in v) return { ...v, lit: decodeEntities(v.lit) };
+  return { ...v, expr: basicReferencesExpr(v.expr) };
+}
+
+/** The expression form of {@link decodeBasicReferences}, over the value of `expr`. */
+export function basicReferencesExpr(expr: string): string {
   const read =
     "(s) => String(s).replace(/&(#\\d+|#[xX][0-9a-fA-F]+|quot|amp|lt|gt|apos|nbsp);/g, " +
     "(m, e) => e[0] === '#' ? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : +e.slice(1)) " +
     ": ({quot: '\\x22', amp: '&', lt: '<', gt: '>', apos: '\\x27', nbsp: '\\xa0'})[e])";
-  return { ...v, expr: `(${read})(${v.expr})` };
+  return `(${read})(${expr})`;
 }
 
 /** The field types whose value is one scalar, which Cwicly's `if ($field)` reads as empty when it is `0` or `"0"`. */

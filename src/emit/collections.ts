@@ -181,7 +181,7 @@ import { transpileJxMarkdown } from "@jxsuite/parser";
 import { MD_ALL, serializeJxMarkdown } from "@jxsuite/parser/serialize";
 import { Document, visit } from "yaml";
 import { collectWpClasses } from "../core/block-css.ts";
-import { postData } from "../cwicly/tokens.ts";
+import { derivedFieldsOf, derivedValues, postData } from "../cwicly/tokens.ts";
 import { userProfiles } from "../wp/profiles.ts";
 import { recipeData } from "../wp/lazyblocks.ts";
 import { convertSubject } from "../convert.ts";
@@ -200,8 +200,10 @@ import {
   acfValues,
   BASE_PROPERTIES,
   BASE_REQUIRED,
+  entryKey,
   fieldsFor,
   postTarget,
+  userFieldNames,
 } from "../wp/acf.ts";
 import type { AcfPostTarget, JsonSchema } from "../wp/acf.ts";
 import { decodeEntities, DEFAULT_EXCLUDED_POST_TYPES, publicUrl } from "../wp/model.ts";
@@ -2416,6 +2418,43 @@ async function entryData(
   return rewriteAddresses(data, ctx.rewriteUrl) as Rec;
 }
 
+/**
+ * The fields the pages, layouts and components read that are derived from another field of the entry
+ * (`excerpt250` from `excerpt`) or of a person it names (`bioText` from a user field's `bio`): see
+ * `DerivedField` in cwicly/tokens.ts. They are computed from the data as it is written, `${` already
+ * spelled out of it, because that is what the expression a binding would otherwise hold reads at build.
+ * The documents are converted before the entries, so every derivation they read is known here.
+ */
+export function withDerivedFields(work: Pick<SiteContext, "model" | "acf">, data: Rec): void {
+  Object.assign(data, derivedValues(derivedFieldsOf(work.model, "entry"), data));
+  const person = derivedFieldsOf(work.model, "person");
+  if (person.length === 0) return;
+  const keys = new Set([...userFieldNames(work.acf)].flatMap((name) => [name, entryKey(name)]));
+  const visit = (value: unknown, people: boolean): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, people);
+      return;
+    }
+    if (!isRec(value)) return;
+    if (people) Object.assign(value, derivedValues(person, value));
+    for (const [key, inner] of Object.entries(value)) visit(inner, keys.has(key));
+  };
+  visit(data, false);
+}
+
+/** The schema of the derived fields a collection's entries carry, for Studio's form. */
+function derivedSchema(
+  work: Pick<SiteContext, "model">,
+  entries: readonly Rec[],
+): Record<string, JsonSchema> {
+  const out: Record<string, JsonSchema> = {};
+  for (const field of derivedFieldsOf(work.model, "entry")) {
+    if (!entries.some((data) => typeof data[field.key] === "string")) continue;
+    out[field.key] = { type: "string", description: field.description };
+  }
+  return out;
+}
+
 /** A string that is one address and nothing else. */
 const WHOLE_ADDRESS = /^https?:\/\/\S+$/i;
 
@@ -2564,6 +2603,7 @@ async function buildEntry(
   if (data.url === undefined || data.url === "") data.url = route.jxRoute;
   const literal = { n: 0 };
   const clean = degradeStrings(data, literal) as Rec;
+  withDerivedFields(work, clean);
 
   const converted = await convertSubject(
     work,
@@ -3276,6 +3316,11 @@ export async function buildCollections(
           }
         : {}),
       ...relaxAddressFormats(fields.properties as Record<string, JsonSchema> | undefined),
+      // The fields derived from another that the documents read, where the entries carry them.
+      ...derivedSchema(
+        work,
+        mine.map((b) => b.entry.frontmatter),
+      ),
     };
     // A group applies to some of the entries and not to others (a location rule on a taxonomy term, a
     // template): its required fields are required of the entries it applies to, and of no others.

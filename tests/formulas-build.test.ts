@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { buildJxProject, cleanupJxProjects, validateJxProject } from "./helpers/jx-build.ts";
 import type { BuiltProject, ProjectFile } from "./helpers/jx-build.ts";
 import { ALL_FORMULAS, FORMULAS, formulaCall, type FormulaName } from "../src/formulas.ts";
-import { jxFormulas } from "../src/emit/project.ts";
+import { jxComponentFormulas, jxFormulas } from "../src/emit/project.ts";
 
 setDefaultTimeout(120_000);
 afterAll(cleanupJxProjects);
@@ -257,6 +257,92 @@ describe("a call of a formula of project.json's state, as the installed Jx build
   });
 });
 
+describe("a call of a formula of project.json's state in a component, as the installed Jx builds it", () => {
+  /** A component that formats the date it is given, and the instance on the entry page that gives it. */
+  const DATED = {
+    tagName: "fp-x",
+    state: { label: "" },
+    children: [
+      { tagName: "time", textContent: t(formulaCall("formatDate", "state.label", OPTIONS)) },
+    ],
+  };
+  const INSTANCE = {
+    tagName: "fp-x",
+    attributes: { "data-k": "component" },
+    $props: { label: t(`${D}.date`) },
+  };
+  const dated = (component: unknown, settle = false): Record<string, ProjectFile> => ({
+    ...project([INSTANCE], {
+      ...(settle ? {} : { state: { formatDate: FORMULAS.formatDate } }),
+      component: true,
+    }),
+    "components/fp-x.json": component as ProjectFile,
+  });
+  /**
+   * No page loads JavaScript: no script on a page and no `app.js`. The component's own module
+   * (`components/fp-x.js`, which carries the formula it calls) is written for every component, and
+   * nothing on a static page loads it.
+   */
+  const noJs = (site: BuiltProject): boolean =>
+    !site.exists("app.js") &&
+    ["/c/foo/", "/c/bar/", "/plain/"].every((route) => !site.html(route).includes("<script"));
+
+  test("[F2] jxComponentFormulas() says whether a component's call is built into static markup, and the build agrees", async () => {
+    const site = await buildJxProject(dated(DATED), {
+      name: "formulas-in-component",
+      settle: false,
+      allowFailure: true,
+    });
+    const html = site.code === 0 ? site.html("/c/foo/") : "";
+    const trusted =
+      pull(html, "component").includes("<time>February 15, 2024</time>") &&
+      !html.includes("data-bind") &&
+      noJs(site);
+    expect(trusted).toBe(jxComponentFormulas());
+    if (!jxComponentFormulas()) return;
+    expect(pull(html, "component")).toBe(
+      '<fp-x data-k="component" data-jx-static><time>February 15, 2024</time></fp-x>',
+    );
+  });
+
+  test.skipIf(!jxComponentFormulas())(
+    "[F2] a component's own entry of the same name is what its call reaches, not the project's formula",
+    async () => {
+      const own = {
+        ...DATED,
+        state: {
+          ...DATED.state,
+          formatDate: {
+            parameters: [{ name: "value" }],
+            $expression: { operator: "+", target: "own:", value: { $ref: "$args/value" } },
+          },
+        },
+      };
+      const site = await buildJxProject(dated(own), { name: "formulas-own", settle: false });
+      expect(pull(site.html("/c/foo/"), "component")).toContain(
+        "<time>own:2024-02-15T17:30:00Z</time>",
+      );
+    },
+  );
+
+  test("[F2] settled, a date in a component of a site in en-US stays a call where the Jx builds it, and the page is static", async () => {
+    const site = await buildJxProject(dated(DATED, true), {
+      name: "formulas-settled-component",
+    });
+    expect(pull(site.html("/c/foo/"), "component")).toBe(
+      '<fp-x data-k="component" data-jx-static><time>February 15, 2024</time></fp-x>',
+    );
+    expect(noJs(site)).toBe(true);
+    const component = readFileSync(join(site.dir, "components/fp-x.json"), "utf8");
+    const config = JSON.parse(readFileSync(join(site.dir, "project.json"), "utf8")) as {
+      state?: Record<string, unknown>;
+    };
+    const kept = jxComponentFormulas() && jxFormulas().has("formatDate");
+    expect(component.includes("state.formatDate(")).toBe(kept);
+    expect(Object.keys(config.state ?? {})).toEqual(kept ? ["formatDate"] : []);
+  });
+});
+
 describe("a migrated project: the calls settled", () => {
   test("a date in a component of a site in en-GB is written in en-GB, as on its pages", async () => {
     const options = { year: "numeric", month: "long", day: "numeric", timeZone: "Europe/London" };
@@ -315,13 +401,16 @@ describe("a migrated project: the calls settled", () => {
     expect(pull(html, "list")).toBe(
       '<ul data-k="list"><li>December 31, 2023</li><li>February 15, 2024</li></ul>',
     );
-    // A component's state is its own: its call is written out, and it renders.
+    // A component keeps its call where the Jx gives it the project's formulas, and it renders
+    // either way.
     expect(pull(html, "component")).toContain(
       "<i>Tom &amp; &lt;Jerry&gt; &quot;q&quot; &#39;x&#39;</i>",
     );
     const written = (path: string): unknown =>
       JSON.parse(readFileSync(join(site.dir, path), "utf8")) as unknown;
-    expect(JSON.stringify(written("components/fp-x.json"))).not.toContain("state.escapeHtml(");
+    expect(JSON.stringify(written("components/fp-x.json")).includes("state.escapeHtml(")).toBe(
+      jxComponentFormulas() && jxFormulas().has("escapeHtml"),
+    );
     expect(html).not.toContain("data-bind");
     for (const route of ["/c/foo/", "/c/bar/", "/plain/"]) {
       expect([route, shipsJs(site, route)]).toEqual([route, false]);

@@ -31,6 +31,7 @@ import {
   type MigrateOptions,
   type MigrationResult,
 } from "./emit/project.ts";
+import { jxEmptyListsStatic, setNativeLists } from "./cwicly/blocks/empty-lists.ts";
 import { createReport } from "./report.ts";
 import { verifyCommand } from "./verify/command.ts";
 import { buildRoutes } from "./routes.ts";
@@ -94,6 +95,11 @@ convert options
                              state, which Jx Studio opens as a field with a format, or as the
                              JavaScript it stands for (default: per formula, whether the installed
                              Jx builds the call into a static page)
+  --native-lists, --no-native-lists
+                             write every list a content collection can say as a mapped Array Jx
+                             Studio edits as a repeater, or as the computed children a Jx that
+                             renders an empty list in the browser needs where a list can be empty
+                             (default: whether the installed Jx builds an empty list static)
   --prune-css                drop the plugin CSS rules for classes no page carries
   --inline-gaps <mode>       report (default) or innerHTML: how to write paragraphs whose inline siblings
                              the build would separate by a space
@@ -161,6 +167,8 @@ const CONVERT_FLAGS = {
   "no-hold": { type: "boolean" },
   formulas: { type: "boolean" },
   "no-formulas": { type: "boolean" },
+  "native-lists": { type: "boolean" },
+  "no-native-lists": { type: "boolean" },
   "prune-css": { type: "boolean" },
   "inline-gaps": { type: "string" },
   "css-cache": { type: "string" },
@@ -349,6 +357,8 @@ export interface ConvertArgs {
   force: boolean;
   secrets: string[];
   db: string;
+  /** `--native-lists` / `--no-native-lists`; absent, the installed Jx decides (`cwicly/blocks/empty-lists.ts`). */
+  nativeLists?: boolean;
 }
 
 export function parseConvertArgs(args: string[], io: CliIo): ConvertArgs | "help" {
@@ -393,6 +403,9 @@ export function parseConvertArgs(args: string[], io: CliIo): ConvertArgs | "help
   }
   if (values.formulas === true && values["no-formulas"] === true) {
     throw new UsageError("--formulas and --no-formulas say opposite things");
+  }
+  if (values["native-lists"] === true && values["no-native-lists"] === true) {
+    throw new UsageError("--native-lists and --no-native-lists say opposite things");
   }
   if (values["no-plugin-css"] === true && values["plugin-from"] !== undefined) {
     throw new UsageError("--no-plugin-css and --plugin-from say opposite things");
@@ -465,6 +478,11 @@ export function parseConvertArgs(args: string[], io: CliIo): ConvertArgs | "help
     force: values.force === true,
     secrets: dbSecrets(db),
     db,
+    ...(values["native-lists"] === true
+      ? { nativeLists: true }
+      : values["no-native-lists"] === true
+        ? { nativeLists: false }
+        : {}),
   };
 }
 
@@ -547,6 +565,16 @@ async function convert(args: string[], io: CliIo): Promise<number> {
   if (options.out !== undefined && !parsed.force) {
     const problem = checkOutDir(options.out);
     if (problem !== undefined) throw new UsageError(problem);
+  }
+  // The lists are written as the blocks are converted, before the project is assembled: the setting
+  // is the converter's own, and a run without one asks the installed Jx again.
+  setNativeLists(parsed.nativeLists);
+  // The project's package.json asks for the installed compiler, which builds such a list's empty page
+  // in the browser: the floor the lists need is the person's to raise.
+  if (parsed.nativeLists === true && !jxEmptyListsStatic()) {
+    io.stderr(
+      "wp2jx: --native-lists writes lists that can be empty as mapped Arrays, and the installed Jx renders an empty one in the browser: build the project with @jxsuite/compiler 8.7.0 or later\n",
+    );
   }
   const started = performance.now();
   if (!parsed.quiet) io.stderr(`wp2jx: reading ${redactDbUrl(parsed.db)}\n`);
