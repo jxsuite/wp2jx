@@ -28,20 +28,31 @@
  *   every list of the page), and `<item>` the item tree as a JavaScript literal ({@link nodeExpr}).
  *   A `Function` state entry with `timing: "compiler"` builds without JavaScript but `jx validate`
  *   rejects it; an `Array` whose `items` is computed is a client render. Computed children validate,
- *   build static and ship no JavaScript, an empty list included, where an EMPTY mapped `Array` is
- *   rendered in the browser: so a list the rules could say is computed too where it can be empty on a
- *   route the page builds (its rules read the page's entry or the route's parameter) or is empty today
- *   ({@link registerPostList}), and a paged list's items are computed over its collection. The two
- *   ways list the same entries and print the same page, which the tests compare.
+ *   build static and ship no JavaScript, an empty list included. The two ways list the same entries
+ *   and print the same page, which the tests compare.
  * - **A Markdown entry cannot hold a loop** (it has no state, and a text child is never evaluated), so a
  *   query inside a post of any non-page type is written out: the entries the plan selects NOW, the
  *   template converted once per entry as a static page of that entry (`query.static`).
  *
+ * **An empty list.** A Jx whose build renders an empty mapped `Array` over a list it resolved as
+ * nothing (compiler 8.7.0; `empty-lists.ts`) gets the first form for every list a collection can say,
+ * a paged list too (the build resolves the page's slice of it), save one whose rule asks whether the
+ * entry's terms contain a term of the page's own entry, which WordPress drops where the entry has none
+ * ({@link registerPostList}). An older Jx renders an EMPTY mapped `Array` in the browser, so for it a
+ * list the rules could say is computed where it can be empty on a route the page builds (its rules
+ * read the page's entry or the route's parameter) or is empty today, and a paged list's items are
+ * computed over its collection. On a Jx that capable, a mapped `Array` no other loop holds writes the
+ * loops of its item over a field of the row (the entry's terms of a taxonomy, an ACF repeater field)
+ * as computed children ({@link loopChildren}): an entry that holds none has no such key, and a pointer
+ * to it is no list, which leaves the whole list for the browser.
+ *
  * The item is `<div class="cc-query-item">` around the converted inner blocks, converted in `entry`
  * mode with `entryExpr` `$map.item` and `entryType` the post type (so `{title}` is
- * `${$map.item.data.title ?? ''}`). The loop is always the only child of its element: an empty mapped
- * array makes its parent a client render (docs/bindings.md, rule 10), and the parent is then only the
- * query template's own element, never a container with siblings.
+ * `${$map.item.data.title ?? ''}`). The loop is the only child of the query template's element, as
+ * the plugin prints it: on an older Jx an empty mapped array makes its parent a client render
+ * (docs/bindings.md, rule 10), and the parent is then never a container with siblings. A Jx that renders
+ * an empty build-resolved list as nothing splices a mapped array among siblings and drops one that is
+ * empty, so for it the rule is the plugin's markup and no longer the build's.
  *
  * **A paged list.** A query with a pagination device (`infiniteLoad`, a `query-pagination` block, a
  * previous, next or load-more link, in the query or in a component it holds) is paged on the live
@@ -178,6 +189,7 @@ import { formulaFunctions } from "../../formulas.ts";
 import { joinClass } from "../../jx-util.ts";
 import { walkElements } from "../../placeholders.ts";
 import { sliderProps } from "../../emit/slider.ts";
+import { nativeLists } from "./empty-lists.ts";
 import {
   assemble,
   baseName,
@@ -1803,26 +1815,47 @@ const emptyNow = (ctx: ConvertCtx, plan: PostPlan): boolean =>
   evaluatePosts(ctx, plan, { all: true })?.length === 0;
 
 /**
+ * Whether every rule that reads the page's entry means what its condition does, also on a route whose
+ * entry lacks the field it reads. `==` and `!=` compare with what the reference finds, nothing
+ * included, exactly as the condition's JavaScript does; `contains` with nothing matches no entry,
+ * where WordPress drops a term clause the entry has no term for and lists every one (the entry's first
+ * term of a taxonomy, `<taxonomy>_id`). A `not contains` of nothing keeps every entry, as WordPress does.
+ */
+const stateRulesHold = (rules: readonly Rule[]): boolean =>
+  rules.every(
+    (r) =>
+      !(typeof r.value === "object" && r.value !== null && r.value.$ref.startsWith("#/state/")) ||
+      r.op !== "contains",
+  );
+
+/**
  * The list a post plan selects as a source for a loop. A plan whose every condition is collection
  * rules, with no offset and no order by title, is one `ContentCollection` (`contentType`, one type or
  * several, `filter`, `sort`, `limit`); anything else is an expression over unfiltered collections, one
  * state entry per post type, shared by every list of the page. `opts.inline` writes the expression
  * even for a native plan (the tests compare the two).
  *
- * Lists the rules can say stay expressions, because of what the build does with an EMPTY mapped
- * `Array`: it leaves it for the browser to render, and the page ships the runtime (measured; Jx keeps
- * the definition for a client that may fill it, which a list resolved where the page is built never
- * is). An expression that lists nothing renders as nothing. So these are written as expressions:
+ * A Jx that builds an empty list the build resolved as nothing ({@link nativeLists}) gets every list
+ * the rules can say as a collection, whatever it lists on a route, and with it a mapped `Array` Studio
+ * edits as a repeater; only a rule that reads the page's entry and cannot mean its condition on a route
+ * whose entry lacks the field ({@link stateRulesHold}) keeps the expression.
+ *
+ * An older Jx leaves an EMPTY mapped `Array` for the browser to render, and the page ships the runtime
+ * (measured; Jx keeps the definition for a client that may fill it, which a list resolved where the
+ * page is built never is). An expression that lists nothing renders as nothing. So for it these are
+ * written as expressions:
  *
  * - a list whose rules read the page's entry (a related list, "not this one", the author's own):
  *   empty on some of the routes the page builds, and WordPress drops a term clause the entry has no
  *   term for, which a rule cannot;
  * - a list whose rules read the route's parameter (an archive's term), unless it is the page's paged
  *   list (`opts.paged`), which must be a collection: a term with no entries is an empty list;
- * - a list that selects nothing today;
- * - a list inside a component (a Cwicly component, a template part): the build resolves no
- *   collection of a component's own state, so its list would be empty for every instance, where a
- *   computed one is left out and said by the components emitter (`component.query-unsupported`).
+ * - a list that selects nothing today.
+ *
+ * Whatever the Jx, a list inside a component (a Cwicly component, a template part) is an expression:
+ * the build resolves no collection of a component's own state, so its list would be empty for every
+ * instance, where a computed one is left out and said by the components emitter
+ * (`component.query-unsupported`).
  */
 export function registerPostList(
   ctx: ConvertCtx,
@@ -1840,11 +1873,13 @@ export function registerPostList(
     opts.inline !== true &&
     plan.types.length > 0 &&
     natives !== undefined &&
-    !readsState(natives) &&
     plan.offset === 0 &&
     !collated &&
     !inComponent(ctx) &&
-    (opts.paged === true || (!readsRoute(natives) && !emptyNow(ctx, plan)))
+    (nativeLists()
+      ? stateRulesHold(natives)
+      : !readsState(natives) &&
+        (opts.paged === true || (!readsRoute(natives) && !emptyNow(ctx, plan))))
   ) {
     // Several types are one collection over all of them: their entries in the block's order, then sorted.
     const key = defineState(ctx, name, {
@@ -2167,13 +2202,12 @@ function stringExpr(text: string, depth: number): string {
   return parts[0]!.expr !== undefined ? `'' + ${each.join(" + ")}` : each.join(" + ");
 }
 
-/** The expression of the list a loop node reads: its pointer, from a loop item (`$map/item/…`) or from page state (`#/state/…`). */
-function pointerExpr(ref: string, depth: number): string | undefined {
-  const base = ref.startsWith("$map/item")
-    ? `$i${depth}`
-    : ref.startsWith("#/state/")
-      ? "state"
-      : undefined;
+/**
+ * The expression of the list a loop node reads: its pointer, from a loop item (`$map/item/…`, the item
+ * being `row`) or from page state (`#/state/…`).
+ */
+function pointerExpr(ref: string, depth: number, row = `$i${depth}`): string | undefined {
+  const base = ref.startsWith("$map/item") ? row : ref.startsWith("#/state/") ? "state" : undefined;
   if (base === undefined) return undefined;
   const path = ref
     .replace(/^\$map\/item\/?/, "")
@@ -2299,9 +2333,43 @@ export function writtenOut(
   return rows.map((row, index) => rowNode(item, { item: row, index, state }) as JxNode);
 }
 
-/** The children of a loop's element: the mapped array over a pointer, or the computed children that write each item of an expression's list. */
-export function loopChildren(source: ListSource, item: JxElement): JxNode[] {
-  if ("pointer" in source) return [mapped(source.pointer, item)];
+/** Whether a loop node lists a field of the row it stands in (`$map/item/…`). */
+const isRowLoop = (v: unknown): v is { $prototype: "Array"; items: unknown; map?: unknown } =>
+  isLoopNode(v) && String(record(v.items)?.$ref).startsWith("$map/item");
+
+/**
+ * A loop over a field of the row it stands in, as computed children that read the field with `?? []`;
+ * any other node with the same done inside it.
+ *
+ * A Markdown entry has no key for what it holds none of (its terms of a taxonomy it has no term in, an
+ * ACF repeater field with no rows), and a pointer to a field that is not there is no list: the build
+ * leaves the loop's element for the browser and the page ships the runtime (`[NL3]` in
+ * tests/native-lists-build.test.ts), where the computed form is nothing. A list over page state is
+ * kept, the loops of its own rows done the same way; `$map.item` in the computed children is the row
+ * the build expands them in.
+ */
+function rowLoopsComputed(value: unknown): unknown {
+  if (isRowLoop(value)) {
+    const list = pointerExpr(String(record(value.items)?.$ref), 0, "$map.item");
+    if (list !== undefined) return `\${${list}.map(($i0, $x0) => (${nodeExpr(value.map, 0)}))}`;
+  }
+  if (Array.isArray(value)) return value.map(rowLoopsComputed);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, rowLoopsComputed(v)]));
+  }
+  return value;
+}
+
+/**
+ * The children of a loop's element: the mapped array over a pointer, or the computed children that write
+ * each item of an expression's list. `rowLoops` writes the loops of the mapped array's item over a field
+ * of its row as computed children ({@link rowLoopsComputed}): only for the outermost list of a page (a
+ * computed list around it writes its loops itself), and only for a Jx whose build expands an empty
+ * build-resolved list as nothing ({@link loopsOfRowsComputed}).
+ */
+export function loopChildren(source: ListSource, item: JxElement, rowLoops = false): JxNode[] {
+  if ("pointer" in source)
+    return [mapped(source.pointer, rowLoops ? (rowLoopsComputed(item) as JxElement) : item)];
   return [`\${(${source.expr}).map(($i0, $x0) => (${nodeExpr(item, 0)}))}`];
 }
 
@@ -2330,11 +2398,30 @@ export function usesInComputedLists(nodes: readonly JxNode[]): {
   return { classes, tags };
 }
 
-/** Say what a computed list cannot keep: a placeholder an emitter would have replaced, which stays as it is in there. */
-function sayHidden(ctx: ConvertCtx, block: WpBlock, source: ListSource, item: JxElement): void {
-  if ("pointer" in source) return;
+/**
+ * Say what a computed list cannot keep: a placeholder an emitter would have replaced, which stays as it
+ * is in there. A mapped array's item is computed only in its loops over a field of the row, where
+ * `rowLoops` makes them so ({@link loopChildren}).
+ */
+function sayHidden(
+  ctx: ConvertCtx,
+  block: WpBlock,
+  source: ListSource,
+  item: JxElement,
+  rowLoops = false,
+): void {
+  const computed: JxNode[] =
+    "pointer" in source
+      ? rowLoops
+        ? [...walkElements([item])].flatMap((e) =>
+            (Array.isArray(e.children) ? e.children : [e.children]).flatMap((c: unknown) =>
+              isRowLoop(c) ? [c.map as JxNode] : [],
+            ),
+          )
+        : []
+      : [item];
   const left = new Set(
-    [...walkElements([item])]
+    [...walkElements(computed)]
       .map((e) => e.tagName)
       .filter((t): t is string => typeof t === "string" && t.startsWith("wp2jx-")),
   );
@@ -2524,6 +2611,14 @@ const nestedLoop = (ctx: ConvertCtx): boolean =>
   (ctx.termExpr !== undefined && /^\$map\b/.test(ctx.termExpr)) ||
   ctx.rowExpr !== undefined;
 
+/**
+ * Whether a list written here computes the loops of its item over a field of the row
+ * ({@link loopChildren}): a list no other loop holds, for a Jx that expands an empty list the build
+ * resolved as nothing ({@link nativeLists}), which writes the lists that can be empty as mapped arrays
+ * and so puts entries without the field in their rows. An older Jx keeps the form it had.
+ */
+const loopsOfRowsComputed = (ctx: ConvertCtx): boolean => nativeLists() && !nestedLoop(ctx);
+
 const query: BlockConverter = (block, ctx) => {
   const env = prepare(passingOwnCount(block), ctx);
   if (!env) return [];
@@ -2608,9 +2703,11 @@ const query: BlockConverter = (block, ctx) => {
           verdict.key = source.pointer.replace(/^#\/state\//, "");
           paged = true;
           // The build cuts the collection into pages, and a page can hold none (a term with no
-          // entries): an empty mapped Array renders in the browser, an empty computed list is
-          // nothing. So the paged list's items are computed children over its state entry.
-          source = { expr: `state.${verdict.key}` };
+          // entries). A Jx that renders an empty build-resolved list as nothing (the page's slice is
+          // one) takes the mapped Array over the entry; for an older one an empty mapped Array renders
+          // in the browser and an empty computed list is nothing, so the items are computed children
+          // over its state entry.
+          if (!nativeLists()) source = { expr: `state.${verdict.key}` };
         }
         loop = {
           kind: "live",
@@ -2646,7 +2743,7 @@ const query: BlockConverter = (block, ctx) => {
           block,
           "query.empty",
           "info",
-          "The query selects no entries on the converted site: its list is empty (and a page with an empty list ships a client script to render it).",
+          "The query selects no entries on the converted site: its list is empty.",
           { detail: "empty" },
         );
       }
@@ -2720,10 +2817,12 @@ const query: BlockConverter = (block, ctx) => {
         rows,
       );
       // Rows a component can list as they are: a mapped array is a `$ref`, which keeps the component
-      // from being static, and a computed list is not expanded inside a component by the build.
+      // from being static, and a computed list is not expanded inside a component by the build. The
+      // rows are authored state, which no Jx renders as nothing when they are none (the browser may
+      // fill them), so no rows is the list the build computes, empty.
       loop = {
         kind: "live",
-        source: { pointer: `#/state/${key}` },
+        source: rows.length === 0 ? NOTHING : { pointer: `#/state/${key}` },
         terms: true,
         ...(inComponent(ctx) ? { rows } : {}),
       };
@@ -3057,10 +3156,11 @@ const queryTemplate: BlockConverter = (block, ctx) =>
       case "live": {
         const inner = loop.terms === true ? block.innerBlocks.map(inTermLoop) : block.innerBlocks;
         const built = item(ctx.convert(inner, itemContext(loop)));
-        sayHidden(ctx, block, loop.source, built);
+        const rowLoops = loopsOfRowsComputed(ctx);
+        sayHidden(ctx, block, loop.source, built, rowLoops);
         const items =
           (loop.rows !== undefined && writtenOut(built, loop.rows, ctx.model.site.language)) ||
-          loopChildren(loop.source, built);
+          loopChildren(loop.source, built, rowLoops);
         return {
           tag: "div",
           children:
@@ -3385,8 +3485,9 @@ const taxonomyterms: BlockConverter = (block, ctx) => {
     block,
     ctx.convert(block.innerBlocks, withLoop(undefined, { termExpr: "$map.item" })),
   );
-  sayHidden(ctx, block, found, item);
-  return assemble(env, { tag: "div", children: loopChildren(found, item) }).nodes;
+  const rowLoops = loopsOfRowsComputed(ctx);
+  sayHidden(ctx, block, found, item, rowLoops);
+  return assemble(env, { tag: "div", children: loopChildren(found, item, rowLoops) }).nodes;
 };
 
 // ── repeater ─────────────────────────────────────────────────────────────────────────────────────
@@ -3510,8 +3611,9 @@ const repeater: BlockConverter = (block, ctx) => {
     block,
     ctx.convert(block.innerBlocks, withLoop(undefined, { rowExpr: "$map.item" })),
   );
-  sayHidden(ctx, block, rows.source, item);
-  return assemble(env, { tag: "div", children: loopChildren(rows.source, item) }).nodes;
+  const rowLoops = loopsOfRowsComputed(ctx);
+  sayHidden(ctx, block, rows.source, item, rowLoops);
+  return assemble(env, { tag: "div", children: loopChildren(rows.source, item, rowLoops) }).nodes;
 };
 
 // ── Components ───────────────────────────────────────────────────────────────────────────────────

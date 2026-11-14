@@ -182,11 +182,17 @@ describe("the Jx a project with held entries asks for", () => {
 
   test("a project that holds entries back asks for the first releases with `hold` at least", () => {
     const pkg = JSON.parse(projectPackageJson("x", true, true));
-    expect(pkg.dependencies["@jxsuite/parser"]).toBe(`^${JX_HOLD_MINIMUM["@jxsuite/parser"]}`);
-    expect(pkg.devDependencies["@jxsuite/compiler"]).toBe(
-      `^${JX_HOLD_MINIMUM["@jxsuite/compiler"]}`,
-    );
-    expect(pkg.devDependencies["@jxsuite/runtime"]).toBe(`^${JX_HOLD_MINIMUM["@jxsuite/runtime"]}`);
+    // the higher of the release installed here and the first release with hold
+    const atLeast = (name: keyof typeof JX_HOLD_MINIMUM): string => {
+      const version = JSON.parse(
+        readFileSync(`${import.meta.dir}/../../node_modules/${name}/package.json`, "utf8"),
+      ).version as string;
+      const minimum = JX_HOLD_MINIMUM[name];
+      return `^${Bun.semver.order(version, minimum) < 0 ? minimum : version}`;
+    };
+    expect(pkg.dependencies["@jxsuite/parser"]).toBe(atLeast("@jxsuite/parser"));
+    expect(pkg.devDependencies["@jxsuite/compiler"]).toBe(atLeast("@jxsuite/compiler"));
+    expect(pkg.devDependencies["@jxsuite/runtime"]).toBe(atLeast("@jxsuite/runtime"));
     // one that holds nothing asks for the release installed here
     const plain = JSON.parse(projectPackageJson("x", true));
     const installed = JSON.parse(
